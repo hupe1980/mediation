@@ -1,0 +1,390 @@
+//! Who terminates a number, and what the traffic to it looks like.
+//!
+//! Both answers come from caller-supplied reference data, so these tests are
+//! mostly about what happens when that data does not answer.
+
+use mediation::{
+    CalledParty, ChargedParty, Msisdn, NumberRange, NumberRangeSet, PlmnId, RecordType, Seconds,
+    Signal, SourceRef, SubscriberRef, TrafficShape, UsageRecord, ait_signature, bypass_signature,
+    impossible_travel, is_ported, premium_destination, terminating_plmn, wangiri_pattern,
+};
+use time::Duration;
+
+fn range(digits: &str) -> NumberRange {
+    digits.parse().expect("a valid range")
+}
+
+fn number(digits: &str) -> Msisdn {
+    digits.parse().expect("a valid number")
+}
+
+fn record(kind: RecordType, opened: &str, serving: &str) -> UsageRecord {
+    UsageRecord::new(
+        kind,
+        ChargedParty::Subscriber(SubscriberRef::new("imsi-262021234567890".parse().unwrap())),
+        opened.parse().unwrap(),
+        SourceRef::new("msc-01".parse().unwrap(), 0),
+    )
+    .with_networks(serving.parse().unwrap(), "262-02".parse().unwrap())
+}
+
+/// German mobile allocation, with one block carved out of a wider range.
+fn allocation() -> NumberRangeSet<PlmnId> {
+    let mut set = NumberRangeSet::new();
+    set.insert(range("49"), "262-01".parse().unwrap());
+    set.insert(range("49151"), "262-01".parse().unwrap());
+    set.insert(range("4915112"), "262-23".parse().unwrap());
+    set.insert(range("49170"), "262-02".parse().unwrap());
+    set
+}
+
+// ── Settlement against the wrong partner ─────────────────────────────────────
+
+/// The whole reason the module exists: interconnect settles per terminating
+/// operator, and a number's range stopped answering that question the day
+/// portability arrived.
+#[test]
+fn a_settlement_built_on_ranges_is_wrong_by_exactly_the_ported_numbers() {
+    let allocation = allocation();
+
+    // A national portability feed: two of these numbers have moved.
+    let ported = |number: Msisdn| -> Option<PlmnId> {
+        match number.to_string().as_str() {
+            "491519000001" => Some("262-02".parse().unwrap()),
+            "491709000002" => Some("262-01".parse().unwrap()),
+            _ => None,
+        }
+    };
+
+    let traffic = [
+        number("491519000001"), // allocated 262-01, ported to 262-02
+        number("491709000002"), // allocated 262-02, ported to 262-01
+        number("491519000003"), // never ported
+        number("491511200004"), // in the carved-out block
+    ];
+
+    let by_range: Vec<String> = traffic
+        .iter()
+        .map(|n| {
+            allocation
+                .longest_match(*n)
+                .map(|(_, plmn)| plmn.to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+    let by_termination: Vec<String> = traffic
+        .iter()
+        .map(|n| {
+            terminating_plmn(*n, &allocation, &ported)
+                .map(|plmn| plmn.to_string())
+                .unwrap_or_default()
+        })
+        .collect();
+
+    assert_eq!(by_range, ["262-01", "262-02", "262-01", "262-23"]);
+    assert_eq!(by_termination, ["262-02", "262-01", "262-01", "262-23"]);
+
+    // Exactly the ported numbers differ, and that is the size of the exposure.
+    let wrong = traffic
+        .iter()
+        .filter(|n| is_ported(**n, &allocation, &ported))
+        .count();
+    assert_eq!(wrong, 2);
+}
+
+/// A number that resolves nowhere is unresolvable, never a default. Settling a
+/// guess is a two-sided error that surfaces only when the partner's invoice
+/// disagrees.
+#[test]
+fn an_unresolvable_number_is_reported_as_such() {
+    let allocation = allocation();
+    let nothing_ported = |_: Msisdn| None;
+
+    assert_eq!(
+        terminating_plmn(number("12125550100"), &allocation, &nothing_ported),
+        None
+    );
+    assert!(!is_ported(
+        number("12125550100"),
+        &allocation,
+        &nothing_ported
+    ));
+}
+
+/// Reference data that answers one question twice is data the loader should
+/// have rejected.
+#[test]
+fn a_duplicated_range_is_visible_before_it_decides_anything() {
+    let mut set = NumberRangeSet::new();
+    set.insert(range("49151"), "262-01".parse::<PlmnId>().unwrap());
+    set.insert(range("49151"), "262-02".parse::<PlmnId>().unwrap());
+
+    assert_eq!(set.duplicates(), vec![range("49151")]);
+    assert!(allocation().duplicates().is_empty());
+}
+
+// ── Fraud signals over the same reference data ───────────────────────────────
+
+/// One range set, two questions: which operator terminates this, and is the
+/// destination one an operator flagged.
+#[test]
+fn the_same_structure_answers_allocation_and_risk() {
+    let mut high_risk: NumberRangeSet<&str> = NumberRangeSet::new();
+    high_risk.insert(range("88216"), "satellite");
+    high_risk.insert(range("2392"), "IPRN");
+
+    let records = vec![
+        record(
+            RecordType::MobileOriginatedCall,
+            "2026-07-28T10:00:00+02:00",
+            "262-02",
+        ),
+        record(
+            RecordType::MobileOriginatedCall,
+            "2026-07-28T11:00:00+02:00",
+            "262-02",
+        ),
+        record(
+            RecordType::MobileOriginatedCall,
+            "2026-07-28T12:00:00+02:00",
+            "262-02",
+        ),
+    ];
+    let called = |index: usize, _: &UsageRecord| -> Option<Msisdn> {
+        match index {
+            0 => Some(number("882161234567")),
+            1 => Some(number("491701234567")),
+            _ => None, // the decoder could not resolve this one
+        }
+    };
+
+    let found = premium_destination(&records, &high_risk, &called);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].signal, Signal::PremiumDestination);
+    assert_eq!(found[0].records, vec![0]);
+    assert!(found[0].detail.contains("88216"));
+}
+
+/// An unresolvable destination is not evidence of anything, in either
+/// direction.
+#[test]
+fn an_unresolved_destination_is_never_evidence() {
+    let mut high_risk: NumberRangeSet<&str> = NumberRangeSet::new();
+    high_risk.insert(range("88216"), "satellite");
+
+    let records: Vec<UsageRecord> = (0..5)
+        .map(|i| {
+            record(
+                RecordType::MobileOriginatedCall,
+                &format!("2026-07-28T1{i}:00:00+02:00"),
+                "262-02",
+            )
+        })
+        .collect();
+    let nothing_resolves = |_: usize, _: &UsageRecord| None;
+
+    assert!(premium_destination(&records, &high_risk, &nothing_resolves).is_empty());
+}
+
+/// A resolver is a trait, so a caller's own type works as well as a closure.
+#[test]
+fn a_called_party_resolver_may_be_a_type() {
+    struct FromTable(Vec<Option<Msisdn>>);
+    impl CalledParty for FromTable {
+        fn called(&self, index: usize, _: &UsageRecord) -> Option<Msisdn> {
+            self.0.get(index).copied().flatten()
+        }
+    }
+
+    let mut high_risk: NumberRangeSet<&str> = NumberRangeSet::new();
+    high_risk.insert(range("88216"), "satellite");
+
+    let records = vec![record(
+        RecordType::MobileOriginatedCall,
+        "2026-07-28T10:00:00+02:00",
+        "262-02",
+    )];
+    let table = FromTable(vec![Some(number("882169999999"))]);
+
+    assert_eq!(premium_destination(&records, &high_risk, &table).len(), 1);
+}
+
+/// A day of one-ring inbound calls, then the callbacks that pay for them.
+#[test]
+fn a_wangiri_wave_shows_up_as_volume_not_as_any_single_call() {
+    let wave: Vec<UsageRecord> = (0..30)
+        .map(|i| {
+            record(
+                RecordType::MobileTerminatedCall,
+                &format!("2026-07-28T10:{i:02}:00+02:00"),
+                "262-02",
+            )
+            .with_duration(Seconds::new(3))
+        })
+        .collect();
+
+    let found = wangiri_pattern(&wave, Seconds::new(5), 20).expect("thirty one-ring calls");
+    assert_eq!(found.signal, Signal::WangiriPattern);
+    assert_eq!(found.records.len(), 30);
+
+    // The same wave against a stricter volume floor says nothing.
+    assert!(wangiri_pattern(&wave, Seconds::new(5), 50).is_none());
+    // Nor does it if the calls were not short.
+    assert!(wangiri_pattern(&wave, Seconds::new(1), 20).is_none());
+
+    // A call with no recorded duration is not a short call.
+    let unmetered: Vec<UsageRecord> = (0..30)
+        .map(|i| {
+            record(
+                RecordType::MobileTerminatedCall,
+                &format!("2026-07-28T11:{i:02}:00+02:00"),
+                "262-02",
+            )
+        })
+        .collect();
+    assert!(wangiri_pattern(&unmetered, Seconds::new(5), 20).is_none());
+}
+
+/// The unsophisticated bypass shape, and the honest limit of it.
+#[test]
+fn bypass_triage_catches_the_naive_case_and_says_so() {
+    let rack: Vec<UsageRecord> = (0..80)
+        .map(|i| {
+            record(
+                RecordType::MobileOriginatedCall,
+                &format!("2026-07-28T{:02}:{:02}:00+02:00", i / 4, (i % 4) * 15),
+                "262-02",
+            )
+        })
+        .collect();
+
+    let shape = TrafficShape::of(&rack);
+    assert_eq!(shape.calls(), 80);
+    assert_eq!(shape.outbound_percent(), Some(100));
+    assert_eq!(shape.distinct_networks, 1);
+
+    let found = bypass_signature(&rack, 50, 90).expect("the naive shape fires");
+    assert_eq!(found.signal, Signal::BypassSignature);
+    assert_eq!(found.records.len(), 80);
+
+    // Now simulate human behaviour: incoming calls and movement between cells
+    // on two networks. Nothing about the fraud changed; the signal is gone.
+    let simulated: Vec<UsageRecord> = (0..80)
+        .map(|i| {
+            record(
+                if i % 3 == 0 {
+                    RecordType::MobileTerminatedCall
+                } else {
+                    RecordType::MobileOriginatedCall
+                },
+                &format!("2026-07-28T{:02}:{:02}:00+02:00", i / 4, (i % 4) * 15),
+                if i % 5 == 0 { "262-01" } else { "262-02" },
+            )
+        })
+        .collect();
+    assert!(bypass_signature(&simulated, 50, 90).is_none());
+}
+
+/// A data session is not voice traffic and must not move the ratio.
+#[test]
+fn non_call_records_do_not_shape_voice_traffic() {
+    let mut mixed: Vec<UsageRecord> = (0..10)
+        .map(|i| {
+            record(
+                RecordType::MobileOriginatedCall,
+                &format!("2026-07-28T1{i}:00:00+02:00"),
+                "262-02",
+            )
+        })
+        .collect();
+    mixed.push(record(
+        RecordType::PduSession,
+        "2026-07-28T23:00:00+02:00",
+        "262-02",
+    ));
+
+    let shape = TrafficShape::of(&mixed);
+    assert_eq!(shape.calls(), 10, "the data session is not a call");
+
+    let found = bypass_signature(&mixed, 10, 90).expect("ten outbound calls on one network");
+    assert_eq!(
+        found.records.len(),
+        10,
+        "the indication points at the calls, not the data session"
+    );
+}
+
+/// An inflated one-time-password flood concentrates on a few ranges; the
+/// denominator is every message, so a sender whose traffic is mostly elsewhere
+/// does not look concentrated.
+#[test]
+fn inflated_message_traffic_is_measured_against_all_of_it() {
+    let mut ranges: NumberRangeSet<&str> = NumberRangeSet::new();
+    ranges.insert(range("2392"), "IPRN");
+
+    let messages: Vec<UsageRecord> = (0..100)
+        .map(|i| {
+            record(
+                RecordType::SmsOriginated,
+                &format!("2026-07-28T{:02}:{:02}:00+02:00", i / 10, i % 60),
+                "262-02",
+            )
+        })
+        .collect();
+
+    // Eighty-five of a hundred to one range.
+    let concentrated = |index: usize, _: &UsageRecord| -> Option<Msisdn> {
+        if index < 85 {
+            Some(number("239212345678"))
+        } else {
+            Some(number("491701234567"))
+        }
+    };
+    let found =
+        ait_signature(&messages, &ranges, &concentrated, 50, 80).expect("eighty-five percent");
+    assert_eq!(found.signal, Signal::AitSignature);
+    assert_eq!(found.records.len(), 85);
+    assert!(found.detail.contains("85%"), "{}", found.detail);
+
+    // The same eighty-five messages inside a much larger stream are not a
+    // concentration, and counting only the matched ones would claim they were.
+    let diluted = |index: usize, _: &UsageRecord| -> Option<Msisdn> {
+        if index < 25 {
+            Some(number("239212345678"))
+        } else {
+            Some(number("491701234567"))
+        }
+    };
+    assert!(ait_signature(&messages, &ranges, &diluted, 50, 80).is_none());
+}
+
+// ── Determinism ──────────────────────────────────────────────────────────────
+
+/// Every detector takes its evaluation inputs as arguments and reads no clock,
+/// so the same batch yields the same indications however often it is replayed.
+#[test]
+fn detection_is_replayable() {
+    let records = vec![
+        record(
+            RecordType::MobileOriginatedCall,
+            "2026-07-28T10:00:00+02:00",
+            "262-02",
+        ),
+        record(
+            RecordType::MobileOriginatedCall,
+            "2026-07-28T10:20:00+02:00",
+            "310-260",
+        ),
+        record(
+            RecordType::MobileOriginatedCall,
+            "2026-07-28T10:40:00+02:00",
+            "262-02",
+        ),
+    ];
+
+    let first = impossible_travel(&records, Duration::hours(4));
+    let second = impossible_travel(&records, Duration::hours(4));
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 2, "there and back again");
+    assert!(first.iter().all(|i| i.signal.is_arithmetic()));
+}

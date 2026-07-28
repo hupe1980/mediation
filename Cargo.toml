@@ -1,0 +1,26 @@
+[package]
+name         = "mediation"
+description  = "Telecom usage mediation domain library — 3GPP CDR local-time-plus-offset arithmetic (quarter-hour offsets, DST-adjusted), integer octet volumes, validated identifiers (IMSI/MSISDN/IMEI/ICCID/SUPI/GPSI/PEI, PLMN, TADIG), natural-key deduplication, RFC 1982 wrap-aware sequence-gap detection, partial-record reassembly, cross-node correlation, signed restatement, a numbered validation catalogue, a conservation law that spans batches, TBCD/BCD wire codecs, a zero-copy BER reader, usage aggregation, roaming-batch reconciliation, longest-prefix number ranges with portability, User Location Information (CGI/SAI/ECGI/NCGI/TAI), conserving tariff-band apportionment, two-question jurisdiction determination and an EU/German regulatory layer. Zero I/O, no async, no clock, exact integer quantities."
+version      = "0.1.0"
+authors      = ["hupe1980"]
+edition      = "2024"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/hupe1980/mediation"
+rust-version = "1.94"
+readme       = "README.md"
+keywords     = ["telecom", "cdr", "mediation", "charging", "roaming"]
+categories   = ["data-structures", "parser-implementations"]
+
+[dependencies]
+serde     = { version = "1", features = ["derive"], optional = true }
+thiserror = "2"
+time      = { version = "0.3", features = ["std", "macros", "parsing", "formatting"] }
+
+[features]
+default = []
+serde   = ["dep:serde"]
+
+[dev-dependencies]
+proptest   = "1"
+serde_json = "1"
+time       = { version = "0.3", features = ["macros"] }
