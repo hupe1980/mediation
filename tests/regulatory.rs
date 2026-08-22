@@ -10,10 +10,10 @@
 //!   dataset outside a policy it was always inside.
 
 use mediation::{
-    AllowanceStatus, ChargedParty, FairUseAssessment, Imsi, NorthAmericanRule, Octets, PlmnId,
-    PresenceDay, Pseudonymiser, RecordType, ReducedSubscriber, Reduction, Region, Regions,
-    RetentionBasis, RetentionPolicy, RetentionSchedule, SafeHarbour, SourceRef, SubscriberRef,
-    Supi, UsageRecord, VolumeAllowance, VolumePair, fairuse,
+    AllowanceStatus, ChargedParty, Deletion, FairUseAlert, FairUseAssessment, Imsi,
+    NorthAmericanRule, Octets, PlmnId, PresenceDay, Pseudonymiser, RecordType, ReducedSubscriber,
+    Region, Regions, RetentionBasis, RetentionPolicy, RetentionSchedule, SafeHarbour, SourceRef,
+    SubscriberRef, Supi, UsageRecord, VolumeAllowance, VolumePair, fairuse, reduce_to_country,
 };
 use proptest::prelude::*;
 use time::{Duration, OffsetDateTime, macros::date, macros::datetime};
@@ -73,8 +73,13 @@ fn the_regulation_sequence_is_observe_warn_surcharge() {
     assert!(assessment.window_sufficient());
     assert_eq!(assessment.safe_harbour(), None);
     assert!(assessment.may_warn());
-    assert!(!assessment.may_surcharge(false), "warn first");
-    assert!(assessment.may_surcharge(true));
+    assert!(!assessment.may_surcharge(None, ending), "alert first");
+
+    // Article 5(4): the alert must give the customer at least two weeks to
+    // change their pattern, so the alert date decides, not a boolean.
+    let alert = FairUseAlert::new(ending);
+    assert!(!assessment.may_surcharge(Some(alert), ending + Duration::days(13)));
+    assert!(assessment.may_surcharge(Some(alert), ending + Duration::days(14)));
 }
 
 /// The error the API shape prevents: either indicator alone is enough, so a
@@ -101,7 +106,9 @@ fn a_subscriber_abroad_but_consuming_at_home_keeps_the_safe_harbour() {
     assert!(assessment.prevailing_domestic_consumption());
     assert_eq!(assessment.safe_harbour(), Some(SafeHarbour::Consumption));
     assert!(!assessment.may_warn());
-    assert!(!assessment.may_surcharge(true));
+    assert!(
+        !assessment.may_surcharge(Some(FairUseAlert::new(ending)), ending + Duration::days(30))
+    );
 }
 
 /// Usage outside the EEA is not roaming under this regulation, and counting it
@@ -167,7 +174,10 @@ proptest! {
             || assessment.prevailing_domestic_consumption()
         {
             prop_assert!(!assessment.may_warn());
-            prop_assert!(!assessment.may_surcharge(true));
+            prop_assert!(!assessment.may_surcharge(
+                Some(FairUseAlert::new(date!(2026 - 01 - 01))),
+                date!(2026 - 12 - 31)
+            ));
             prop_assert!(assessment.safe_harbour().is_some());
         } else {
             prop_assert!(assessment.may_warn());
@@ -188,7 +198,7 @@ proptest! {
             Octets::new(1),
             120,
         );
-        prop_assert!(!assessment.may_surcharge(false));
+        prop_assert!(!assessment.may_surcharge(None, date!(2026 - 12 - 31)));
     }
 
     /// The alert always falls due strictly before the limit, so a customer is
@@ -231,12 +241,12 @@ fn a_billing_period_outlives_the_call_it_covers() {
 
     assert!(correct.deadline() > wrong_anchor.deadline());
     assert_eq!(
-        correct.deadline() - wrong_anchor.deadline(),
+        correct.deadline().unwrap() - wrong_anchor.deadline().unwrap(),
         INVOICED - CALL
     );
 
     // On a day between the two deadlines, only the wrong anchor has expired.
-    let between = wrong_anchor.deadline() + Duration::days(1);
+    let between = wrong_anchor.deadline().unwrap() + Duration::days(1);
     assert!(wrong_anchor.is_expired(between));
     assert!(!correct.is_expired(between));
 }
@@ -265,10 +275,10 @@ fn a_dispute_hold_outlives_the_billing_period() {
     assert_eq!(schedule.governing_policy(), Some(dispute));
 
     // The billing period lapsing does not make the record deletable.
-    let after_billing = billing.deadline() + Duration::days(1);
+    let after_billing = billing.deadline().unwrap() + Duration::days(1);
     assert!(billing.is_expired(after_billing));
     assert!(!schedule.is_deletable(after_billing));
-    assert!(schedule.is_deletable(dispute.deadline() + Duration::seconds(1)));
+    assert!(schedule.is_deletable(dispute.deadline().unwrap() + Duration::seconds(1)));
 }
 
 /// No basis to keep the data is not a licence to keep it indefinitely.
@@ -296,8 +306,9 @@ proptest! {
             .collect();
         let schedule: RetentionSchedule = policies.iter().copied().collect();
 
-        let longest = policies.iter().map(|p| p.deadline()).max().unwrap();
+        let longest = policies.iter().filter_map(|p| p.deadline()).max().unwrap();
         prop_assert_eq!(schedule.governing_deadline(), Some(longest));
+        prop_assert_eq!(schedule.deletion(), Deletion::After(longest));
 
         prop_assert!(!schedule.is_deletable(longest));
         prop_assert!(schedule.is_deletable(longest + Duration::seconds(1)));
@@ -309,6 +320,53 @@ proptest! {
             }
         }
     }
+}
+
+/// A hold has no deadline, so no instant makes the record deletable. The old
+/// shape — a hold with a nominal duration — silently permitted deletion the
+/// moment that nominal period ran out, while the dispute was still open.
+#[test]
+fn an_open_hold_is_never_deletable() {
+    let billing = RetentionPolicy::new(
+        RetentionBasis::BillingTdddg10 {
+            invoice_dispatched_at: INVOICED,
+        },
+        Duration::days(183),
+    )
+    .unwrap();
+    let dispute = RetentionPolicy::until_released(RetentionBasis::DisputeHold {
+        raised_at: INVOICED + Duration::days(5),
+    })
+    .unwrap();
+
+    let schedule: RetentionSchedule = vec![billing, dispute].into_iter().collect();
+    assert!(schedule.is_held());
+    assert!(schedule.deletion().is_blocked());
+    assert_eq!(schedule.deletion().deadline(), None);
+    assert!(!schedule.is_deletable(INVOICED + Duration::days(10_000)));
+
+    // Releasing the hold is rebuilding the schedule without it.
+    let released: RetentionSchedule = vec![billing].into_iter().collect();
+    assert_eq!(
+        released.deletion(),
+        Deletion::After(billing.deadline().unwrap())
+    );
+    assert!(released.is_deletable(INVOICED + Duration::days(10_000)));
+
+    // And only a hold may run without a duration.
+    assert!(
+        RetentionPolicy::until_released(RetentionBasis::OperatorPolicy { from: INVOICED })
+            .is_none()
+    );
+}
+
+/// No basis to keep the data is an instruction to delete, not a licence to
+/// keep it forever.
+#[test]
+fn an_empty_schedule_says_delete_now() {
+    let schedule = RetentionSchedule::new();
+    assert_eq!(schedule.deletion(), Deletion::Immediate);
+    assert!(schedule.is_deletable(INVOICED));
 }
 
 // ── Privacy ──────────────────────────────────────────────────────────────────
@@ -334,10 +392,7 @@ fn a_reduction_loses_information_and_a_pseudonym_does_not() {
     let b: Imsi = "262029999999999".parse().unwrap();
 
     // Reduced: both become the same country, and nothing recovers which.
-    assert_eq!(
-        Reduction::CountryOnly.apply_to_imsi(a),
-        Reduction::CountryOnly.apply_to_imsi(b)
-    );
+    assert_eq!(reduce_to_country(a), reduce_to_country(b));
 
     // Pseudonymised: distinct, because the key holder can still tell them apart.
     let key = TestKey(1);
@@ -385,11 +440,11 @@ proptest! {
         let second: Imsi = format!("262{b}").parse().unwrap();
 
         prop_assert_eq!(
-            Reduction::CountryOnly.apply_to_imsi(first),
-            Reduction::CountryOnly.apply_to_imsi(second)
+            reduce_to_country(first),
+            reduce_to_country(second)
         );
         prop_assert_eq!(
-            Reduction::CountryOnly.apply_to_imsi(first).to_string(),
+            reduce_to_country(first).to_string(),
             "262"
         );
     }
@@ -402,4 +457,97 @@ proptest! {
         let key = TestKey(9);
         prop_assert_eq!(key.pseudonymise(&supi), key.pseudonymise(&supi));
     }
+}
+
+/// The gate that stops a provider concluding from thin data has to measure the
+/// data, not the configuration. `ObservationWindow::new` already refuses
+/// anything shorter than four months, so filling `observed_days` from the
+/// window's length made `window_sufficient` a restatement of the caller's own
+/// setting — always true, and blocking nothing.
+#[test]
+fn the_sufficiency_gate_measures_the_evidence_not_the_configuration() {
+    let window = fairuse::ObservationWindow::minimum();
+    let ending = date!(2026 - 07 - 28);
+
+    // Three weeks of registration data inside a four-month window.
+    let mut presence = Vec::new();
+    let mut day = window.start(ending);
+    for _ in 0..21 {
+        presence.push(PresenceDay::new(day, Region::Eea));
+        day += Duration::days(1);
+    }
+    let usage = vec![record("2026-07-20", "234-15", 9_500)];
+
+    let thin = fairuse::assess(&usage, &presence, home(), window, ending, &regions());
+
+    assert_eq!(thin.observed_days(), 21);
+    assert!(!thin.window_sufficient());
+    assert!(
+        !thin.may_warn(),
+        "insufficient evidence favours the customer"
+    );
+    assert!(!thin.may_surcharge(
+        Some(FairUseAlert::new(date!(2026 - 01 - 01))),
+        date!(2026 - 12 - 31)
+    ));
+    assert_eq!(
+        thin.safe_harbour(),
+        Some(fairuse::SafeHarbour::WindowTooShort)
+    );
+}
+
+/// A feed that reports a subscriber twice on one day has still observed one
+/// day. Counting entries rather than days tilts a test with legal consequences
+/// by however often the feed repeats itself.
+#[test]
+fn presence_counts_days_not_entries() {
+    let window = fairuse::ObservationWindow::minimum();
+    let ending = date!(2026 - 07 - 28);
+
+    let mut presence = Vec::new();
+    let mut day = window.start(ending);
+    for index in 0..window.days() {
+        // Every day abroad, but the first thirty are reported three times over.
+        let region = if index < 30 {
+            Region::Eea
+        } else {
+            Region::Domestic
+        };
+        presence.push(PresenceDay::new(day, region));
+        if index < 30 {
+            presence.push(PresenceDay::new(day, region));
+            presence.push(PresenceDay::new(day, region));
+        }
+        day += Duration::days(1);
+    }
+
+    let assessment = fairuse::assess(&[], &presence, home(), window, ending, &regions());
+
+    assert_eq!(assessment.observed_days(), window.days());
+    assert_eq!(assessment.roaming_presence_days(), 30);
+    assert_eq!(assessment.domestic_presence_days(), window.days() - 30);
+    assert!(assessment.prevailing_domestic_presence());
+}
+
+/// A `Reduction` names a policy; it does not perform one. The three reductions
+/// take different inputs and return different types, so a single `apply` would
+/// have to ignore the variant it was called on — which is what it used to do,
+/// returning a country from a model reduction.
+#[test]
+fn a_reduction_names_a_policy_and_says_what_it_needs() {
+    use mediation::Reduction;
+
+    assert!(Reduction::CountryOnly.applies_to_subscription());
+    assert!(Reduction::NetworkOnly.applies_to_subscription());
+    assert!(!Reduction::ModelOnly.applies_to_subscription());
+
+    // Only the network reduction needs the assignment table, which is what a
+    // configuration check wants to know before it runs.
+    assert!(!Reduction::CountryOnly.needs_assignment_table());
+    assert!(Reduction::NetworkOnly.needs_assignment_table());
+
+    for reduction in Reduction::ALL {
+        assert_eq!(reduction.as_str().parse::<Reduction>().unwrap(), *reduction);
+    }
+    assert_eq!(Reduction::ALL.len(), Reduction::CODES.len());
 }

@@ -303,13 +303,18 @@ impl<'a> BerElement<'a> {
                 "a minimally encoded integer, without leading padding",
             ));
         }
-        if bytes.len() > 8 {
+        // Nine octets are the widest a `u64` can hold: X.690 integers are
+        // signed, so `u64::MAX` is encoded as a `0x00` sign octet followed by
+        // eight value octets. Rejecting that form would put the top bit of the
+        // range out of reach for no reason.
+        let value = if bytes[0] == 0x00 { &bytes[1..] } else { bytes };
+        if value.len() > 8 {
             return Err(DecodeError::new(
                 self.offset,
-                "an integer of at most 8 octets",
+                "an integer that fits in 64 unsigned bits",
             ));
         }
-        Ok(bytes.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)))
+        Ok(value.iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)))
     }
 
     /// Walk this element's structure, refusing to descend past `max_depth`.
@@ -404,6 +409,14 @@ pub struct BerReader<'a> {
 }
 
 impl<'a> BerReader<'a> {
+    /// How deep indefinite-length constructions may nest.
+    ///
+    /// X.690 sets no limit, and a real charging record nests a handful of
+    /// levels. The bound exists because resolving an indefinite length means
+    /// walking the element's subtree, so an unbounded chain of them is
+    /// quadratic in the file size — and because the input is untrusted.
+    pub const MAX_INDEFINITE_DEPTH: usize = 128;
+
     /// A reader over `bytes`.
     #[must_use]
     pub const fn new(bytes: &'a [u8]) -> Self {
@@ -434,14 +447,9 @@ impl<'a> BerReader<'a> {
         }
         let start = self.position;
         match self.read_element(start) {
-            Ok(Some(element)) => {
+            Ok(element) => {
                 self.position += element.encoded_len;
                 Some(Ok(element))
-            }
-            // An end-of-contents marker closes this level.
-            Ok(None) => {
-                self.finished = true;
-                None
             }
             Err(e) => {
                 self.finished = true;
@@ -450,20 +458,26 @@ impl<'a> BerReader<'a> {
         }
     }
 
-    /// `Ok(None)` for an end-of-contents marker, which terminates the level.
-    fn read_element(&self, start: usize) -> Result<Option<BerElement<'a>>, DecodeError> {
+    /// Read the element beginning at `start`.
+    ///
+    /// An end-of-contents marker is an **error** here rather than a quiet stop.
+    /// A reader only ever walks a region whose extent is already known — an
+    /// element's contents, or the caller's whole input — so a marker inside one
+    /// closes nothing. Treating it as a terminator would silently drop every
+    /// remaining field of a definite-length structure, which is exactly the
+    /// "decoder that steps over what it could not read" this module refuses to
+    /// be. The scan that resolves an indefinite length recognises the marker by
+    /// inspection, before reaching here.
+    fn read_element(&self, start: usize) -> Result<BerElement<'a>, DecodeError> {
         let absolute = self.base + start;
         let (tag, after_tag) = self.read_tag(start)?;
         let (length, after_length) = self.read_length(after_tag)?;
 
         if tag.is_end_of_contents() {
-            return match length {
-                BerLength::Definite(0) => Ok(None),
-                _ => Err(DecodeError::new(
-                    absolute,
-                    "an end-of-contents marker with zero length",
-                )),
-            };
+            return Err(DecodeError::new(
+                absolute,
+                "an element; an end-of-contents marker closes nothing here",
+            ));
         }
 
         let (content, encoded_len) = match length {
@@ -496,14 +510,14 @@ impl<'a> BerReader<'a> {
             }
         };
 
-        Ok(Some(BerElement {
+        Ok(BerElement {
             tag,
             length,
             content,
             encoded_len,
             offset: absolute,
             content_offset: self.base + after_length,
-        }))
+        })
     }
 
     /// Decode the identifier octets (X.690 §8.1.2).
@@ -610,8 +624,19 @@ impl<'a> BerReader<'a> {
     ///
     /// Walks the nested elements rather than scanning for `00 00`, because two
     /// zero octets occur inside contents all the time.
+    ///
+    /// **Iterative, and depth-bounded.** Nesting is attacker-controlled in a
+    /// record that arrived over a network, so a scan that recursed once per
+    /// level would abort the process on a file that is a few hundred kilobytes
+    /// of `30 80` — no allocation and no cleverness required of the attacker.
+    /// This walk keeps a counter instead, and refuses input nested deeper than
+    /// [`MAX_INDEFINITE_DEPTH`](Self::MAX_INDEFINITE_DEPTH). The bound also caps
+    /// the cost of descending: resolving an indefinite length is inherently a
+    /// walk of the element's whole subtree, so an unbounded chain of them would
+    /// be quadratic in the file size even without the stack.
     fn scan_to_end_of_contents(&self, start: usize) -> Result<usize, DecodeError> {
         let mut position = start;
+        let mut open = 1usize;
         loop {
             if position + 2 > self.bytes.len() {
                 return Err(DecodeError::new(
@@ -620,13 +645,54 @@ impl<'a> BerReader<'a> {
                 ));
             }
             if self.bytes[position] == 0x00 && self.bytes[position + 1] == 0x00 {
-                return Ok(position);
+                open -= 1;
+                if open == 0 {
+                    return Ok(position);
+                }
+                position += 2;
+                continue;
             }
-            let inner = BerReader::at_offset(&self.bytes[position..], self.base + position);
-            let element = inner.clone().read_element(0)?.ok_or_else(|| {
-                DecodeError::new(self.base + position, "an element, not a marker")
-            })?;
-            position += element.encoded_len;
+
+            // Read the header only. A definite-length element is stepped over
+            // wholesale; an indefinite one opens another level of this loop.
+            let (tag, after_tag) = self.read_tag(position)?;
+            let (length, after_length) = self.read_length(after_tag)?;
+            if tag.is_end_of_contents() {
+                return Err(DecodeError::new(
+                    self.base + position,
+                    "an end-of-contents marker with zero length",
+                ));
+            }
+            match length {
+                BerLength::Definite(n) => {
+                    let end = after_length.checked_add(n).ok_or_else(|| {
+                        DecodeError::new(self.base + position, "a length that does not overflow")
+                    })?;
+                    if end > self.bytes.len() {
+                        return Err(DecodeError::new(
+                            self.base + position,
+                            "contents that fit within the input",
+                        ));
+                    }
+                    position = end;
+                }
+                BerLength::Indefinite => {
+                    if !tag.is_constructed() {
+                        return Err(DecodeError::new(
+                            self.base + position,
+                            "a definite length; only constructed elements may be indefinite",
+                        ));
+                    }
+                    open += 1;
+                    if open > Self::MAX_INDEFINITE_DEPTH {
+                        return Err(DecodeError::new(
+                            self.base + position,
+                            "indefinite lengths nested within the depth limit",
+                        ));
+                    }
+                    position = after_length;
+                }
+            }
         }
     }
 }

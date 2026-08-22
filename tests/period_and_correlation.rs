@@ -12,10 +12,10 @@
 //! is why both are exercised here rather than only in unit tests.
 
 use mediation::{
-    BatchReconciliation, ChainBreak, ChargedParty, ChargingId, CorrelationConfig, CorrelationKeys,
-    Disposition, HoldReason, Octets, PeriodLedger, RecordKey, RecordType, RestateReason,
-    Restatement, RestatementLog, SourceRef, SubscriberRef, UsageDelta, UsageRecord, VolumePair,
-    correlate,
+    BatchReconciliation, CdrTimestamp, ChainBreak, ChargedParty, ChargingId, CorrelationConfig,
+    CorrelationKeys, Disposition, HoldReason, Octets, PeriodLedger, RecordKey, RecordType,
+    RestateReason, Restatement, RestatementLog, SourceRef, SubscriberRef, UsageDelta, UsageRecord,
+    VolumePair, correlate,
 };
 use proptest::prelude::*;
 use std::net::Ipv4Addr;
@@ -291,7 +291,10 @@ fn a_withdrawn_correction_nets_to_nothing_and_leaves_a_trace() {
         UsageDelta::default().with_volume(-5_000, 0),
         "2026-08-02T09:00:00+02:00".parse().unwrap(),
     );
-    let withdrawn = issued.clone().reverse();
+    let withdrawn = issued
+        .clone()
+        .checked_reverse()
+        .expect("a reversible delta");
 
     let log: RestatementLog = vec![issued, withdrawn].into_iter().collect();
     assert_eq!(log.net_for(&key(1)), Some(UsageDelta::ZERO));
@@ -314,7 +317,7 @@ proptest! {
                 UsageDelta::default().with_duration(*seconds),
                 "2026-08-02T09:00:00+02:00".parse().unwrap(),
             );
-            entries.push(entry.clone().reverse());
+            entries.push(entry.clone().checked_reverse().expect("a reversible delta"));
             entries.push(entry);
         }
         entries.reverse();
@@ -325,4 +328,85 @@ proptest! {
             prop_assert_eq!(log.net_for(&key(serial)), Some(UsageDelta::ZERO));
         }
     }
+}
+
+/// A revenue-assurance log runs to hundreds of thousands of corrections over a
+/// period, and `net_for` is asked once per record being settled. Scanning the
+/// whole log per question is quadratic in exactly the case the type exists for.
+#[test]
+fn a_large_correction_log_stays_answerable() {
+    let mut log = RestatementLog::new();
+    let issued: CdrTimestamp = "2026-07-28T10:00:00+02:00".parse().unwrap();
+
+    for sequence in 0..50_000u32 {
+        log.push(Restatement::new(
+            RecordKey::RecordingEntity {
+                entity: "msc-01".parse().unwrap(),
+                local_sequence: sequence,
+            },
+            RestateReason::OperatorCorrection,
+            UsageDelta::ZERO.with_duration(10),
+            issued,
+        ));
+    }
+
+    let target = RecordKey::RecordingEntity {
+        entity: "msc-01".parse().unwrap(),
+        local_sequence: 49_999,
+    };
+    assert_eq!(
+        log.net_for(&target),
+        Some(UsageDelta::ZERO.with_duration(10))
+    );
+    assert_eq!(log.corrected_count(), 50_000);
+    assert_eq!(log.corrected_records().len(), 50_000);
+
+    // A record nobody corrected nets to zero rather than to nothing.
+    let untouched = RecordKey::RecordingEntity {
+        entity: "msc-01".parse().unwrap(),
+        local_sequence: 999_999,
+    };
+    assert_eq!(log.net_for(&untouched), Some(UsageDelta::ZERO));
+}
+
+/// Corrections against one record are returned in the order they were issued,
+/// and the records themselves in first-correction order — a reader following a
+/// period wants them in the order they happened, not in key order.
+#[test]
+fn a_log_reads_in_the_order_things_happened() {
+    let issued: CdrTimestamp = "2026-07-28T10:00:00+02:00".parse().unwrap();
+    let key = |n: u32| RecordKey::RecordingEntity {
+        entity: "msc-01".parse().unwrap(),
+        local_sequence: n,
+    };
+    let mut log = RestatementLog::new();
+    log.push(Restatement::new(
+        key(9),
+        RestateReason::LatePartial,
+        UsageDelta::ZERO.with_duration(1),
+        issued,
+    ));
+    log.push(Restatement::new(
+        key(1),
+        RestateReason::LatePartial,
+        UsageDelta::ZERO.with_duration(2),
+        issued,
+    ));
+    log.push(Restatement::new(
+        key(9),
+        RestateReason::OperatorCorrection,
+        UsageDelta::ZERO.with_duration(3),
+        issued,
+    ));
+
+    assert_eq!(
+        log.corrected_records(),
+        vec![&key(9), &key(1)],
+        "record 9 was corrected first"
+    );
+    assert_eq!(log.entries_for(&key(9)).len(), 2);
+    assert_eq!(
+        log.net_for(&key(9)),
+        Some(UsageDelta::ZERO.with_duration(4))
+    );
 }

@@ -233,6 +233,84 @@ impl fmt::Display for RejectReason {
     }
 }
 
+// ── Outcome ──────────────────────────────────────────────────────────────────
+
+/// One of the five terms on the right of the conservation law.
+///
+/// A [`Disposition`] with its reason stripped away. The reason explains *why* a
+/// record ended where it did; the outcome is which counter it lands in, and it
+/// is the only part a count can be moved between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Outcome {
+    /// Released downstream to be rated.
+    Billable,
+    /// Understood, and deliberately not billed.
+    Suppressed,
+    /// Already seen; the surviving copy carries the usage.
+    Duplicate,
+    /// Cannot be billed, and will not be retried.
+    Rejected,
+    /// Not finished — something that may still arrive is missing.
+    Held,
+}
+
+impl Outcome {
+    /// Every outcome, in the order the conservation law writes them.
+    pub const ALL: &'static [Self] = &[
+        Self::Billable,
+        Self::Suppressed,
+        Self::Duplicate,
+        Self::Rejected,
+        Self::Held,
+    ];
+
+    /// The canonical code of each variant, in [`ALL`](Self::ALL) order.
+    pub const CODES: &'static [&'static str] =
+        &["BILLABLE", "SUPPRESSED", "DUPLICATE", "REJECTED", "HELD"];
+
+    /// The canonical string form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Billable => "BILLABLE",
+            Self::Suppressed => "SUPPRESSED",
+            Self::Duplicate => "DUPLICATE",
+            Self::Rejected => "REJECTED",
+            Self::Held => "HELD",
+        }
+    }
+
+    /// `true` for the one outcome that reaches a rating engine.
+    #[must_use]
+    pub const fn is_released(self) -> bool {
+        matches!(self, Self::Billable)
+    }
+
+    /// `true` for the one outcome that is not final.
+    #[must_use]
+    pub const fn may_return(self) -> bool {
+        matches!(self, Self::Held)
+    }
+}
+
+impl fmt::Display for Outcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Outcome {
+    type Err = crate::error::ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .find(|o| o.as_str().eq_ignore_ascii_case(s.trim()))
+            .copied()
+            .ok_or_else(|| crate::error::ParseError::one_of("Outcome", s, Self::CODES))
+    }
+}
+
 // ── Disposition ──────────────────────────────────────────────────────────────
 
 /// What became of one ingested record.
@@ -277,16 +355,25 @@ impl Disposition {
         matches!(self, Self::Rejected(_) | Self::Held(_))
     }
 
+    /// Which term of the conservation law this record lands in.
+    ///
+    /// The disposition without its reason — what a counter can be keyed on and
+    /// what [`BatchReconciliation::reclassify`] moves between.
+    #[must_use]
+    pub const fn outcome(&self) -> Outcome {
+        match self {
+            Self::Billable => Outcome::Billable,
+            Self::Suppressed(_) => Outcome::Suppressed,
+            Self::Duplicate(_) => Outcome::Duplicate,
+            Self::Rejected(_) => Outcome::Rejected,
+            Self::Held(_) => Outcome::Held,
+        }
+    }
+
     /// A short code naming the outcome, for grouping and reporting.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
-        match self {
-            Self::Billable => "BILLABLE",
-            Self::Suppressed(_) => "SUPPRESSED",
-            Self::Duplicate(_) => "DUPLICATE",
-            Self::Rejected(_) => "REJECTED",
-            Self::Held(_) => "HELD",
-        }
+        self.outcome().as_str()
     }
 }
 
@@ -306,9 +393,13 @@ impl fmt::Display for Disposition {
 
 /// The counting law over one batch.
 ///
-/// Every counter is `u64` and every arithmetic operation is checked: a wrapped
-/// count would make an unbalanced batch appear balanced, which is the one
-/// failure this type exists to make impossible.
+/// Every counter is `u64` and every arithmetic operation that could plausibly
+/// overflow is checked: a wrapped count would make an unbalanced batch appear
+/// balanced, which is the one failure this type exists to make impossible. The
+/// two exceptions are the `+= 1` in [`observe`](Self::observe) and
+/// [`observe_carried`](Self::observe_carried), which would need eighteen
+/// quintillion records in one batch to wrap and cannot be reached by any input
+/// a machine could hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BatchReconciliation {
     carried_in: u64,
@@ -356,14 +447,121 @@ impl BatchReconciliation {
         self.count_outcome(disposition);
     }
 
-    const fn count_outcome(&mut self, disposition: &Disposition) {
-        match disposition {
-            Disposition::Billable => self.billable += 1,
-            Disposition::Suppressed(_) => self.suppressed += 1,
-            Disposition::Duplicate(_) => self.duplicate += 1,
-            Disposition::Rejected(_) => self.rejected += 1,
-            Disposition::Held(_) => self.held += 1,
+    /// Count `count` newly arrived records that all reached `outcome`.
+    ///
+    /// The bulk form of [`observe`](Self::observe), for a caller who already
+    /// holds counts rather than records — a partner's return, a summary row
+    /// loaded from storage. `None` on overflow.
+    #[must_use]
+    pub const fn observe_many(mut self, outcome: Outcome, count: u64) -> Option<Self> {
+        self.ingested = match self.ingested.checked_add(count) {
+            Some(v) => v,
+            None => return None,
+        };
+        match self.add_outcome(outcome, count) {
+            Some(()) => Some(self),
+            None => None,
         }
+    }
+
+    /// Count `count` records **carried in** that all reached `outcome`.
+    ///
+    /// `None` on overflow.
+    #[must_use]
+    pub const fn observe_carried_many(mut self, outcome: Outcome, count: u64) -> Option<Self> {
+        self.carried_in = match self.carried_in.checked_add(count) {
+            Some(v) => v,
+            None => return None,
+        };
+        match self.add_outcome(outcome, count) {
+            Some(()) => Some(self),
+            None => None,
+        }
+    }
+
+    /// How many records reached `outcome`.
+    #[must_use]
+    pub const fn count_of(&self, outcome: Outcome) -> u64 {
+        match outcome {
+            Outcome::Billable => self.billable,
+            Outcome::Suppressed => self.suppressed,
+            Outcome::Duplicate => self.duplicate,
+            Outcome::Rejected => self.rejected,
+            Outcome::Held => self.held,
+        }
+    }
+
+    /// Move `count` records from one outcome to another.
+    ///
+    /// The only supported way to revise a batch after the fact, and the reason
+    /// it exists rather than a set of mutable counters: moving records between
+    /// outcomes is precisely the operation the conservation law polices, so it
+    /// happens through one method that cannot change the totals. `presented`
+    /// is unchanged and the batch still balances afterwards.
+    ///
+    /// `None` when fewer than `count` records are counted under `from`, which
+    /// means the caller and the batch disagree about what the batch held.
+    ///
+    /// ```rust
+    /// use mediation::{BatchReconciliation, Disposition, Outcome};
+    ///
+    /// let mut batch = BatchReconciliation::EMPTY;
+    /// batch.observe(&Disposition::Billable);
+    /// batch.observe(&Disposition::Billable);
+    ///
+    /// // A partner returned one of the two.
+    /// let revised = batch.reclassify(Outcome::Billable, Outcome::Rejected, 1).unwrap();
+    /// assert_eq!(revised.released(), 1);
+    /// assert_eq!(revised.rejected(), 1);
+    /// assert_eq!(revised.presented(), batch.presented());
+    /// assert!(revised.balances());
+    /// ```
+    #[must_use]
+    pub const fn reclassify(mut self, from: Outcome, to: Outcome, count: u64) -> Option<Self> {
+        if self.count_of(from) < count {
+            return None;
+        }
+        self.take_outcome(from, count);
+        match self.add_outcome(to, count) {
+            Some(()) => Some(self),
+            None => None,
+        }
+    }
+
+    const fn add_outcome(&mut self, outcome: Outcome, count: u64) -> Option<()> {
+        let slot = match outcome {
+            Outcome::Billable => &mut self.billable,
+            Outcome::Suppressed => &mut self.suppressed,
+            Outcome::Duplicate => &mut self.duplicate,
+            Outcome::Rejected => &mut self.rejected,
+            Outcome::Held => &mut self.held,
+        };
+        match slot.checked_add(count) {
+            Some(v) => {
+                *slot = v;
+                Some(())
+            }
+            None => None,
+        }
+    }
+
+    /// Subtract from a counter the caller has already checked is large enough.
+    const fn take_outcome(&mut self, outcome: Outcome, count: u64) {
+        let slot = match outcome {
+            Outcome::Billable => &mut self.billable,
+            Outcome::Suppressed => &mut self.suppressed,
+            Outcome::Duplicate => &mut self.duplicate,
+            Outcome::Rejected => &mut self.rejected,
+            Outcome::Held => &mut self.held,
+        };
+        *slot -= count;
+    }
+
+    const fn count_outcome(&mut self, disposition: &Disposition) {
+        // Infallible by construction: one record adds one to one counter, and a
+        // batch that could overflow a `u64` of records would have had to ingest
+        // 18 quintillion of them.
+        let _ = self.add_outcome(disposition.outcome(), 1);
     }
 
     /// How many records arrived for the first time.
@@ -692,10 +890,39 @@ impl PeriodLedger {
     /// The summed counts across the period.
     ///
     /// `carried_in` here is the sum of every batch's carry, which is a measure
-    /// of how much work crossed a boundary rather than of anything owed.
+    /// of how much work crossed a boundary rather than of anything owed, and
+    /// `held` is the sum of every batch's holds, which counts a record once per
+    /// batch it waited in. Neither is the period's own arithmetic — for that,
+    /// ask [`period_totals`](Self::period_totals).
     #[must_use]
     pub const fn totals(&self) -> BatchReconciliation {
         self.totals
+    }
+
+    /// The period's own arithmetic, with the carries telescoped away.
+    ///
+    /// The batch law counts a held record again in every batch that
+    /// re-presents it, which is right per batch and wrong for a period: a
+    /// record held through four batches would be counted four times over.
+    /// [`PeriodTotals`] states the law that survives the chaining —
+    ///
+    /// ```text
+    /// ingested == billable + suppressed + duplicate + rejected + outstanding
+    /// ```
+    ///
+    /// — where `outstanding` is what the **last** batch left held rather than
+    /// the sum of every batch's holds. That is the equation a period close
+    /// needs, and it is the one the chaining exists to make true.
+    #[must_use]
+    pub const fn period_totals(&self) -> PeriodTotals {
+        PeriodTotals {
+            ingested: self.totals.ingested(),
+            billable: self.totals.released(),
+            suppressed: self.totals.suppressed(),
+            duplicate: self.totals.duplicate(),
+            rejected: self.totals.rejected(),
+            outstanding: self.outstanding,
+        }
     }
 
     /// `true` when the period may be closed.
@@ -705,6 +932,97 @@ impl PeriodLedger {
     #[must_use]
     pub fn is_closable(&self) -> bool {
         self.breaks.is_empty() && self.outstanding == 0
+    }
+}
+
+/// The conservation law over a whole period, with the batch carries
+/// telescoped away.
+///
+/// Produced by [`PeriodLedger::period_totals`]. Every record ever ingested
+/// reached a **final** outcome, or is still explicitly outstanding:
+///
+/// ```text
+/// ingested == billable + suppressed + duplicate + rejected + outstanding
+/// ```
+///
+/// A separate type from [`BatchReconciliation`] because it states a different
+/// equation over a different set of counters — there is no `carried_in` here,
+/// and `outstanding` is the last batch's holds rather than every batch's. One
+/// type carrying both meanings would let a caller read the wrong law off the
+/// right numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PeriodTotals {
+    /// How many records arrived for the first time across the period.
+    pub ingested: u64,
+    /// How many were released downstream.
+    pub billable: u64,
+    /// How many were understood and deliberately not billed.
+    pub suppressed: u64,
+    /// How many were recognised as retransmissions.
+    pub duplicate: u64,
+    /// How many can never be billed.
+    pub rejected: u64,
+    /// How many the last batch left waiting.
+    pub outstanding: u64,
+}
+
+impl PeriodTotals {
+    /// How many reached a final outcome.
+    ///
+    /// `None` on overflow, which is itself an imbalance.
+    #[must_use]
+    pub const fn finalised(&self) -> Option<u64> {
+        let Some(total) = self.billable.checked_add(self.suppressed) else {
+            return None;
+        };
+        let Some(total) = total.checked_add(self.duplicate) else {
+            return None;
+        };
+        total.checked_add(self.rejected)
+    }
+
+    /// Whether the period's law holds.
+    ///
+    /// An overflowing sum reads as `false`: it cannot equal an ingested count
+    /// that did not itself overflow, so an unbalanced period never reads as
+    /// balanced by luck.
+    #[must_use]
+    pub const fn balances(&self) -> bool {
+        let Some(finalised) = self.finalised() else {
+            return false;
+        };
+        match finalised.checked_add(self.outstanding) {
+            Some(total) => total == self.ingested,
+            None => false,
+        }
+    }
+
+    /// `true` when the period balances and nothing is still waiting.
+    #[must_use]
+    pub const fn is_closable(&self) -> bool {
+        self.balances() && self.outstanding == 0
+    }
+}
+
+impl fmt::Display for PeriodTotals {
+    /// One line, in the order of the law, so an imbalance is visible by
+    /// inspection.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ingested={} = billable={} + suppressed={} + duplicate={} + rejected={} + outstanding={} [{}]",
+            self.ingested,
+            self.billable,
+            self.suppressed,
+            self.duplicate,
+            self.rejected,
+            self.outstanding,
+            if self.balances() {
+                "balanced"
+            } else {
+                "UNBALANCED"
+            }
+        )
     }
 }
 
@@ -729,7 +1047,7 @@ impl fmt::Display for PeriodLedger {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{BatchReconciliation, HoldReason, SuppressReason};
+    use super::{BatchReconciliation, HoldReason, Outcome, SuppressReason};
     use serde::de::{self, Visitor};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::fmt;
@@ -762,6 +1080,7 @@ mod serde_impl {
 
     string_serde!(SuppressReason, "a suppression reason code");
     string_serde!(HoldReason, "a hold reason code");
+    string_serde!(Outcome, "an outcome code such as \"BILLABLE\"");
 
     /// Field names are part of the public representation and covered by semver.
     #[derive(Serialize, Deserialize)]

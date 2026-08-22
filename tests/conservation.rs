@@ -9,10 +9,34 @@
 //! processing orders, split arbitrarily and recombined.
 
 use mediation::{
-    BatchReconciliation, Disposition, HoldReason, NotKeyable, RecordKey, RejectReason,
-    SuppressReason, UnattributableReason,
+    Batch, BatchReconciliation, ChargedParty, ChargingId, CorrelationKeys, DedupWindow,
+    Disposition, HoldReason, NotKeyable, Octets, ProcessConfig, ProcessState, RecordKey,
+    RecordType, RejectReason, SourceRef, SubscriberRef, SuppressReason, UnattributableReason,
+    UsageRecord, VolumePair, apportion, process, split_session,
 };
 use proptest::prelude::*;
+use std::net::Ipv4Addr;
+use time::{Duration, OffsetDateTime, macros::datetime};
+
+const NOW: OffsetDateTime = datetime!(2026-07-28 12:00:00 UTC);
+
+/// A record that reaches `Billable` on its own.
+fn billable(charging_id: u32) -> UsageRecord {
+    UsageRecord::new(
+        RecordType::PduSession,
+        ChargedParty::Subscriber(SubscriberRef::new("imsi-262021234567890".parse().unwrap())),
+        "2026-07-28T10:00:00+02:00".parse().unwrap(),
+        SourceRef::new("pgw-fra-01".parse().unwrap(), 0),
+    )
+    .with_networks("262-02".parse().unwrap(), "262-02".parse().unwrap())
+    .with_closed("2026-07-28T10:30:00+02:00".parse().unwrap())
+    .with_volume(VolumePair::new(Octets::new(1_000), Octets::new(4_000)))
+    .with_correlation(
+        CorrelationKeys::default()
+            .with_charging_id(ChargingId::new(charging_id))
+            .with_gateway(Ipv4Addr::new(10, 0, 0, 1).into()),
+    )
+}
 
 /// Any outcome a record can reach.
 fn any_disposition() -> impl Strategy<Value = Disposition> {
@@ -172,4 +196,195 @@ fn each_outcome_is_final_or_returnable_and_not_both() {
     kinds.sort_unstable();
     kinds.dedup();
     assert_eq!(kinds.len(), all.len());
+}
+
+/// A session that opened and closed in the same second still carries the octets
+/// it reported. Dividing by a zero span used to hand every slice nothing —
+/// silently deleting the whole volume through the one function whose stated
+/// purpose is that usage is never created or destroyed.
+#[test]
+fn a_zero_length_session_does_not_lose_its_usage() {
+    let record = UsageRecord::new(
+        RecordType::PduSession,
+        ChargedParty::Subscriber(SubscriberRef::new("imsi-262021234567890".parse().unwrap())),
+        "2026-07-28T10:00:00+02:00".parse().unwrap(),
+        SourceRef::new("pgw-01".parse().unwrap(), 0),
+    )
+    .with_closed("2026-07-28T10:00:00+02:00".parse().unwrap())
+    .with_volume(VolumePair::new(Octets::new(1_000), Octets::new(500)));
+
+    let split = split_session(&record, &[datetime!(2026-07-28 09:00 +2)]).unwrap();
+
+    assert_eq!(split.len(), 1);
+    assert_eq!(split.total_volume(), record.volume);
+    assert!(split.conserves(&record));
+}
+
+/// The property beneath the whole module, over every shape of input: what goes
+/// into an apportionment comes out of it.
+#[test]
+fn apportionment_conserves_for_every_weighting() {
+    for total in [0u64, 1, 7, 1_000, u64::MAX] {
+        for weights in [
+            vec![0u64],
+            vec![0, 0],
+            vec![0, 0, 0, 0, 0],
+            vec![1, 0, 1],
+            vec![u64::MAX, u64::MAX],
+            vec![3, 1, 4, 1, 5, 9, 2, 6],
+        ] {
+            let parts = apportion(total, &weights);
+            assert_eq!(parts.len(), weights.len());
+            assert_eq!(
+                parts.iter().map(|p| u128::from(*p)).sum::<u128>(),
+                u128::from(total),
+                "{total} over {weights:?}"
+            );
+        }
+    }
+}
+
+// ── The law through the one-pass driver ──────────────────────────────────────
+
+/// A record built from generated parts, so the batch contains shapes nobody
+/// thought to write a test for.
+fn any_record() -> impl Strategy<Value = UsageRecord> {
+    (
+        0u32..4,                       // which correlator, if any
+        0u32..6,                       // which correlator value
+        proptest::option::of(0u32..4), // a partial sequence, sometimes
+        proptest::bool::ANY,           // fully qualified, or reduced
+        0u64..5_000,                   // uplink octets
+        proptest::bool::ANY,           // attributable, or not
+        0i64..90,                      // days before the evaluation instant
+        proptest::option::of(0u32..3), // a file sequence, sometimes
+    )
+        .prop_map(
+            |(shape, value, partial, fqpc, uplink, attributable, age, file)| {
+                let party = if attributable {
+                    ChargedParty::Subscriber(SubscriberRef::new(
+                        "imsi-262021234567890".parse().unwrap(),
+                    ))
+                } else {
+                    ChargedParty::Unattributable(UnattributableReason::IdentityAbsent)
+                };
+                let opened = datetime!(2026-07-28 10:00:00 UTC) - time::Duration::days(age);
+                let opened =
+                    mediation::CdrTimestamp::from_utc(opened, mediation::QuarterHourOffset::UTC);
+                let mut source = SourceRef::new("pgw-01".parse().unwrap(), 0);
+                if let Some(file) = file {
+                    source = source.with_file_sequence(file);
+                }
+
+                let mut record = UsageRecord::new(RecordType::PduSession, party, opened, source)
+                    .with_closed(opened)
+                    .with_volume(VolumePair::new(Octets::new(uplink), Octets::ZERO));
+
+                let mut keys = mediation::CorrelationKeys::default();
+                match shape {
+                    0 => {}
+                    1 => {
+                        keys = keys
+                            .with_charging_id(mediation::ChargingId::new(value))
+                            .with_gateway(std::net::Ipv4Addr::new(10, 0, 0, 1).into());
+                    }
+                    2 => {
+                        keys = keys.with_icid(format!("icid-{value}").parse().unwrap());
+                    }
+                    _ => {
+                        keys.recording_entity = Some("pgw-01".parse().unwrap());
+                        keys.local_sequence_number = Some(value);
+                    }
+                }
+                if let Some(sequence) = partial {
+                    keys.record_sequence_number = Some(sequence + 1);
+                    record.partial = Some(mediation::PartialInfo::new(
+                        sequence + 1,
+                        if fqpc {
+                            mediation::PartialFormat::FullyQualified
+                        } else {
+                            mediation::PartialFormat::Reduced
+                        },
+                        mediation::RecordClosureCause::VolumeLimit,
+                    ));
+                }
+                record.with_correlation(keys)
+            },
+        )
+}
+
+proptest! {
+    /// The crate's central claim, at the level a caller actually uses: whatever
+    /// a batch contains, `process` accounts for every record exactly once.
+    #[test]
+    fn the_driver_conserves_over_any_batch(
+        records in proptest::collection::vec(any_record(), 0..24),
+        carried in 0usize..6,
+    ) {
+        let carried = carried.min(records.len());
+        let batch = mediation::Batch::with_carry(&records, carried).expect("within the slice");
+
+        let mut state = mediation::ProcessState::new(
+            mediation::DedupWindow::from_bound(time::Duration::days(7)).unwrap(),
+        );
+        let outcome = mediation::process(
+            &batch,
+            &mediation::ProcessConfig::default(),
+            datetime!(2026-07-28 12:00:00 UTC),
+            &mut state,
+        );
+
+        prop_assert_eq!(outcome.dispositions().len(), records.len());
+        prop_assert_eq!(outcome.reconciliation().carried_in(), carried as u64);
+        prop_assert_eq!(
+            outcome.reconciliation().presented(),
+            Some(records.len() as u64)
+        );
+        prop_assert!(outcome.reconciliation().balances());
+
+        // The totals are of exactly the records that were released.
+        if let Ok(totals) = outcome.totals() {
+            prop_assert!(totals.is_consistent());
+        }
+    }
+
+    /// Replaying the same batch against fresh state reproduces the same answer,
+    /// which is what a disputed billing cycle needs.
+    #[test]
+    fn the_driver_is_deterministic(
+        records in proptest::collection::vec(any_record(), 0..16),
+    ) {
+        let run = || {
+            let mut state = mediation::ProcessState::new(
+                mediation::DedupWindow::from_bound(time::Duration::days(7)).unwrap(),
+            );
+            let outcome = mediation::process(
+                &mediation::Batch::new(&records),
+                &mediation::ProcessConfig::default(),
+                datetime!(2026-07-28 12:00:00 UTC),
+                &mut state,
+            );
+            (outcome.dispositions().to_vec(), *outcome.reconciliation())
+        };
+        prop_assert_eq!(run(), run());
+    }
+}
+
+/// Two reconciliations of one batch must not disagree. The pipeline's counts
+/// and the ones travelling with the total are the same batch seen twice, and a
+/// carried record counted as a new arrival in one of them is the seam where a
+/// reconciliation stops being evidence.
+#[test]
+fn the_totals_carry_the_same_reconciliation_the_pass_reported() {
+    let records: Vec<UsageRecord> = (1..=4).map(billable).collect();
+    let batch = Batch::with_carry(&records, 2).expect("two carried");
+
+    let mut state = ProcessState::new(DedupWindow::from_bound(Duration::days(7)).unwrap());
+    let outcome = process(&batch, &ProcessConfig::default(), NOW, &mut state);
+
+    let totals = outcome.totals().expect("aggregable");
+    assert_eq!(&totals.reconciliation(), outcome.reconciliation());
+    assert_eq!(totals.reconciliation().carried_in(), 2);
+    assert_eq!(totals.reconciliation().ingested(), 2);
+    assert!(totals.is_consistent());
 }

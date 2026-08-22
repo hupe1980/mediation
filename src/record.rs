@@ -708,10 +708,16 @@ impl UsageRecord {
     /// Zero volume, zero duration and zero events together mean the record
     /// describes nothing; whether that is chargeable is a policy question, but
     /// it is always worth surfacing.
+    ///
+    /// The volume is [`billable_volume`](Self::billable_volume), not the
+    /// record-level field: a packet-data record commonly carries its volume
+    /// **only** in its containers, and reading the absent record total as zero
+    /// would call a five-gigabyte session empty — which a suppression policy
+    /// then deliberately does not bill.
     #[must_use]
     pub fn is_zero_usage(&self) -> bool {
         self.duration.is_none_or(Seconds::is_zero)
-            && self.volume.is_none_or(VolumePair::is_zero)
+            && self.billable_volume().is_none_or(VolumePair::is_zero)
             && self.events.is_none_or(|e| e == 0)
     }
 }

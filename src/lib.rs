@@ -13,6 +13,15 @@
 //! attributed to a charged party, a network and a service, which a rating layer
 //! then prices.
 //!
+//! <div class="warning">
+//!
+//! **Long-form documentation lives at
+//! <https://hupe1980.github.io/mediation>.** This page is the API reference;
+//! the site explains the failure each piece exists to prevent, and every one of
+//! its examples is compiled by this crate's test suite.
+//!
+//! </div>
+//!
 //! # Modules
 //!
 //! | Module | Contents |
@@ -22,30 +31,30 @@
 //! | [`ber`] | `BerReader`, `BerElement`, `BerTag` — the X.690 framing a CDR arrives in |
 //! | [`cdrtime`] | `CdrTimestamp`, `QuarterHourOffset`, `DstAdjustment`, `MsTimeZone`, `Seconds` |
 //! | [`volume`] | `Octets`, `VolumePair`, `ByteScale` — integer data volumes |
-//! | [`plmn`] | `Mcc`, `Mnc`, `PlmnId`, `TadigCode` — network identity |
-//! | [`identity`] | `Imsi`, `Msisdn`, `Imei`, `Imeisv`, `Iccid`, `Supi`, `Gpsi`, `Pei`, `Suci` |
+//! | [`plmn`] | `Mcc`, `Mnc`, `PlmnId`, `TadigCode` — network identity, and its three-octet wire form |
+//! | [`identity`] | `Imsi`, `Msisdn`, `Imei`, `Imeisv`, `Iccid`, `Supi`, `Gpsi`, `Pei`, `Suci`, `AddressString` |
 //! | [`jurisdiction`] | `usage_country()`, `customer_country_presumption()` — two questions, two countries |
-//! | [`location`] | `UserLocation`, `Cgi`, `Ecgi`, `Ncgi`, `Tai` — where a record was produced |
+//! | [`location`] | `UserLocation`, `Uli`, `Cgi`, `Sai`, `Rai`, `Lai`, `Ecgi`, `Ncgi`, `Tai` — where a record was produced |
 //! | [`numbering`] | `NumberRange`, `NumberRangeSet`, `Porting`, `terminating_plmn` — who really terminates a number |
 //! | [`party`] | `ChargedParty`, `SubscriberRef`, `TenantRef` — who the usage is charged to |
-//! | [`correlation`] | `CorrelationKeys`, `ChargingId`, `Icid`, `PacketSessionId` |
+//! | [`correlation`] | `CorrelationKeys`, `ChargingId`, `Icid`, `correlate()`, `CorrelatedGroup`, `LegChain` |
 //! | [`container`] | `ServiceDataContainer`, `ContainerSet`, `RatingGroup`, `ChangeCondition` |
-//! | [`correlate`](mod@correlate) | `correlate()`, `CorrelatedGroup`, `LegChain` — joining one usage's records |
 //! | [`partial`] | `PartialInfo`, `PartialRun`, `Reassembly`, `RecordClosureCause` |
-//! | [`session`] | `Dnn`, `Snssai`, `RatType` — the network, slice and access a session ran on |
-//! | [`timeband`] | `split_session()`, `apportion()`, `Apportionment` — dividing usage at a tariff boundary |
+//! | [`pipeline`] | `process()`, `Batch`, `ProcessState`, `ProcessOutcome` — the whole layer, in one pass |
+//! | [`session`] | `Dnn`, `Snssai`, `RatType`, `ChargingCharacteristics` — the network, slice, access and charging profile a session ran on |
+//! | [`timeband`] | `split_session()`, `split_measured()`, `apportion()` — dividing usage at a tariff boundary |
 //! | [`record`] | `UsageRecord`, `RecordType`, `ServiceDomain`, `SourceRef` |
 //! | [`lateness`] | `LatenessPolicy`, `Lateness` — one concept behind every window |
-//! | [`sequence`] | `SequenceSpace`, `SequenceValue`, `SequenceTracker` — wrap-aware gap detection |
+//! | [`sequence`] | `SequenceSpace`, `SequenceValue`, `SequenceTracker`, `SequenceSnapshot` — wrap-aware gap detection |
 //! | [`dedup`] | `RecordKey`, `DedupStore`, `DedupWindow` — natural-key deduplication |
-//! | [`disposition`] | `Disposition`, `BatchReconciliation` — the conservation law |
+//! | [`disposition`] | `Disposition`, `Outcome`, `BatchReconciliation`, `PeriodLedger` — the conservation law |
 //! | [`validation`] | `validate_records()`, `Rule` (V01–V21), `Finding`, `Severity` |
 //! | [`restatement`] | `Restatement`, `UsageDelta`, `RestatementLog` — corrections as signed events |
 //! | [`quality`] | `score_batch()`, `QualityGrade`, `ReleaseBlocker` — the release gate |
 //! | [`aggregation`] | `aggregate_released()`, `UsageTotal` — what the batch adds up to |
-//! | [`roaming`] | `TapBatch`, `ScaledAmount`, `RapReturn` — a partner's batch, and whether it adds up |
-//! | [`fairuse`] | `assess()`, `FairUseAssessment`, `VolumeAllowance` — EU 2016/2286 |
-//! | [`retention`] | `RetentionPolicy`, `RetentionSchedule` — how long a record may be kept |
+//! | [`roaming`] | `TapBatch`, `BatchTotals`, `ScaledAmount`, `RapReturn` — a partner's batch, and whether it adds up |
+//! | [`fairuse`] | `assess()`, `FairUseAssessment`, `FairUseAlert`, `VolumeAllowance` — EU 2016/2286 |
+//! | [`retention`] | `RetentionPolicy`, `RetentionSchedule`, `Deletion` — how long a record may be kept |
 //! | [`fraud`] | `Signal`, `Indication`, `impossible_travel()` — evidence, never verdicts |
 //! | [`privacy`] | `Pseudonymiser`, `Reduction` — narrowing an identity to the question |
 //!
@@ -115,12 +124,125 @@
 //! behaviour. It is offered here as a named primitive
 //! ([`Octets::units_ceil`], [`Seconds::units_ceil`]) and applied by nothing.
 //! What leaves this crate is the measured quantity.
+//!
+//! # Every input is untrusted
+//!
+//! A mediation layer reads records that arrived over a network from a partner's
+//! equipment, so **no input may panic a parser or a decoder**. Every
+//! [`FromStr`](std::str::FromStr) and every wire decoder here returns a
+//! `Result` for arbitrary input, and a property suite hammers all of them with
+//! generated strings and bytes on every build.
+//!
+//! Two consequences are visible in the API. Anything whose size is chosen by
+//! the input is **bounded**: [`SequenceTracker::observe`] caps the missing
+//! identities it lists, [`PartialRun::assess`] caps the holes it names while
+//! still counting them exactly, and [`BerReader`] bounds how deep indefinite
+//! lengths may nest. And nothing is silently skipped: a decoder that stepped
+//! over a field it could not read would produce a record missing exactly the
+//! fields it failed on, which is worse than no record.
+
+/// The README's code blocks, compiled as doctests.
+///
+/// `cfg(doctest)` is set only while rustdoc is collecting doctests, so this
+/// costs nothing in a normal build and adds nothing to the rendered docs. What
+/// it buys is that a snippet in the README **cannot** drift from the API: a
+/// README that claims to be tested and is not is worse than one that claims
+/// nothing, because a reader trusts it.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
+
+/// Every page of the documentation site, compiled as doctests.
+///
+/// The site under `site/` is the crate's long-form documentation, and the same
+/// argument that applies to the README applies to it with more force: a
+/// published page is read by people who will not check it against the API, and
+/// a page that has quietly drifted is worse than no page at all.
+///
+/// So every Rust block on the site is compiled and run by `cargo test`. A page
+/// that names a function the crate does not have, or asserts a value it no
+/// longer returns, fails the build. Zola's TOML front matter is inert markdown
+/// to rustdoc, so the files need no preprocessing to be both.
+///
+/// The one thing this costs: the site cannot use rustdoc's hidden-line syntax,
+/// because Zola would render the marker. Examples on the site are therefore
+/// whole — which is what a reader wanting to paste one into a file needs
+/// anyway.
+#[cfg(doctest)]
+mod site_doctests {
+    /// The `getting-started` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/getting-started.md")]
+    pub struct GettingStarted;
+
+    /// The `time` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/time.md")]
+    pub struct Time;
+
+    /// The `quantities` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/quantities.md")]
+    pub struct Quantities;
+
+    /// The `identity` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/identity.md")]
+    pub struct Identity;
+
+    /// The `location` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/location.md")]
+    pub struct Location;
+
+    /// The `pipeline` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/pipeline.md")]
+    pub struct Pipeline;
+
+    /// The `conservation` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/conservation.md")]
+    pub struct Conservation;
+
+    /// The `completeness` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/completeness.md")]
+    pub struct Completeness;
+
+    /// The `deduplication` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/deduplication.md")]
+    pub struct Deduplication;
+
+    /// The `reassembly` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/reassembly.md")]
+    pub struct Reassembly;
+
+    /// The `validation` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/validation.md")]
+    pub struct Validation;
+
+    /// The `tariff-boundaries` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/tariff-boundaries.md")]
+    pub struct TariffBoundaries;
+
+    /// The `roaming` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/roaming.md")]
+    pub struct Roaming;
+
+    /// The `regulatory` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/regulatory.md")]
+    pub struct Regulatory;
+
+    /// The `fraud` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/fraud.md")]
+    pub struct Fraud;
+
+    /// The `wire-formats` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/wire-formats.md")]
+    pub struct WireFormats;
+
+    /// The `design` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/design.md")]
+    pub struct Design;
+}
 
 pub mod aggregation;
 pub mod ber;
 pub mod cdrtime;
 pub mod container;
-pub mod correlate;
 pub mod correlation;
 pub mod dedup;
 pub mod digits;
@@ -135,6 +257,7 @@ pub mod location;
 pub mod numbering;
 pub mod partial;
 pub mod party;
+pub mod pipeline;
 pub mod plmn;
 pub mod privacy;
 pub mod quality;
@@ -150,39 +273,42 @@ pub mod volume;
 
 pub use aggregation::{
     AggregationError, ReleasedTotals, UsageTotal, aggregate, aggregate_by, aggregate_rating_groups,
-    aggregate_released,
+    aggregate_released, aggregate_released_with_carry,
 };
 pub use ber::{BerElement, BerLength, BerReader, BerTag, TagClass};
 pub use cdrtime::{CdrTimestamp, Century, DstAdjustment, MsTimeZone, QuarterHourOffset, Seconds};
 pub use container::{ChangeCondition, ContainerSet, Qos5qi, RatingGroup, ServiceDataContainer};
-pub use correlate::{
-    CorrelatedGroup, CorrelationConfig, CorrelationKey, CorrelationResult, LegChain, Unmatched,
-    UnmatchedReason, correlate,
+pub use correlation::{
+    BrokenLeg, ChargingId, CorrelatedGroup, CorrelationConfig, CorrelationKey, CorrelationKeys,
+    CorrelationResult, Icid, LegChain, PacketSessionId, Unmatched, UnmatchedReason, correlate,
 };
-pub use correlation::{ChargingId, CorrelationKeys, Icid, PacketSessionId};
 pub use dedup::{DedupDecision, DedupStore, DedupWindow, NotKeyable, RecordKey};
 pub use digits::DigitString;
 pub use disposition::{
-    BatchReconciliation, ChainBreak, Disposition, HoldReason, PeriodLedger, RejectReason,
-    SuppressReason,
+    BatchReconciliation, ChainBreak, Disposition, HoldReason, Outcome, PeriodLedger, PeriodTotals,
+    RejectReason, SuppressReason,
 };
 pub use error::{DecodeError, ParseError};
 pub use fairuse::{
-    AllowanceStatus, FairUseAssessment, ObservationWindow, PresenceDay, Region, Regions,
-    SafeHarbour, VolumeAllowance,
+    AllowanceStatus, FairUseAlert, FairUseAssessment, ObservationWindow, PresenceDay, Region,
+    Regions, SafeHarbour, VolumeAllowance,
 };
 pub use fraud::{
-    CalledParty, Indication, Signal, TrafficShape, ait_signature, bypass_signature,
-    impossible_travel, premium_destination, wangiri_pattern,
+    CalledParty, Indication, Signal, TrafficShape, TransitTimes, UniformTransit, ait_signature,
+    bypass_signature, impossible_travel, premium_destination, wangiri_pattern,
 };
-pub use identity::{Gpsi, Iccid, Imei, Imeisv, Imsi, Msin, Msisdn, Nai, Pei, Suci, Supi, Tac};
+pub use identity::{
+    AddressString, Gpsi, Iccid, Imei, Imeisv, Imsi, Msin, Msisdn, Nai, NatureOfAddress,
+    NumberingPlan, Pei, RoutingIndicator, Suci, Supi, Tac,
+};
 pub use jurisdiction::{
     Ambiguity, Jurisdiction, customer_country_presumption, is_abroad, usage_country,
 };
 pub use lateness::{Lateness, LatenessPolicy};
 pub use location::{
-    CellId, Cgi, Ecgi, Eci, EnbKind, GnbIdLength, Lac, Ncgi, Nci, Sai, ServiceAreaCode, TacWidth,
-    Tai, TrackingAreaCode, UserLocation,
+    CellId, Cgi, Ecgi, Eci, EnbKind, ExtendedEnbKind, ExtendedMacroEnbId, GnbIdLength, Lac, Lai,
+    MacroEnbId, Ncgi, Nci, Rai, RoutingAreaCode, Sai, ServiceAreaCode, TacWidth, Tai,
+    TrackingAreaCode, Uli, UserLocation,
 };
 pub use numbering::{NumberRange, NumberRangeSet, Porting, is_ported, terminating_plmn};
 pub use partial::{
@@ -191,18 +317,24 @@ pub use partial::{
 pub use party::{
     ChargedParty, NfInstanceId, PartyId, SubscriberRef, TenantRef, UnattributableReason,
 };
+pub use pipeline::{
+    Batch, NoSuppression, ProcessConfig, ProcessOutcome, ProcessState, SequenceGap, Suppression,
+    process, process_with,
+};
 pub use plmn::{Mcc, Mnc, MncWidth, MncWidths, NorthAmericanRule, PlmnId, TadigCode};
 pub use privacy::{
     NumberPrefix, Pseudonym, Pseudonymiser, ReducedSubscriber, Reduction, reduce_equipment,
-    software_version,
+    reduce_to_country, reduce_to_network, software_version,
 };
 pub use quality::{QualityGrade, QualityReport, ReleaseBlocker, score_batch};
 pub use record::{NodeId, PrimaryMeasure, RecordType, ServiceDomain, SourceRef, UsageRecord};
 pub use restatement::{RestateReason, Restatement, RestatementLog, UsageDelta};
-pub use retention::{RetentionBasis, RetentionPolicy, RetentionSchedule};
-pub use roaming::{BatchDiscrepancy, RapReturn, ScaledAmount, TapBatch};
+pub use retention::{Deletion, RetentionBasis, RetentionPolicy, RetentionSchedule};
+pub use roaming::{BatchDiscrepancy, BatchTotals, RapReturn, ScaledAmount, TapBatch, TotalKind};
 pub use sequence::{SequenceObservation, SequenceSpace, SequenceTracker, SequenceValue};
-pub use session::{Dnn, RatType, SessionContext, SliceServiceType, Snssai};
+pub use session::{
+    ChargingCharacteristics, Dnn, RatType, SessionContext, SliceServiceType, Snssai,
+};
 pub use timeband::{
     Apportionment, SplitError, TimeSlice, UsageSplit, apportion, split_measured, split_session,
 };

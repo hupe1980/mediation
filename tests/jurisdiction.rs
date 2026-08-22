@@ -242,3 +242,67 @@ fn jurisdiction_is_replayable() {
         );
     }
 }
+
+/// ITU-T E.212 sets aside codes that name no territory: test and trial
+/// networks, internal use, and the shared codes international operators use.
+/// They are well-formed, and filing usage under "country 901" answers no
+/// question about where the subscriber was — which is what retention, lawful
+/// interception and roaming regulation turn on.
+#[test]
+fn a_non_geographic_network_fixes_no_country() {
+    for (mcc, network) in [
+        ("001", "001-01"),
+        ("901", "901-01"),
+        ("902", "902-01"),
+        ("991", "991-01"),
+        ("999", "999-01"),
+    ] {
+        let record = record("imsi-262021234567890", network, "262-02");
+        assert_eq!(
+            usage_country(&record),
+            Jurisdiction::Unresolved(Ambiguity::NonGeographicNetwork {
+                mcc: mcc.parse().unwrap()
+            }),
+            "{network}"
+        );
+        // Unresolved is unresolved: nothing downstream may assume a country.
+        assert_eq!(is_abroad(&record), None);
+    }
+
+    // An ordinary network is unaffected.
+    let ordinary = record("imsi-262021234567890", "214-07", "262-02");
+    assert!(usage_country(&ordinary).is_resolved());
+}
+
+/// The reasons are distinct because the remedies are: a satellite record needs
+/// a position from somewhere else, a shared-code record is very likely a test
+/// record that should never have entered the feed, and a silent one needs the
+/// decoder fixed.
+#[test]
+fn the_unresolved_reasons_stay_distinguishable() {
+    let shared = record("imsi-262021234567890", "901-01", "262-02");
+    let ambiguity = usage_country(&shared).ambiguity().unwrap();
+    assert_eq!(ambiguity.as_str(), "NON_GEOGRAPHIC_NETWORK");
+    assert!(!ambiguity.is_contradiction());
+    assert!(ambiguity.to_string().contains("901"), "{ambiguity}");
+}
+
+/// Both questions apply the same geographic test. A test SIM has no tax country,
+/// and answering "001" would invent one — the asymmetry nobody notices until a
+/// test SIM turns up on a VAT return.
+#[test]
+fn a_test_sim_has_no_tax_country_either() {
+    let test_sim = record("imsi-001010000000001", "262-02", "262-02");
+
+    assert!(matches!(
+        customer_country_presumption(&test_sim),
+        Jurisdiction::Unresolved(Ambiguity::NonGeographicNetwork { .. }),
+    ));
+    // The usage side still resolves — the *serving* network is a real one.
+    assert_eq!(
+        usage_country(&test_sim),
+        Jurisdiction::Country("262".parse().unwrap())
+    );
+    // And with no customer country there is no answer to "abroad?".
+    assert_eq!(is_abroad(&test_sim), None);
+}

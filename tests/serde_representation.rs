@@ -14,6 +14,10 @@
 
 #![cfg(feature = "serde")]
 
+use mediation::{
+    AddressString, BatchTotals, ChargingCharacteristics, Lai, NatureOfAddress, NumberingPlan,
+    Outcome, Rai, RoutingAreaCode, ScaledAmount, SequenceGap, Suci, Tai, TotalKind, Uli,
+};
 use mediation::{Ambiguity, Jurisdiction};
 use mediation::{
     Apportionment, ByteScale, CdrTimestamp, ChargedParty, DstAdjustment, Ecgi, Eci, EnbKind, Gpsi,
@@ -419,4 +423,145 @@ fn a_jurisdiction_distinguishes_a_country_from_a_reason() {
             value
         );
     }
+}
+
+// ── The types added since the first release ──────────────────────────────────
+
+/// A SUCI is one string with seven fields, and the order is the whole point —
+/// pinned so a rename or a reorder cannot happen quietly.
+#[test]
+fn a_suci_serialises_as_its_canonical_string() {
+    let suci: Suci = "suci-0-262-02-0678-1-27-0072b7d4c1e8".parse().unwrap();
+    assert_wire(&suci, "\"suci-0-262-02-0678-1-27-0072b7d4c1e8\"");
+}
+
+/// The qualifier octet's two fields are stored as their **codes**. A stored `1`
+/// says nothing about whether it was a nature of address or a numbering plan,
+/// and the two are adjacent fields of the same octet.
+#[test]
+fn an_address_string_keeps_its_qualifier() {
+    let address = AddressString::from_bytes(&[0x91, 0x94, 0x71, 0x10, 0x32, 0x54, 0x76]).unwrap();
+    assert_wire(
+        &address,
+        r#"{"nature":"INTERNATIONAL","plan":"ISDN","digits":"491701234567"}"#,
+    );
+
+    // A reserved value keeps its number, because that is all that identifies it.
+    let reserved = AddressString::new(
+        NatureOfAddress::Reserved(5),
+        NumberingPlan::Reserved(2),
+        "1234".parse().unwrap(),
+    );
+    assert_wire(
+        &reserved,
+        r#"{"nature":"RESERVED_5","plan":"RESERVED_2","digits":"1234"}"#,
+    );
+}
+
+/// A ULI keeps every identity it carried, so what was reported survives the
+/// round trip rather than being reduced to whichever one a reader picked.
+#[test]
+fn a_uli_keeps_every_identity_it_carried() {
+    let uli = Uli {
+        tai: Some(Tai::new(
+            "262-02".parse().unwrap(),
+            TrackingAreaCode::eps(0x002A).unwrap(),
+        )),
+        ecgi: Some(Ecgi::new(
+            "262-02".parse().unwrap(),
+            Eci::new(0x0A1_B2C3).unwrap(),
+        )),
+        ..Uli::new()
+    };
+
+    let value = to_value(uli).expect("serialises");
+    assert_eq!(value["tai"]["tac"], json!({"value": 42, "width": "EPS"}));
+    assert_eq!(value["ecgi"]["eci"], json!(10_597_059));
+    assert_eq!(value["cgi"], Value::Null);
+
+    let read: Uli = serde_json::from_value(value).expect("deserialises");
+    assert_eq!(read, uli);
+}
+
+/// The new area types name their parts, exactly as the existing ones do.
+#[test]
+fn the_area_identities_name_their_parts() {
+    let rai = Rai::new(
+        "262-02".parse().unwrap(),
+        Lac::new(0x1A2B).unwrap(),
+        RoutingAreaCode::new(5),
+    );
+    assert_wire(&rai, r#"{"plmn":"262-02","lac":6699,"rac":5}"#);
+
+    let lai = Lai::new("262-02".parse().unwrap(), Lac::new(0x1A2B).unwrap());
+    assert_wire(&lai, r#"{"plmn":"262-02","lac":6699}"#);
+}
+
+/// The conservation law's five terms have stable codes, because a
+/// revenue-assurance report stores them.
+#[test]
+fn every_outcome_has_a_stable_code() {
+    for (outcome, code) in [
+        (Outcome::Billable, "\"BILLABLE\""),
+        (Outcome::Suppressed, "\"SUPPRESSED\""),
+        (Outcome::Duplicate, "\"DUPLICATE\""),
+        (Outcome::Rejected, "\"REJECTED\""),
+        (Outcome::Held, "\"HELD\""),
+    ] {
+        assert_wire(&outcome, code);
+    }
+    assert_eq!(Outcome::ALL.len(), Outcome::CODES.len());
+}
+
+/// A TAP discrepancy names the field TD.57 names, so a stored finding means the
+/// same thing to the partner who has to act on it.
+#[test]
+fn a_declared_total_names_itself_the_way_td57_does() {
+    assert_wire(&TotalKind::Charge, "\"totalCharge\"");
+    assert_wire(&TotalKind::Discount, "\"totalDiscountValue\"");
+    assert_wire(&TotalKind::Tax, "\"totalTaxValue\"");
+
+    let totals =
+        BatchTotals::new(5, ScaledAmount::new(1_234, 3)).with_tax(ScaledAmount::new(234, 3));
+    assert_wire(
+        &totals,
+        r#"{"events":5,"charge":{"value":1234,"decimal_places":3},"discount":null,"tax":{"value":234,"decimal_places":3}}"#,
+    );
+}
+
+/// A gap carries the identities, because the operational response is a resend
+/// request for exactly those files.
+#[test]
+fn a_sequence_gap_carries_the_files_to_ask_for() {
+    let gap = SequenceGap {
+        node: "pgw-fra-01".parse().unwrap(),
+        missing: vec![7, 8, 9],
+        missing_count: 3,
+    };
+    assert_wire(
+        &gap,
+        r#"{"node":"pgw-fra-01","missing":[7,8,9],"missing_count":3}"#,
+    );
+}
+
+/// The charging-characteristics profile is four hex digits — the form an
+/// operator's provisioning system writes, and one spelling per value.
+#[test]
+fn a_charging_characteristics_profile_is_four_hex_digits() {
+    let profile: ChargingCharacteristics = "0800".parse().unwrap();
+    assert_wire(&profile, r#""0800""#);
+
+    // Lower case parses and renders upper, so two records cannot disagree.
+    assert_eq!(
+        "0a0f"
+            .parse::<ChargingCharacteristics>()
+            .unwrap()
+            .to_string(),
+        "0A0F"
+    );
+
+    // Exactly four: a short form would shift every behaviour index by four.
+    assert!("800".parse::<ChargingCharacteristics>().is_err());
+    assert!("00800".parse::<ChargingCharacteristics>().is_err());
+    assert!("08g0".parse::<ChargingCharacteristics>().is_err());
 }

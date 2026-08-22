@@ -1,0 +1,61 @@
+# Zola configuration — https://www.getzola.org/documentation/getting-started/configuration/
+#
+# The site is the crate's documentation. Its pages are **compiled as doctests**
+# by `cargo test` (see `SiteDoctests` in `src/lib.rs`), so a published page
+# cannot claim an API the crate does not have.
+
+base_url = "https://hupe1980.github.io/mediation"
+title = "mediation"
+description = "A pure Rust domain library for telecom usage mediation: 3GPP CDR local-time arithmetic, integer octet volumes, validated IMSI/MSISDN/IMEI identifiers, natural-key deduplication, wrap-safe sequence-gap detection and a conservation law that proves no record was lost."
+
+default_language = "en"
+compile_sass = true
+minify_html = true
+generate_feeds = false
+
+# Search needs no server and no third party: the index is a static JSON file the
+# page fetches once. A documentation site nobody can search is a book with no
+# index.
+build_search_index = true
+
+taxonomies = []
+
+[markdown]
+smart_punctuation = false
+render_emoji = false
+external_links_target_blank = true
+insert_anchor_links = "heading"
+bottom_footnotes = true
+
+[markdown.highlighting]
+# Class-based rather than inline styles: the HTML stays free of presentation and
+# one request serves both colour schemes.
+style = "class"
+light_theme = "ayu-light"
+dark_theme = "ayu-dark"
+add_color_scheme = true
+
+[search]
+index_format = "elasticlunr_javascript"
+
+[link_checker]
+# docs.rs and crates.io rate-limit crawlers, and a link into the repository's own
+# tree 404s until the commit that adds the file is pushed — which is exactly the
+# commit that adds the link. Internal links are still checked, and those are the
+# ones a reader actually hits.
+skip_prefixes = [
+  "https://docs.rs/",
+  "https://crates.io/",
+  "https://github.com/hupe1980/mediation/blob/",
+  "https://github.com/hupe1980/mediation/edit/",
+]
+
+[extra]
+# Used by the templates for canonical URLs, Open Graph and JSON-LD.
+author = "hupe1980"
+repository = "https://github.com/hupe1980/mediation"
+crate_name = "mediation"
+docs_rs = "https://docs.rs/mediation"
+crates_io = "https://crates.io/crates/mediation"
+license = "MIT OR Apache-2.0"
+og_image = "/social-card.png"

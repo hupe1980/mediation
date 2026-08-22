@@ -146,16 +146,16 @@ impl RecordKey {
     pub fn of(record: &UsageRecord) -> Result<Self, NotKeyable> {
         let keys = &record.correlation;
 
+        // Every complete correlator is tried first, in preference order. A
+        // *half* one is only a reason to refuse the record when nothing else
+        // keyed it — an IMS record that happens to carry a bearer's Charging ID
+        // without its gateway is still perfectly keyable on its ICID, and
+        // rejecting it for the stray field would lose the usage.
         if let Some(session) = keys.packet_session() {
             return Ok(Self::PacketSession {
                 session,
                 sequence: keys.record_sequence_number,
             });
-        }
-        if keys.charging_id.is_some() != keys.gateway.is_some() {
-            // Half a packet-session identity is worse than none: it looks
-            // usable and identifies the wrong thing.
-            return Err(NotKeyable::IncompletePacketSessionId);
         }
         if let Some(icid) = &keys.icid {
             return Ok(Self::Ims {
@@ -169,12 +169,47 @@ impl RecordKey {
                 local_sequence,
             });
         }
+
+        // Nothing keyed it. Now say which half-identity is present, because
+        // that points at a decoder dropping a field rather than at a record
+        // type that never carries one — a different fix, in a different place.
+        if keys.charging_id.is_some() != keys.gateway.is_some() {
+            return Err(NotKeyable::IncompletePacketSessionId);
+        }
         if keys.local_sequence_number.is_some() || keys.recording_entity.is_some() {
-            // Half an entity-scoped identity. A serial number scoped to the
-            // wrong element, or an element with no serial, identifies nothing.
             return Err(NotKeyable::IncompleteEntitySerial);
         }
         Err(NotKeyable::NoCorrelatorPresent)
+    }
+
+    /// The identity of the **session** this record belongs to, if it has one.
+    ///
+    /// The same key with the partial-record sequence removed — which is what a
+    /// run of partials must be gathered by. Two partials of one session have
+    /// different keys (that is the point: neither deduplicates the other) and
+    /// the same scope.
+    ///
+    /// `None` for a [`RecordingEntity`](Self::RecordingEntity) key, and that
+    /// `None` is load-bearing. A serial number scoped to an element identifies
+    /// **the record**, not the session above it, so there is nothing to gather
+    /// a run by. Returning the key unchanged would make every such partial a
+    /// run of one — and a run of one that does not begin at sequence 1 is an
+    /// orphan, so an ordinary SGSN partial numbered 3 would be rejected as
+    /// malformed. A run that cannot be gathered is not a broken run; it is a
+    /// question this key cannot answer.
+    #[must_use]
+    pub fn session_scope(&self) -> Option<Self> {
+        match self {
+            Self::PacketSession { session, .. } => Some(Self::PacketSession {
+                session: *session,
+                sequence: None,
+            }),
+            Self::Ims { icid, .. } => Some(Self::Ims {
+                icid: icid.clone(),
+                sequence: None,
+            }),
+            Self::RecordingEntity { .. } => None,
+        }
     }
 
     /// A short code naming the key's shape, for grouping and reporting.
@@ -419,13 +454,91 @@ impl DedupStore {
     pub fn clear(&mut self) {
         self.seen.clear();
     }
+
+    /// Every key remembered, with when it was first seen.
+    ///
+    /// The order is unspecified and varies between runs — the store is a hash
+    /// map, and nothing about deduplication depends on iteration order. Sort
+    /// the result if you need a stable rendering.
+    pub fn iter(&self) -> impl Iterator<Item = (&RecordKey, OffsetDateTime)> {
+        self.seen.iter().map(|(key, at)| (key, *at))
+    }
+
+    /// Rebuild a store from keys and their first-seen instants.
+    ///
+    /// The other half of [`iter`](Self::iter), and the reason both exist: the
+    /// crate performs no I/O, so a store that survives a restart is something
+    /// **you** serialise — and a store you cannot read out is one you cannot
+    /// persist, which would leave every restart silently re-billing a window's
+    /// worth of retransmissions.
+    ///
+    /// A repeated key keeps its **earliest** instant, so restoring from a
+    /// concatenation of snapshots cannot extend a key's life past its window.
+    ///
+    /// ```rust
+    /// use mediation::{DedupStore, DedupWindow, RecordKey};
+    /// use time::{Duration, macros::datetime};
+    /// # use mediation::{ChargingId, PacketSessionId};
+    /// # use std::net::Ipv4Addr;
+    /// # let key = RecordKey::PacketSession {
+    /// #     session: PacketSessionId::new(ChargingId::new(1), Ipv4Addr::new(10, 0, 0, 1).into()),
+    /// #     sequence: None,
+    /// # };
+    /// let window = DedupWindow::from_bound(Duration::days(7)).unwrap();
+    /// let mut store = DedupStore::new(window);
+    /// store.observe(key.clone(), datetime!(2026-07-28 10:00 UTC));
+    ///
+    /// // Round-trips through whatever you store it in.
+    /// let saved: Vec<_> = store.iter().map(|(k, at)| (k.clone(), at)).collect();
+    /// let restored = DedupStore::restore(window, saved);
+    ///
+    /// assert_eq!(restored.first_seen(&key), store.first_seen(&key));
+    /// ```
+    #[must_use]
+    pub fn restore(
+        window: DedupWindow,
+        observations: impl IntoIterator<Item = (RecordKey, OffsetDateTime)>,
+    ) -> Self {
+        let mut store = Self::new(window);
+        for (key, at) in observations {
+            store
+                .seen
+                .entry(key)
+                .and_modify(|first| {
+                    if at < *first {
+                        *first = at;
+                    }
+                })
+                .or_insert(at);
+        }
+        store
+    }
+}
+
+impl<'a> IntoIterator for &'a DedupStore {
+    type Item = (&'a RecordKey, OffsetDateTime);
+    type IntoIter = std::iter::Map<
+        std::collections::hash_map::Iter<'a, RecordKey, OffsetDateTime>,
+        fn((&'a RecordKey, &'a OffsetDateTime)) -> (&'a RecordKey, OffsetDateTime),
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.seen.iter().map(|(key, at)| (key, *at))
+    }
 }
 
 // ── Serde ────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{NotKeyable, RecordKey};
+    use super::{DedupStore, DedupWindow, NotKeyable, RecordKey};
+    use time::OffsetDateTime;
+
+    /// An instant in RFC 3339, which is what `time` offers and what a persisted
+    /// store should be legible as.
+    #[derive(Serialize, Deserialize)]
+    #[serde(transparent)]
+    struct Instant(#[serde(with = "time::serde::rfc3339")] OffsetDateTime);
     use serde::de::{self, Visitor};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::fmt;
@@ -526,6 +639,51 @@ mod serde_impl {
     // reached only through the visitors above.
     const _: fn(&str) -> Result<crate::correlation::Icid, crate::ParseError> =
         crate::correlation::Icid::from_str;
+
+    /// A window and its keys, which is the whole of the store.
+    ///
+    /// Both halves are needed: a set of keys restored under a different window
+    /// than it was filled under silently loses duplicate detection for the
+    /// difference, and the window alone remembers nothing.
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename = "DedupStore")]
+    struct StoreRepr {
+        /// The window, in whole seconds.
+        window_seconds: i64,
+        /// Every key with the instant it was first seen, sorted by key so the
+        /// representation is stable across runs despite the hash map inside.
+        ///
+        /// RFC 3339, so a persisted store is legible in the file it lives in
+        /// and survives a change of storage format.
+        seen: Vec<(RecordKey, Instant)>,
+    }
+
+    impl Serialize for DedupStore {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut seen: Vec<(RecordKey, Instant)> = self
+                .iter()
+                .map(|(key, at)| (key.clone(), Instant(at)))
+                .collect();
+            seen.sort_by(|a, b| a.0.cmp(&b.0));
+            StoreRepr {
+                window_seconds: self.window().get().whole_seconds(),
+                seen,
+            }
+            .serialize(serializer)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for DedupStore {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let r = StoreRepr::deserialize(deserializer)?;
+            let window = DedupWindow::from_bound(time::Duration::seconds(r.window_seconds))
+                .ok_or_else(|| de::Error::custom("a positive deduplication window"))?;
+            Ok(DedupStore::restore(
+                window,
+                r.seen.into_iter().map(|(key, at)| (key, at.0)),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

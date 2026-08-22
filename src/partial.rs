@@ -308,7 +308,18 @@ pub enum Reassembly {
         /// Sequence numbers present in the run, ascending.
         have: Vec<u32>,
         /// Sequence numbers missing between the ones present.
+        ///
+        /// Truncated to [`PartialRun::MAX_REPORTED_MISSING`]; the exact figure
+        /// is always `missing_count`.
         missing: Vec<u32>,
+        /// How many sequence numbers are missing in total.
+        ///
+        /// Separate from `missing.len()` because the list is bounded and this
+        /// is not: one corrupt sequence field claiming partial 4 294 967 295
+        /// would otherwise ask for a sixteen-gigabyte list of holes, and a
+        /// decoder that allocates on a number an attacker chose is a denial of
+        /// service with a domain name on it.
+        missing_count: u64,
         /// `true` when a terminal record has arrived.
         ///
         /// A run with no holes and no terminal record is not broken — it is
@@ -345,13 +356,32 @@ impl Reassembly {
         matches!(self, Self::Incomplete { .. } | Self::Empty)
     }
 
-    /// The sequence numbers still outstanding.
+    /// The sequence numbers still outstanding, up to
+    /// [`PartialRun::MAX_REPORTED_MISSING`] of them.
     #[must_use]
     pub fn missing(&self) -> &[u32] {
         match self {
             Self::Incomplete { missing, .. } => missing,
             _ => &[],
         }
+    }
+
+    /// How many sequence numbers are outstanding, exactly.
+    ///
+    /// Always the true figure, even where [`missing`](Self::missing) was
+    /// truncated.
+    #[must_use]
+    pub const fn missing_count(&self) -> u64 {
+        match self {
+            Self::Incomplete { missing_count, .. } => *missing_count,
+            _ => 0,
+        }
+    }
+
+    /// `true` when [`missing`](Self::missing) lists fewer holes than there are.
+    #[must_use]
+    pub fn missing_is_truncated(&self) -> bool {
+        self.missing_count() > self.missing().len() as u64
     }
 }
 
@@ -361,13 +391,13 @@ impl fmt::Display for Reassembly {
             Self::Complete { count } => write!(f, "COMPLETE ({count} partials)"),
             Self::Incomplete {
                 have,
-                missing,
+                missing_count,
                 terminated,
+                ..
             } => write!(
                 f,
-                "INCOMPLETE ({} present, {} missing, {})",
+                "INCOMPLETE ({} present, {missing_count} missing, {})",
                 have.len(),
-                missing.len(),
                 if *terminated { "terminated" } else { "open" }
             ),
             Self::Orphan { reason, have } => {
@@ -425,6 +455,14 @@ impl fmt::Display for OrphanReason {
 pub struct PartialRun(Vec<PartialInfo>);
 
 impl PartialRun {
+    /// How many missing sequence numbers [`assess`](Self::assess) will list.
+    ///
+    /// The count is always exact; only the identities are capped. A partial's
+    /// sequence number arrives from the wire, so the size of the hole it
+    /// implies is attacker-chosen — the same reasoning as
+    /// [`SequenceTracker::observe`](crate::SequenceTracker::observe)'s bound.
+    pub const MAX_REPORTED_MISSING: usize = 10_000;
+
     /// An empty run.
     #[must_use]
     pub const fn new() -> Self {
@@ -486,11 +524,11 @@ impl PartialRun {
     pub fn is_explained_loss(&self) -> bool {
         match self.assess() {
             Reassembly::Incomplete {
-                missing,
+                missing_count,
                 terminated,
                 ..
             } => {
-                missing.is_empty()
+                missing_count == 0
                     && !terminated
                     && self
                         .last_cause()
@@ -530,20 +568,34 @@ impl PartialRun {
         }
 
         let highest = *have.last().expect("non-empty");
-        // `have` is sorted and deduplicated, so membership is a binary search.
-        // A linear scan here is quadratic in the run length, and a long-lived
-        // data session can run to thousands of partials.
-        let missing: Vec<u32> = (1..=highest)
-            .filter(|n| have.binary_search(n).is_err())
-            .collect();
+        // The count is exact; the *list* is bounded. `have` is sorted and
+        // deduplicated, so a hole is the distance between neighbours and no
+        // scan of the whole range is needed — which matters because `highest`
+        // comes off the wire and may be four billion.
+        let missing_count = u64::from(highest) - have.len() as u64;
+        let mut missing: Vec<u32> = Vec::new();
+        if missing_count > 0 {
+            let mut expected = 1u32;
+            for present in &have {
+                while expected < *present && missing.len() < Self::MAX_REPORTED_MISSING {
+                    missing.push(expected);
+                    expected += 1;
+                }
+                if missing.len() >= Self::MAX_REPORTED_MISSING {
+                    break;
+                }
+                expected = present.saturating_add(1);
+            }
+        }
         let terminated = self.0.iter().any(|p| p.is_last());
 
-        if missing.is_empty() && terminated {
+        if missing_count == 0 && terminated {
             return Reassembly::Complete { count: have.len() };
         }
         Reassembly::Incomplete {
             have,
             missing,
+            missing_count,
             terminated,
         }
     }
@@ -733,6 +785,7 @@ mod tests {
             Reassembly::Incomplete {
                 have: vec![1, 4],
                 missing: vec![2, 3],
+                missing_count: 2,
                 terminated: true,
             }
         );
@@ -753,6 +806,7 @@ mod tests {
             Reassembly::Incomplete {
                 have: vec![1, 2],
                 missing: vec![],
+                missing_count: 0,
                 terminated: false,
             }
         );

@@ -338,17 +338,49 @@ pub fn aggregate_released(
     records: &[UsageRecord],
     dispositions: &[Disposition],
 ) -> Result<ReleasedTotals, AggregationError> {
+    aggregate_released_with_carry(records, dispositions, 0)
+}
+
+/// [`aggregate_released`] for a batch whose first `carried_in` records an
+/// earlier batch had held.
+///
+/// The total is the same either way — a carried record's octets are its octets.
+/// What changes is the **evidence** travelling with it: a carry counted as a new
+/// arrival makes this reconciliation disagree with the one
+/// [`crate::pipeline::process`] produced for the very same batch, and two
+/// reconciliations of one batch that disagree is exactly the thing a total is
+/// paired with its evidence to prevent.
+///
+/// # Errors
+///
+/// As [`aggregate_released`], and [`AggregationError::LengthMismatch`] when
+/// `carried_in` exceeds the number of records.
+pub fn aggregate_released_with_carry(
+    records: &[UsageRecord],
+    dispositions: &[Disposition],
+    carried_in: usize,
+) -> Result<ReleasedTotals, AggregationError> {
     if records.len() != dispositions.len() {
         return Err(AggregationError::LengthMismatch {
             records: records.len(),
             dispositions: dispositions.len(),
         });
     }
+    if carried_in > records.len() {
+        return Err(AggregationError::LengthMismatch {
+            records: records.len(),
+            dispositions: carried_in,
+        });
+    }
 
     let mut total = UsageTotal::ZERO;
     let mut reconciliation = BatchReconciliation::EMPTY;
     for (record_index, (record, disposition)) in records.iter().zip(dispositions).enumerate() {
-        reconciliation.observe(disposition);
+        if record_index < carried_in {
+            reconciliation.observe_carried(disposition);
+        } else {
+            reconciliation.observe(disposition);
+        }
         if !disposition.is_released() {
             continue;
         }

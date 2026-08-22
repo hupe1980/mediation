@@ -111,10 +111,14 @@ impl fmt::Display for Apportionment {
 /// discard them, and a mediation layer that discards octets has broken the
 /// conservation law it exists to uphold.
 ///
-/// Returns one part per weight, in the same order. An empty `weights`, or
-/// weights summing to zero, gives every slice nothing — there is no proportion
-/// to divide by, and putting the whole total on the first slice would be a
-/// guess dressed as arithmetic.
+/// Returns one part per weight, in the same order.
+///
+/// **Weights summing to zero divide the total equally**, by the same
+/// largest-remainder rule. That case is a real one — a session whose open and
+/// close instants are identical still carries the octets it reported — and the
+/// alternative of returning nothing would delete usage, which is the one thing
+/// this module exists to prevent. Only an *empty* `weights` returns nothing,
+/// because there is no slice to put anything on.
 ///
 /// ```rust
 /// use mediation::apportion;
@@ -127,13 +131,22 @@ impl fmt::Display for Apportionment {
 /// let awkward = apportion(10, &[1, 1, 1]);
 /// assert_eq!(awkward, vec![4, 3, 3]);
 /// assert_eq!(awkward.iter().sum::<u64>(), 10);
+///
+/// // A zero-length session still carries what it reported.
+/// assert_eq!(apportion(1_000, &[0]), vec![1_000]);
+/// assert_eq!(apportion(10, &[0, 0, 0]), vec![4, 3, 3]);
 /// ```
 #[must_use]
 pub fn apportion(total: u64, weights: &[u64]) -> Vec<u64> {
-    let sum: u128 = weights.iter().map(|w| u128::from(*w)).sum();
-    if sum == 0 {
-        return vec![0; weights.len()];
+    if weights.is_empty() {
+        return Vec::new();
     }
+    let sum: u128 = weights.iter().map(|w| u128::from(*w)).sum();
+    // No proportion to divide by, but the total still has to land somewhere:
+    // divide it equally. Returning zeros would delete usage, which is the
+    // failure this whole module exists to prevent.
+    let equal = sum == 0;
+    let sum = if equal { weights.len() as u128 } else { sum };
 
     // u128 throughout: `total * weight` overflows u64 for realistic octet
     // counts long before either factor does.
@@ -143,7 +156,8 @@ pub fn apportion(total: u64, weights: &[u64]) -> Vec<u64> {
     let mut allocated: u128 = 0;
 
     for (index, weight) in weights.iter().enumerate() {
-        let scaled = total * u128::from(*weight);
+        let weight = if equal { 1 } else { u128::from(*weight) };
+        let scaled = total * weight;
         let floor = scaled / sum;
         allocated += floor;
         remainders.push((scaled % sum, index));
@@ -235,34 +249,43 @@ impl UsageSplit {
 
     /// The slices' volumes summed back up.
     ///
-    /// `None` when no slice carried a volume, or the sum overflows.
+    /// `None` when **any** slice carried no volume, and `None` when the sum
+    /// overflows. All or nothing, deliberately: adding up the slices that
+    /// happen to have a figure and presenting the result as the session's total
+    /// reports a number short by exactly the slices that did not — which is the
+    /// same mistake as summing a partial container set and calling it a total.
     #[must_use]
     pub fn total_volume(&self) -> Option<VolumePair> {
-        let mut any = false;
         let mut total = VolumePair::ZERO;
         for slice in &self.slices {
-            if let Some(volume) = slice.volume {
-                any = true;
-                total = total.checked_add(volume)?;
-            }
+            total = total.checked_add(slice.volume?)?;
         }
-        any.then_some(total)
+        (!self.slices.is_empty()).then_some(total)
     }
 
     /// The slices' chargeable durations summed back up.
     ///
-    /// `None` when no slice carried one, or the sum overflows.
+    /// `None` when **any** slice carried none, for the reason given on
+    /// [`total_volume`](Self::total_volume), and `None` on overflow.
     #[must_use]
     pub fn total_duration(&self) -> Option<Seconds> {
-        let mut any = false;
         let mut total = Seconds::ZERO;
         for slice in &self.slices {
-            if let Some(duration) = slice.duration {
-                any = true;
-                total = total.checked_add(duration)?;
-            }
+            total = total.checked_add(slice.duration?)?;
         }
-        any.then_some(total)
+        (!self.slices.is_empty()).then_some(total)
+    }
+
+    /// The slices' event counts summed back up.
+    ///
+    /// `None` when any slice carried none, or the sum overflows.
+    #[must_use]
+    pub fn total_events(&self) -> Option<u32> {
+        let mut total: u32 = 0;
+        for slice in &self.slices {
+            total = total.checked_add(slice.events?)?;
+        }
+        (!self.slices.is_empty()).then_some(total)
     }
 
     /// Whether the split gave back exactly what the record held.
@@ -278,7 +301,9 @@ impl UsageSplit {
     /// [`ContainerSet::agrees_with`](crate::ContainerSet::agrees_with) reports.
     #[must_use]
     pub fn conserves(&self, record: &UsageRecord) -> bool {
-        self.total_volume() == record.volume && self.total_duration() == record.duration
+        self.total_volume() == record.volume
+            && self.total_duration() == record.duration
+            && self.total_events() == record.events
     }
 }
 
@@ -305,6 +330,13 @@ pub enum SplitError {
     ContainersOutOfOrder,
     /// A container set held no containers to split.
     NoContainers,
+    /// The record carries an event count, and containers do not divide one.
+    ///
+    /// Refused rather than dropped. A container reports volume and time, never
+    /// events, so a measured split has nothing to attribute them by — and a
+    /// result that silently omitted them would not conserve, while claiming on
+    /// its face to be a measurement.
+    EventsNotContained,
     /// A quantity did not fit the type it had to be written back into.
     Overflow,
 }
@@ -319,6 +351,7 @@ impl SplitError {
             Self::ContainerNotTimed => "a container carried no close time",
             Self::ContainersOutOfOrder => "a container closed before its band began",
             Self::NoContainers => "there are no containers to split",
+            Self::EventsNotContained => "containers cannot divide an event count",
             Self::Overflow => "a quantity overflowed",
         }
     }
@@ -471,26 +504,44 @@ pub fn split_session(
 ///
 /// Every container must carry a close time: without one there is nothing to
 /// place a slice boundary at, and inferring one would put the estimate back in
-/// through a side door.
+/// through a side door. A record carrying an **event count** is refused
+/// outright — containers report volume and time and never events, so there is
+/// nothing to divide the count by.
 pub fn split_measured(record: &UsageRecord) -> Result<UsageSplit, SplitError> {
     let containers = &record.containers;
     if containers.is_empty() {
         return Err(SplitError::NoContainers);
+    }
+    // Containers report volume and time. An event count has nothing to be
+    // divided by, and a split that quietly dropped it would fail
+    // `UsageSplit::conserves` while calling itself a measurement.
+    if record.events.is_some() {
+        return Err(SplitError::EventsNotContained);
     }
 
     let all = containers.as_slice();
     let last = all.len() - 1;
 
     let mut slices: Vec<TimeSlice> = Vec::new();
-    let mut open_at: Option<CdrTimestamp> = Some(record.opened);
+    let mut slice_start: CdrTimestamp = record.opened;
+    let mut previous_close: CdrTimestamp = record.opened;
     let mut volume = VolumePair::ZERO;
     let mut duration: Option<Seconds> = None;
     let mut first_of_slice = 0usize;
 
     for (index, container) in all.iter().enumerate() {
         let closed = container.closed.ok_or(SplitError::ContainerNotTimed)?;
-        let start = open_at.unwrap_or(closed);
-        open_at = Some(start);
+        // Containers are in record order, which is chronological. Checked at
+        // *every* container rather than only at the one that ends a band: a
+        // container that closes before its predecessor is a data fault whether
+        // or not the band's own span happens to come out positive, and letting
+        // it through would attribute its volume to a stretch of time that ran
+        // backwards.
+        if closed.to_utc() < previous_close.to_utc() {
+            return Err(SplitError::ContainersOutOfOrder);
+        }
+        previous_close = closed;
+
         volume = volume
             .checked_add(container.volume)
             .ok_or(SplitError::Overflow)?;
@@ -512,19 +563,19 @@ pub fn split_measured(record: &UsageRecord) -> Result<UsageSplit, SplitError> {
         // A tariff change ends a band; so does running out of containers.
         let ends_slice = container.change_condition == ChangeCondition::TariffTime || index == last;
         if ends_slice {
-            let span = (closed.to_utc() - start.to_utc()).whole_seconds();
+            let span = (closed.to_utc() - slice_start.to_utc()).whole_seconds();
             if span < 0 {
                 return Err(SplitError::ContainersOutOfOrder);
             }
             slices.push(TimeSlice {
-                start: start.to_utc(),
+                start: slice_start.to_utc(),
                 end: closed.to_utc(),
                 wall_clock: Seconds::new(u32::try_from(span).map_err(|_| SplitError::Overflow)?),
                 duration,
                 volume: Some(volume),
                 events: None,
             });
-            open_at = Some(closed);
+            slice_start = closed;
             volume = VolumePair::ZERO;
             duration = None;
             first_of_slice = index + 1;
@@ -631,14 +682,39 @@ mod tests {
         assert_eq!(apportion(3, &[1, 1]), apportion(3, &[1, 1]));
     }
 
-    /// Weights that sum to zero give no proportion to divide by, and putting
-    /// the whole total on the first slice would be a guess dressed as
-    /// arithmetic.
+    /// Weights that sum to zero give no proportion to divide by — but the
+    /// total still has to land somewhere, and zeroing it would delete usage.
+    /// A zero-length session that reported octets is the real case.
     #[test]
-    fn nothing_to_divide_by_yields_nothing() {
-        assert_eq!(apportion(100, &[0, 0]), vec![0, 0]);
+    fn zero_weights_divide_equally_rather_than_deleting_the_total() {
+        assert_eq!(apportion(100, &[0, 0]), vec![50, 50]);
+        assert_eq!(apportion(1_000, &[0]), vec![1_000]);
+        assert_eq!(apportion(10, &[0, 0, 0]), vec![4, 3, 3]);
+        // Only an empty slice list has nowhere to put anything.
         assert_eq!(apportion(100, &[]), Vec::<u64>::new());
         assert_eq!(apportion(0, &[1, 2]), vec![0, 0]);
+    }
+
+    /// The property that matters, stated over every case: what goes in comes
+    /// out, whatever the weights are.
+    #[test]
+    fn apportionment_never_creates_or_destroys() {
+        for total in [0u64, 1, 999, u64::MAX] {
+            for weights in [
+                vec![0u64],
+                vec![0, 0, 0],
+                vec![1, 0],
+                vec![u64::MAX, 1],
+                vec![3, 3, 3, 3, 3],
+            ] {
+                let parts = apportion(total, &weights);
+                assert_eq!(
+                    parts.iter().map(|p| u128::from(*p)).sum::<u128>(),
+                    u128::from(total),
+                    "{total} over {weights:?}"
+                );
+            }
+        }
     }
 
     /// A weight large enough that `total * weight` leaves the u64 range must

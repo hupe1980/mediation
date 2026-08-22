@@ -1,0 +1,60 @@
+# Publish the documentation site to GitHub Pages.
+#
+# The site's Rust examples are compiled by the CI workflow's `test` job — every
+# page is included as a doctest from `src/lib.rs` — so this workflow only has to
+# check links, render and deploy. Nothing reaches Pages that has not built.
+
+name: Site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/site.yml"
+  workflow_dispatch:
+
+# One deployment at a time, and never cancel one halfway: a cancelled deploy can
+# leave Pages serving a partial upload.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: 🌐 build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: zola
+      - uses: actions/configure-pages@v5
+        id: pages
+
+      # `base_url` has to match where Pages actually serves the site, or every
+      # absolute URL — canonical tags, the sitemap, Open Graph — points at a
+      # host that does not have the page.
+      - name: build
+        working-directory: site
+        run: zola --base-url "${{ steps.pages.outputs.base_url }}" build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/public
+
+  deploy:
+    name: 🚀 deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

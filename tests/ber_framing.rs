@@ -82,7 +82,7 @@ fn packet_record() -> Vec<u8> {
         true,
         &[
             context(3, false, &imsi_wire[..n]),
-            context(13, false, &opened.to_bcd().unwrap()),
+            context(13, false, &opened.to_bcd(Century::TWENTY_FIRST).unwrap()),
             context(
                 34,
                 true,
@@ -348,4 +348,113 @@ fn integer_encoding_round_trips_through_the_reader() {
         let bytes = context(2, false, &integer_content(value));
         assert_eq!(only(&bytes).as_u64().unwrap(), value, "value {value}");
     }
+}
+
+// ── Untrusted input ──────────────────────────────────────────────────────────
+
+/// Nesting is attacker-controlled in a record that arrived over a network. A
+/// scanner that recursed once per indefinite length aborted the process on a
+/// few hundred kilobytes of `30 80` — no allocation and no cleverness required.
+#[test]
+fn deeply_nested_indefinite_lengths_are_refused_rather_than_fatal() {
+    let mut bytes = Vec::new();
+    for _ in 0..200_000 {
+        bytes.extend_from_slice(&[0x30, 0x80]);
+    }
+    for _ in 0..200_000 {
+        bytes.extend_from_slice(&[0x00, 0x00]);
+    }
+    let first = BerReader::new(&bytes).next().unwrap();
+    assert!(first.is_err(), "past the depth limit, and reported as such");
+}
+
+/// The depth limit is generous, so ordinary indefinite-length records still
+/// walk normally.
+#[test]
+fn modest_indefinite_nesting_still_decodes() {
+    // SEQUENCE { SEQUENCE { INTEGER 42 } }, both indefinite.
+    let bytes = [
+        0x30, 0x80, 0x30, 0x80, 0x02, 0x01, 0x2A, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let outer = BerReader::new(&bytes).next().unwrap().unwrap();
+    assert_eq!(outer.encoded_len(), bytes.len());
+
+    let inner = outer.children().unwrap().next().unwrap().unwrap();
+    assert_eq!(inner.encoded_len(), 7);
+    assert_eq!(
+        inner
+            .children()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .as_u64()
+            .unwrap(),
+        42
+    );
+}
+
+/// An end-of-contents marker inside a definite-length structure closes nothing.
+/// Reading it as a terminator silently drops every field after it — the
+/// "decoder that steps over what it could not read" this module refuses to be.
+#[test]
+fn a_stray_end_of_contents_marker_does_not_truncate_a_definite_sequence() {
+    // SEQUENCE (8 octets) { INTEGER 1, 00 00, INTEGER 2 }
+    let bytes = [0x30, 0x08, 0x02, 0x01, 0x01, 0x00, 0x00, 0x02, 0x01, 0x02];
+    let outer = BerReader::new(&bytes).next().unwrap().unwrap();
+    let children: Vec<_> = outer.children().unwrap().collect();
+
+    assert_eq!(
+        children.len(),
+        2,
+        "the walk stops at the fault, not before it"
+    );
+    assert_eq!(children[0].as_ref().unwrap().as_u64().unwrap(), 1);
+    assert!(
+        children[1].is_err(),
+        "the marker is reported, not swallowed"
+    );
+}
+
+/// X.690 integers are signed, so `u64::MAX` is nine content octets: a `0x00`
+/// sign octet and eight of value. Refusing that form puts the top bit of the
+/// range out of reach for no reason.
+#[test]
+fn an_integer_may_span_the_whole_unsigned_range() {
+    let max = [
+        0x02, 0x09, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    ];
+    assert_eq!(
+        BerReader::new(&max)
+            .next()
+            .unwrap()
+            .unwrap()
+            .as_u64()
+            .unwrap(),
+        u64::MAX
+    );
+
+    // Padding that is *not* the sign octet is still a second encoding.
+    let padded = [0x02, 0x02, 0x00, 0x2A];
+    assert!(
+        BerReader::new(&padded)
+            .next()
+            .unwrap()
+            .unwrap()
+            .as_u64()
+            .is_err()
+    );
+
+    // And ten octets cannot be a `u64` however they are spelled.
+    let too_wide = [
+        0x02, 0x0A, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    ];
+    assert!(
+        BerReader::new(&too_wide)
+            .next()
+            .unwrap()
+            .unwrap()
+            .as_u64()
+            .is_err()
+    );
 }

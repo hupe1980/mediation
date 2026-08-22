@@ -40,7 +40,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::error::ParseError;
+use crate::error::{DecodeError, ParseError};
 
 // ── Mcc ──────────────────────────────────────────────────────────────────────
 
@@ -73,6 +73,28 @@ impl Mcc {
     #[must_use]
     pub const fn get(self) -> u16 {
         self.0
+    }
+
+    /// `true` when the country code names an actual country.
+    ///
+    /// ITU-T E.212 sets aside a handful of codes that name no territory:
+    ///
+    /// | Code | Meaning |
+    /// |---|---|
+    /// | `001` | test networks |
+    /// | `901` | shared code for international operators — satellite, maritime, aeronautical |
+    /// | `902` | shared MNCs, not tied to a country |
+    /// | `991` | trial networks |
+    /// | `999` | internal use within an operator |
+    ///
+    /// A record served by one of these has a well-formed MCC that answers no
+    /// question about **where** the usage happened — and where the usage
+    /// happened is what retention, lawful interception and roaming regulation
+    /// turn on. [`crate::jurisdiction`] reports it as an ambiguity rather than
+    /// filing the usage in a country called 901.
+    #[must_use]
+    pub const fn is_geographic(self) -> bool {
+        !matches!(self.0, 1 | 901 | 902 | 991 | 999)
     }
 
     /// `true` for the North American numbering region, MCC 3xx.
@@ -290,6 +312,110 @@ impl PlmnId {
     pub const fn is_same_country(self, other: Self) -> bool {
         self.mcc.get() == other.mcc.get()
     }
+
+    // ── Wire form ────────────────────────────────────────────────────────────
+
+    /// The wire length of a PLMN identity, in octets.
+    pub const BCD_OCTETS: usize = 3;
+
+    /// Decode the three-octet PLMN identity of 3GPP TS 24.008 §10.5.1.13.
+    ///
+    /// The layout is the one every location information element embeds:
+    ///
+    /// ```text
+    /// octet 1: MCC digit 2 | MCC digit 1
+    /// octet 2: MNC digit 3 | MCC digit 3
+    /// octet 3: MNC digit 2 | MNC digit 1
+    /// ```
+    ///
+    /// with the nibbles swapped as usual and `0xF` in the MNC-digit-3 position
+    /// when the network code is two digits. **That filler is the only thing on
+    /// the wire that says how wide the MNC is** — which is why this decoder,
+    /// unlike [`Imsi::plmn`](crate::Imsi::plmn), needs no
+    /// [`MncWidths`] resolver: the encoding carries what the digit string does
+    /// not.
+    ///
+    /// ```rust
+    /// use mediation::PlmnId;
+    ///
+    /// // 262-02: MCC 262, two-digit MNC, so the third MNC nibble is the filler.
+    /// let telekom = PlmnId::from_bcd(&[0x62, 0xF2, 0x20]).unwrap();
+    /// assert_eq!(telekom.to_string(), "262-02");
+    /// assert_eq!(telekom.to_bcd(), [0x62, 0xF2, 0x20]);
+    ///
+    /// // 310-260: a three-digit MNC fills the same nibble with a digit.
+    /// let tmobile = PlmnId::from_bcd(&[0x13, 0x00, 0x62]).unwrap();
+    /// assert_eq!(tmobile.to_string(), "310-260");
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] for the wrong length, a nibble that is neither a decimal
+    /// digit nor the filler in the one position that permits it, or an MCC of
+    /// `000`.
+    pub fn from_bcd(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() != Self::BCD_OCTETS {
+            return Err(DecodeError::new(0, "exactly 3 octets"));
+        }
+        let nibble = |octet: u8, high: bool| if high { octet >> 4 } else { octet & 0x0F };
+
+        let mcc_digits = [
+            nibble(bytes[0], false),
+            nibble(bytes[0], true),
+            nibble(bytes[1], false),
+        ];
+        let mnc3 = nibble(bytes[1], true);
+        let mnc_low = [nibble(bytes[2], false), nibble(bytes[2], true)];
+
+        for (index, digit) in mcc_digits.iter().enumerate() {
+            if *digit > 9 {
+                return Err(DecodeError::new(index / 2, "a decimal MCC digit"));
+            }
+        }
+        for digit in mnc_low {
+            if digit > 9 {
+                return Err(DecodeError::new(2, "a decimal MNC digit"));
+            }
+        }
+
+        let mcc_value = u16::from(mcc_digits[0]) * 100
+            + u16::from(mcc_digits[1]) * 10
+            + u16::from(mcc_digits[2]);
+        let mcc = Mcc::new(mcc_value).ok_or_else(|| DecodeError::new(0, "an assigned MCC"))?;
+
+        // The filler in the MNC-digit-3 position is what makes the code two
+        // digits wide. Any other non-decimal value there is corrupt.
+        let mnc = if mnc3 == 0x0F {
+            Mnc::new(u16::from(mnc_low[0]) * 10 + u16::from(mnc_low[1]), 2)
+        } else if mnc3 <= 9 {
+            Mnc::new(
+                u16::from(mnc_low[0]) * 100 + u16::from(mnc_low[1]) * 10 + u16::from(mnc3),
+                3,
+            )
+        } else {
+            return Err(DecodeError::new(1, "a decimal MNC digit or the 0xF filler"));
+        };
+        let mnc = mnc.ok_or_else(|| DecodeError::new(2, "an MNC that fits its width"))?;
+        Ok(Self::new(mcc, mnc))
+    }
+
+    /// Encode to the three-octet PLMN identity of 3GPP TS 24.008 §10.5.1.13.
+    ///
+    /// Round-trips with [`from_bcd`](Self::from_bcd) for every value: the
+    /// declared MNC width decides whether the third MNC nibble is a digit or
+    /// the filler, which is exactly the information a bare digit string loses.
+    #[must_use]
+    pub const fn to_bcd(self) -> [u8; Self::BCD_OCTETS] {
+        let mcc = self.mcc.get();
+        let (mcc1, mcc2, mcc3) = ((mcc / 100) as u8, ((mcc / 10) % 10) as u8, (mcc % 10) as u8);
+        let mnc = self.mnc.get();
+        let (mnc1, mnc2, mnc3) = if self.mnc.width() == 3 {
+            ((mnc / 100) as u8, ((mnc / 10) % 10) as u8, (mnc % 10) as u8)
+        } else {
+            ((mnc / 10) as u8, (mnc % 10) as u8, 0x0F)
+        };
+        [(mcc2 << 4) | mcc1, (mnc3 << 4) | mcc3, (mnc2 << 4) | mnc1]
+    }
 }
 
 impl fmt::Display for PlmnId {
@@ -454,6 +580,43 @@ mod tests {
         assert_ne!(two, three);
         assert_eq!(two.to_string(), "01");
         assert_eq!(three.to_string(), "001");
+    }
+
+    /// Round-trip every constructible identity through the three-octet form.
+    /// The filler nibble is the only thing that says how wide the MNC is, so
+    /// the width must survive the trip in both directions.
+    #[test]
+    fn the_plmn_wire_form_round_trips_and_carries_the_mnc_width() {
+        for (mcc, mnc_value, width, octets) in [
+            (262u16, 2u16, 2u8, [0x62, 0xF2, 0x20]),
+            (262, 1, 2, [0x62, 0xF2, 0x10]),
+            (310, 260, 3, [0x13, 0x00, 0x62]),
+            (1, 1, 2, [0x00, 0xF1, 0x10]),
+            (999, 999, 3, [0x99, 0x99, 0x99]),
+        ] {
+            let plmn = PlmnId::new(Mcc::new(mcc).unwrap(), Mnc::new(mnc_value, width).unwrap());
+            assert_eq!(plmn.to_bcd(), octets, "{plmn}");
+            assert_eq!(PlmnId::from_bcd(&octets).unwrap(), plmn);
+        }
+
+        // Same digits, different widths, different octets — and never equal.
+        let two = PlmnId::new(Mcc::new(262).unwrap(), Mnc::new(1, 2).unwrap());
+        let three = PlmnId::new(Mcc::new(262).unwrap(), Mnc::new(1, 3).unwrap());
+        assert_ne!(two.to_bcd(), three.to_bcd());
+    }
+
+    #[test]
+    fn the_plmn_wire_form_rejects_what_it_cannot_read() {
+        // Wrong length.
+        assert!(PlmnId::from_bcd(&[0x62, 0xF2]).is_err());
+        // A non-decimal MCC nibble.
+        assert!(PlmnId::from_bcd(&[0x6A, 0xF2, 0x20]).is_err());
+        // A filler where an MNC digit belongs.
+        assert!(PlmnId::from_bcd(&[0x62, 0xF2, 0xF0]).is_err());
+        // MCC 000 is not assigned, and is the shape an unset field takes.
+        assert!(PlmnId::from_bcd(&[0x00, 0xF0, 0x00]).is_err());
+        // 0xE in the MNC-digit-3 position is neither a digit nor the filler.
+        assert!(PlmnId::from_bcd(&[0x62, 0xE2, 0x20]).is_err());
     }
 
     #[test]

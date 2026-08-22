@@ -33,7 +33,7 @@
 //! );
 //!
 //! // Every restatement can be undone, and the pair nets to nothing.
-//! let reversal = correction.clone().reverse();
+//! let reversal = correction.clone().checked_reverse().expect("a reversible delta");
 //! assert_eq!(
 //!     correction.delta.checked_add(reversal.delta),
 //!     Some(UsageDelta::ZERO),
@@ -57,6 +57,8 @@
 
 use std::fmt;
 use std::str::FromStr;
+
+use std::collections::BTreeMap;
 
 use crate::cdrtime::CdrTimestamp;
 use crate::dedup::RecordKey;
@@ -325,22 +327,17 @@ impl Restatement {
     /// rather than describing a later one. A caller reversing at a different
     /// time should say so by constructing the reversal directly.
     ///
-    /// # Panics
-    ///
-    /// Never for any delta this crate constructs: negating requires each
-    /// component to be away from its type's minimum, and no realistic
-    /// correction is `i128::MIN` octets. It panics rather than returning a
-    /// saturated delta, because a reversal that does not reverse is worse than
-    /// no reversal at all.
+    /// `None` when a component sits at its type's minimum and cannot be
+    /// negated. Fallible rather than saturating: a reversal that does not
+    /// reverse leaves a ledger that looks corrected and is not, and fallible
+    /// rather than panicking because a [`UsageDelta`] is built from caller data
+    /// and nothing in this crate may abort on a value somebody else chose.
     #[must_use]
-    pub fn reverse(self) -> Self {
-        Self {
-            delta: self
-                .delta
-                .checked_negate()
-                .expect("a delta at its type's minimum cannot be reversed"),
+    pub fn checked_reverse(self) -> Option<Self> {
+        Some(Self {
+            delta: self.delta.checked_negate()?,
             ..self
-        }
+        })
     }
 
     /// `true` when the correction changes nothing.
@@ -368,36 +365,66 @@ impl fmt::Display for Restatement {
 /// entry, because a withdrawn correction is itself a correction and must leave
 /// a trace.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RestatementLog(Vec<Restatement>);
+pub struct RestatementLog {
+    entries: Vec<Restatement>,
+    /// Which entries correct which record, so a net is a lookup rather than a
+    /// scan. A revenue-assurance log runs to hundreds of thousands of
+    /// corrections over a period, and `net_for` is asked once per record being
+    /// settled — a scan per question is quadratic in exactly the case the type
+    /// exists for.
+    by_record: BTreeMap<RecordKey, Vec<usize>>,
+}
 
 impl RestatementLog {
     /// An empty log.
     #[must_use]
     pub const fn new() -> Self {
-        Self(Vec::new())
+        Self {
+            entries: Vec::new(),
+            by_record: BTreeMap::new(),
+        }
     }
 
     /// Append a correction.
     pub fn push(&mut self, restatement: Restatement) {
-        self.0.push(restatement);
+        self.by_record
+            .entry(restatement.supersedes.clone())
+            .or_default()
+            .push(self.entries.len());
+        self.entries.push(restatement);
     }
 
     /// Every correction, in the order it was issued.
     #[must_use]
     pub fn entries(&self) -> &[Restatement] {
-        &self.0
+        &self.entries
+    }
+
+    /// Every correction against one record, in the order it was issued.
+    #[must_use]
+    pub fn entries_for(&self, key: &RecordKey) -> Vec<&Restatement> {
+        self.by_record
+            .get(key)
+            .map(|indices| indices.iter().map(|i| &self.entries[*i]).collect())
+            .unwrap_or_default()
     }
 
     /// How many corrections have been issued.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.entries.len()
     }
 
     /// `true` when nothing has been corrected.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.entries.is_empty()
+    }
+
+    /// How many distinct records have been corrected.
+    #[must_use]
+    pub fn corrected_count(&self) -> usize {
+        self.by_record.len()
     }
 
     /// The net change to one record across every correction against it.
@@ -407,16 +434,18 @@ impl RestatementLog {
     /// rather than merely long.
     #[must_use]
     pub fn net_for(&self, key: &RecordKey) -> Option<UsageDelta> {
-        self.0
-            .iter()
-            .filter(|r| &r.supersedes == key)
-            .try_fold(UsageDelta::ZERO, |acc, r| acc.checked_add(r.delta))
+        let Some(indices) = self.by_record.get(key) else {
+            return Some(UsageDelta::ZERO);
+        };
+        indices.iter().try_fold(UsageDelta::ZERO, |acc, i| {
+            acc.checked_add(self.entries[*i].delta)
+        })
     }
 
     /// The net change across every record, `None` on overflow.
     #[must_use]
     pub fn net(&self) -> Option<UsageDelta> {
-        self.0
+        self.entries
             .iter()
             .try_fold(UsageDelta::ZERO, |acc, r| acc.checked_add(r.delta))
     }
@@ -424,33 +453,25 @@ impl RestatementLog {
     /// The records corrected, each once, in first-correction order.
     #[must_use]
     pub fn corrected_records(&self) -> Vec<&RecordKey> {
-        let mut seen = Vec::new();
-        for restatement in &self.0 {
-            if !seen.contains(&&restatement.supersedes) {
-                seen.push(&restatement.supersedes);
-            }
-        }
-        seen
+        // First-correction order, not key order: a reader following a period's
+        // corrections wants them in the order they happened.
+        let mut first: Vec<(usize, &RecordKey)> = self
+            .by_record
+            .iter()
+            .map(|(key, indices)| (indices[0], key))
+            .collect();
+        first.sort_unstable_by_key(|(index, _)| *index);
+        first.into_iter().map(|(_, key)| key).collect()
     }
 }
 
 impl FromIterator<Restatement> for RestatementLog {
     fn from_iter<I: IntoIterator<Item = Restatement>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
-    }
-}
-
-impl fmt::Display for RestatementLog {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.net() {
-            Some(net) => write!(
-                f,
-                "{} correction(s) over {} record(s), net {net}",
-                self.0.len(),
-                self.corrected_records().len()
-            ),
-            None => write!(f, "{} correction(s), net overflows", self.0.len()),
+        let mut log = Self::new();
+        for restatement in iter {
+            log.push(restatement);
         }
+        log
     }
 }
 
@@ -607,7 +628,10 @@ mod tests {
             .with_volume(1_000, -4_000)
             .with_events(2);
         let forward = correction(1, delta);
-        let back = forward.clone().reverse();
+        let back = forward
+            .clone()
+            .checked_reverse()
+            .expect("a reversible delta");
 
         assert_eq!(back.delta, delta.checked_negate().unwrap());
         assert_eq!(

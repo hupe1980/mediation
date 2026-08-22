@@ -54,7 +54,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::error::ParseError;
+use crate::error::{DecodeError, ParseError};
 use crate::plmn::{Mcc, PlmnId};
 
 // ── The reserved "no valid area" codes ───────────────────────────────────────
@@ -243,6 +243,121 @@ impl Sai {
 impl fmt::Display for Sai {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}-{}-{}", self.plmn, self.lac, self.sac)
+    }
+}
+
+/// A Routing Area Code: one octet, within a location area.
+///
+/// The GPRS grouping of cells. An SGSN charging record reports a **routing
+/// area**, not a cell, so a record set that mixes 2G/3G packet usage with
+/// circuit usage is mixing two precisions — which is why this is a type of its
+/// own rather than a number beside a [`Lac`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RoutingAreaCode(u8);
+
+impl RoutingAreaCode {
+    /// A routing area code. Every 8-bit value is valid.
+    #[must_use]
+    pub const fn new(value: u8) -> Self {
+        Self(value)
+    }
+
+    /// The numeric value.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl fmt::Display for RoutingAreaCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:02X}", self.0)
+    }
+}
+
+/// A Location Area Identity: network plus [`Lac`].
+///
+/// The coarsest location a record carries, and the only one a circuit-switched
+/// element is obliged to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Lai {
+    plmn: PlmnId,
+    lac: Lac,
+}
+
+impl Lai {
+    /// A location area identity from its parts.
+    #[must_use]
+    pub const fn new(plmn: PlmnId, lac: Lac) -> Self {
+        Self { plmn, lac }
+    }
+
+    /// The network.
+    #[must_use]
+    pub const fn plmn(self) -> PlmnId {
+        self.plmn
+    }
+
+    /// The location area.
+    #[must_use]
+    pub const fn lac(self) -> Lac {
+        self.lac
+    }
+}
+
+impl fmt::Display for Lai {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", self.plmn, self.lac)
+    }
+}
+
+/// A Routing Area Identity: network, location area and routing area.
+///
+/// What an SGSN reports. Kept apart from [`Cgi`] because it locates the
+/// subscriber less precisely, and a report that mixed them would overstate what
+/// the records actually said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Rai {
+    plmn: PlmnId,
+    lac: Lac,
+    rac: RoutingAreaCode,
+}
+
+impl Rai {
+    /// A routing area identity from its parts.
+    #[must_use]
+    pub const fn new(plmn: PlmnId, lac: Lac, rac: RoutingAreaCode) -> Self {
+        Self { plmn, lac, rac }
+    }
+
+    /// The network.
+    #[must_use]
+    pub const fn plmn(self) -> PlmnId {
+        self.plmn
+    }
+
+    /// The location area.
+    #[must_use]
+    pub const fn lac(self) -> Lac {
+        self.lac
+    }
+
+    /// The routing area.
+    #[must_use]
+    pub const fn rac(self) -> RoutingAreaCode {
+        self.rac
+    }
+
+    /// The location area this routing area sits in.
+    #[must_use]
+    pub const fn lai(self) -> Lai {
+        Lai::new(self.plmn, self.lac)
+    }
+}
+
+impl fmt::Display for Rai {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}-{}", self.plmn, self.lac, self.rac)
     }
 }
 
@@ -706,6 +821,454 @@ impl fmt::Display for Tai {
     }
 }
 
+// ── The string forms ─────────────────────────────────────────────────────────
+
+/// Parse exactly `width` upper-case hex digits.
+///
+/// Strict on the digit count, because the count is what distinguishes the
+/// forms: `262-02-002A` is a tracking area and `262-02-00002A` is the same
+/// number at 5GS width, and accepting either spelling for both would make the
+/// two indistinguishable in stored data.
+fn hex_exact(field: &str, width: usize) -> Option<u32> {
+    if field.len() != width || !field.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(field, 16).ok()
+}
+
+/// Split `MCC-MNC-<rest>` into the network and the remaining fields.
+fn split_plmn(s: &str, expected_fields: usize) -> Option<(PlmnId, Vec<&str>)> {
+    let fields: Vec<&str> = s.trim().split('-').collect();
+    if fields.len() != expected_fields {
+        return None;
+    }
+    let plmn = format!("{}-{}", fields[0], fields[1]).parse().ok()?;
+    Some((plmn, fields[2..].to_vec()))
+}
+
+/// `FromStr` mirroring a composite's `Display`, so one value has one spelling
+/// in **both** directions. A type that renders but does not parse cannot be
+/// round-tripped through a log line, a CSV column or a JSON document — and the
+/// serde representations here are built on exactly this pair.
+macro_rules! parsed_composite {
+    ($t:ty, $name:literal, $fields:expr, $shape:literal, $build:expr) => {
+        impl FromStr for $t {
+            type Err = ParseError;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                let err = || ParseError::format($name, s, $shape);
+                let (plmn, rest) = split_plmn(s, $fields).ok_or_else(err)?;
+                #[allow(clippy::redundant_closure_call)]
+                ($build)(plmn, rest.as_slice()).ok_or_else(err)
+            }
+        }
+    };
+}
+
+parsed_composite!(
+    Lai,
+    "Lai",
+    3,
+    "a location area identity such as 262-02-1A2B",
+    |plmn, rest: &[&str]| {
+        let lac = Lac::new(u16::try_from(hex_exact(rest[0], 4)?).ok()?)?;
+        Some(Lai::new(plmn, lac))
+    }
+);
+
+parsed_composite!(
+    Rai,
+    "Rai",
+    4,
+    "a routing area identity such as 262-02-1A2B-05",
+    |plmn, rest: &[&str]| {
+        let lac = Lac::new(u16::try_from(hex_exact(rest[0], 4)?).ok()?)?;
+        let rac = RoutingAreaCode::new(u8::try_from(hex_exact(rest[1], 2)?).ok()?);
+        Some(Rai::new(plmn, lac, rac))
+    }
+);
+
+parsed_composite!(
+    Cgi,
+    "Cgi",
+    4,
+    "a cell global identity such as 262-02-1A2B-00FF",
+    |plmn, rest: &[&str]| {
+        let lac = Lac::new(u16::try_from(hex_exact(rest[0], 4)?).ok()?)?;
+        let cell = CellId::new(u16::try_from(hex_exact(rest[1], 4)?).ok()?);
+        Some(Cgi::new(plmn, lac, cell))
+    }
+);
+
+parsed_composite!(
+    Sai,
+    "Sai",
+    4,
+    "a service area identity such as 262-02-1A2B-0007",
+    |plmn, rest: &[&str]| {
+        let lac = Lac::new(u16::try_from(hex_exact(rest[0], 4)?).ok()?)?;
+        let sac = ServiceAreaCode::new(u16::try_from(hex_exact(rest[1], 4)?).ok()?);
+        Some(Sai::new(plmn, lac, sac))
+    }
+);
+
+parsed_composite!(
+    Ecgi,
+    "Ecgi",
+    3,
+    "an E-UTRAN cell global identity such as 262-02-0A1B2C3",
+    |plmn, rest: &[&str]| Some(Ecgi::new(plmn, Eci::new(hex_exact(rest[0], 7)?)?))
+);
+
+parsed_composite!(
+    Ncgi,
+    "Ncgi",
+    3,
+    "an NR cell global identity such as 262-02-012345678",
+    |plmn, rest: &[&str]| {
+        let field = rest[0];
+        if field.len() != 9 || !field.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(Ncgi::new(
+            plmn,
+            Nci::new(u64::from_str_radix(field, 16).ok()?)?,
+        ))
+    }
+);
+
+parsed_composite!(
+    Tai,
+    "Tai",
+    3,
+    "a tracking area identity such as 262-02-002A (EPS) or 262-02-00002A (5GS)",
+    |plmn, rest: &[&str]| {
+        // The digit count *is* the width. An EPS code written at 5GS width is a
+        // different value here, which is the whole point of `TacWidth`.
+        let field = rest[0];
+        let tac = match field.len() {
+            4 => TrackingAreaCode::eps(u16::try_from(hex_exact(field, 4)?).ok()?),
+            6 => TrackingAreaCode::five_gs(hex_exact(field, 6)?),
+            _ => None,
+        }?;
+        Some(Tai::new(plmn, tac))
+    }
+);
+
+/// The shape [`UserLocation`] accepts, as rendered in a [`ParseError`].
+const USER_LOCATION_FORMAT: &str =
+    "a tagged location such as ecgi:262-02-0A1B2C3, cgi:262-02-1A2B-00FF or tai:262-02-002A";
+
+impl FromStr for UserLocation {
+    type Err = ParseError;
+
+    /// Parses the tagged form [`Display`](fmt::Display) writes.
+    ///
+    /// The tag is required. `262-02-1A2B` is a location area and a tracking
+    /// area written at EPS width, and nothing in the digits says which — the
+    /// same reason the enum exists rather than a struct of options.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || ParseError::format("UserLocation", s, USER_LOCATION_FORMAT);
+        let (tag, body) = s.trim().split_once(':').ok_or_else(err)?;
+        match tag.to_ascii_lowercase().as_str() {
+            "cgi" => body.parse().map(Self::Cgi),
+            "sai" => body.parse().map(Self::Sai),
+            "ecgi" => body.parse().map(Self::Ecgi),
+            "ncgi" => body.parse().map(Self::Ncgi),
+            "tai" => body.parse().map(Self::Tai),
+            "rai" => body.parse().map(Self::Rai),
+            "lai" => body.parse().map(Self::Lai),
+            _ => return Err(err()),
+        }
+        .map_err(|_| err())
+    }
+}
+
+// ── The wire form: User Location Information ─────────────────────────────────
+
+/// Read a big-endian `u16` at `at`.
+const fn u16_at(bytes: &[u8], at: usize) -> u16 {
+    ((bytes[at] as u16) << 8) | bytes[at + 1] as u16
+}
+
+/// Decode the three-octet PLMN identity and a location area code, the common
+/// head of every 2G and 3G identity in a ULI.
+fn plmn_and_lac(bytes: &[u8]) -> Result<(PlmnId, Lac), DecodeError> {
+    let plmn = PlmnId::from_bcd(&bytes[..3])?;
+    // 0x0000 and 0xFFFE are reserved to mean "no valid location area". They
+    // reach a record when an element copies its own "unknown" marker into the
+    // field, and reading one as an area puts real usage somewhere that does not
+    // exist — so the decoder refuses rather than inventing a place.
+    let lac = Lac::new(u16_at(bytes, 3))
+        .ok_or_else(|| DecodeError::new(3, "a location area code that is not reserved"))?;
+    Ok((plmn, lac))
+}
+
+impl Lai {
+    /// The wire length of a Location Area Identity, in octets.
+    pub const OCTETS: usize = 5;
+
+    /// Decode the five-octet LAI: PLMN identity, then a 16-bit location area.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] for the wrong length, a malformed PLMN identity, or a
+    /// reserved location area code.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() != Self::OCTETS {
+            return Err(DecodeError::new(0, "exactly 5 octets"));
+        }
+        let (plmn, lac) = plmn_and_lac(bytes)?;
+        Ok(Self::new(plmn, lac))
+    }
+
+    /// Encode to the five-octet LAI.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; Self::OCTETS] {
+        let plmn = self.plmn.to_bcd();
+        let lac = self.lac.get().to_be_bytes();
+        [plmn[0], plmn[1], plmn[2], lac[0], lac[1]]
+    }
+}
+
+impl Cgi {
+    /// The wire length of a Cell Global Identity, in octets.
+    pub const OCTETS: usize = 7;
+
+    /// Decode the seven-octet CGI of 3GPP TS 29.274 §8.21.1.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] for the wrong length, a malformed PLMN identity, or a
+    /// reserved location area code.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() != Self::OCTETS {
+            return Err(DecodeError::new(0, "exactly 7 octets"));
+        }
+        let (plmn, lac) = plmn_and_lac(bytes)?;
+        Ok(Self::new(plmn, lac, CellId::new(u16_at(bytes, 5))))
+    }
+
+    /// Encode to the seven-octet CGI.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; Self::OCTETS] {
+        let plmn = self.plmn().to_bcd();
+        let lac = self.lac().get().to_be_bytes();
+        let cell = self.cell().get().to_be_bytes();
+        [plmn[0], plmn[1], plmn[2], lac[0], lac[1], cell[0], cell[1]]
+    }
+}
+
+impl Sai {
+    /// The wire length of a Service Area Identity, in octets.
+    pub const OCTETS: usize = 7;
+
+    /// Decode the seven-octet SAI of 3GPP TS 29.274 §8.21.2.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cgi::from_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() != Self::OCTETS {
+            return Err(DecodeError::new(0, "exactly 7 octets"));
+        }
+        let (plmn, lac) = plmn_and_lac(bytes)?;
+        Ok(Self::new(plmn, lac, ServiceAreaCode::new(u16_at(bytes, 5))))
+    }
+
+    /// Encode to the seven-octet SAI.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; Self::OCTETS] {
+        let plmn = self.plmn().to_bcd();
+        let lac = self.lac().get().to_be_bytes();
+        let sac = self.sac().get().to_be_bytes();
+        [plmn[0], plmn[1], plmn[2], lac[0], lac[1], sac[0], sac[1]]
+    }
+}
+
+impl Rai {
+    /// The wire length of a Routing Area Identity inside a ULI, in octets.
+    ///
+    /// Seven, not six. TS 29.274 pads the one-octet routing area code with a
+    /// spare octet, which every other specification carrying an RAI does not —
+    /// a six-octet reader walks off the end of the field and reads the next
+    /// identity's PLMN as a location area.
+    pub const OCTETS: usize = 7;
+
+    /// The value TS 29.274 fixes the spare octet at.
+    pub const SPARE: u8 = 0xFF;
+
+    /// Decode the seven-octet RAI of 3GPP TS 29.274 §8.21.3.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cgi::from_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() != Self::OCTETS {
+            return Err(DecodeError::new(0, "exactly 7 octets"));
+        }
+        let (plmn, lac) = plmn_and_lac(bytes)?;
+        Ok(Self::new(plmn, lac, RoutingAreaCode::new(bytes[5])))
+    }
+
+    /// Encode to the seven-octet RAI, spare octet included.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; Self::OCTETS] {
+        let plmn = self.plmn.to_bcd();
+        let lac = self.lac.get().to_be_bytes();
+        [
+            plmn[0],
+            plmn[1],
+            plmn[2],
+            lac[0],
+            lac[1],
+            self.rac.get(),
+            Self::SPARE,
+        ]
+    }
+}
+
+impl Tai {
+    /// The wire length of an EPS Tracking Area Identity, in octets.
+    pub const EPS_OCTETS: usize = 5;
+
+    /// The wire length of a 5GS Tracking Area Identity, in octets.
+    pub const FIVE_GS_OCTETS: usize = 6;
+
+    /// Decode a TAI, at either width.
+    ///
+    /// Five octets is the EPS form (16-bit code, TS 29.274 §8.21.4) and six the
+    /// 5GS one (24-bit code, TS 24.501). **The width is taken from the field's
+    /// length and kept**, because an EPS code appears in 5GS zero-padded and
+    /// the two must not silently compare equal — see [`TrackingAreaCode`].
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] for any other length, a malformed PLMN identity, or a
+    /// reserved tracking area code.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let plmn_len = PlmnId::BCD_OCTETS;
+        let tac = match bytes.len() {
+            Self::EPS_OCTETS => TrackingAreaCode::eps(u16_at(bytes, plmn_len)),
+            Self::FIVE_GS_OCTETS => TrackingAreaCode::five_gs(
+                (u32::from(bytes[plmn_len]) << 16)
+                    | (u32::from(bytes[plmn_len + 1]) << 8)
+                    | u32::from(bytes[plmn_len + 2]),
+            ),
+            _ => return Err(DecodeError::new(0, "5 octets (EPS) or 6 (5GS)")),
+        };
+        let tac = tac.ok_or_else(|| {
+            DecodeError::new(plmn_len, "a tracking area code that is not reserved")
+        })?;
+        Ok(Self::new(PlmnId::from_bcd(&bytes[..plmn_len])?, tac))
+    }
+
+    /// Encode to the wire, writing into `out` and returning the octet count.
+    ///
+    /// Five octets for an EPS code and six for a 5GS one — the width the code
+    /// was assigned at, never widened on the way out.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] when `out` is too short.
+    pub fn to_bytes(self, out: &mut [u8]) -> Result<usize, DecodeError> {
+        let needed = match self.tac().width() {
+            TacWidth::Eps => Self::EPS_OCTETS,
+            TacWidth::FiveGs => Self::FIVE_GS_OCTETS,
+        };
+        if out.len() < needed {
+            return Err(DecodeError::new(0, "a buffer of 5 octets (EPS) or 6 (5GS)"));
+        }
+        out[..3].copy_from_slice(&self.plmn().to_bcd());
+        let value = self.tac().get();
+        match self.tac().width() {
+            TacWidth::Eps => out[3..5].copy_from_slice(&(value as u16).to_be_bytes()),
+            TacWidth::FiveGs => {
+                out[3] = (value >> 16) as u8;
+                out[4] = (value >> 8) as u8;
+                out[5] = value as u8;
+            }
+        }
+        Ok(needed)
+    }
+}
+
+impl Ecgi {
+    /// The wire length of an E-UTRAN Cell Global Identity, in octets.
+    pub const OCTETS: usize = 7;
+
+    /// Decode the seven-octet ECGI of 3GPP TS 29.274 §8.21.5.
+    ///
+    /// The cell identity is 28 bits, so the top nibble of the fourth octet is
+    /// spare. It is **not** required to be zero — elements do set it — but it is
+    /// masked off rather than folded into the identity, which would produce a
+    /// cell that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] for the wrong length or a malformed PLMN identity.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() != Self::OCTETS {
+            return Err(DecodeError::new(0, "exactly 7 octets"));
+        }
+        let raw = u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]);
+        let eci = Eci::new(raw & 0x0FFF_FFFF)
+            .ok_or_else(|| DecodeError::new(3, "a 28-bit E-UTRAN cell identity"))?;
+        Ok(Self::new(PlmnId::from_bcd(&bytes[..3])?, eci))
+    }
+
+    /// Encode to the seven-octet ECGI, with the spare nibble zeroed.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; Self::OCTETS] {
+        let plmn = self.plmn().to_bcd();
+        let eci = self.eci().get().to_be_bytes();
+        [plmn[0], plmn[1], plmn[2], eci[0], eci[1], eci[2], eci[3]]
+    }
+}
+
+impl Ncgi {
+    /// The wire length of an NR Cell Global Identity, in octets.
+    ///
+    /// Three of PLMN identity and five holding a 36-bit cell identity, as
+    /// NGAP (3GPP TS 38.413) carries it: the identity occupies the **top** 36
+    /// bits of the five octets, so the low nibble of the last one is spare.
+    pub const OCTETS: usize = 8;
+
+    /// Decode the eight-octet NCGI.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] for the wrong length or a malformed PLMN identity.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() != Self::OCTETS {
+            return Err(DecodeError::new(0, "exactly 8 octets"));
+        }
+        let raw = u64::from(u32::from_be_bytes([bytes[3], bytes[4], bytes[5], bytes[6]])) << 8
+            | u64::from(bytes[7]);
+        // A BIT STRING (SIZE(36)) is left-aligned in the octets it occupies.
+        let nci =
+            Nci::new(raw >> 4).ok_or_else(|| DecodeError::new(3, "a 36-bit NR cell identity"))?;
+        Ok(Self::new(PlmnId::from_bcd(&bytes[..3])?, nci))
+    }
+
+    /// Encode to the eight-octet NCGI, with the spare nibble zeroed.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; Self::OCTETS] {
+        let plmn = self.plmn().to_bcd();
+        let shifted = self.nci().get() << 4;
+        [
+            plmn[0],
+            plmn[1],
+            plmn[2],
+            (shifted >> 32) as u8,
+            (shifted >> 24) as u8,
+            (shifted >> 16) as u8,
+            (shifted >> 8) as u8,
+            shifted as u8,
+        ]
+    }
+}
+
 // ── User location ────────────────────────────────────────────────────────────
 
 /// Where a record says the subscriber was.
@@ -729,6 +1292,10 @@ pub enum UserLocation {
     Ncgi(Ncgi),
     /// A tracking area only, with no cell.
     Tai(Tai),
+    /// A GPRS routing area only, with no cell.
+    Rai(Rai),
+    /// A location area only — the coarsest a record reports.
+    Lai(Lai),
 }
 
 impl UserLocation {
@@ -741,6 +1308,8 @@ impl UserLocation {
             Self::Ecgi(v) => v.plmn(),
             Self::Ncgi(v) => v.plmn(),
             Self::Tai(v) => v.plmn(),
+            Self::Rai(v) => v.plmn(),
+            Self::Lai(v) => v.plmn(),
         }
     }
 
@@ -760,7 +1329,10 @@ impl UserLocation {
     /// as one would claim a precision the record does not carry.
     #[must_use]
     pub const fn is_cell(self) -> bool {
-        !matches!(self, Self::Tai(_))
+        matches!(
+            self,
+            Self::Cgi(_) | Self::Sai(_) | Self::Ecgi(_) | Self::Ncgi(_)
+        )
     }
 
     /// The canonical string form of the variant.
@@ -772,8 +1344,617 @@ impl UserLocation {
             Self::Ecgi(_) => "ECGI",
             Self::Ncgi(_) => "NCGI",
             Self::Tai(_) => "TAI",
+            Self::Rai(_) => "RAI",
+            Self::Lai(_) => "LAI",
         }
     }
+}
+
+// ── The ULI information element ──────────────────────────────────────────────
+
+/// A macro eNodeB identifier, as a ULI carries it: network plus 20 bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MacroEnbId {
+    plmn: PlmnId,
+    id: u32,
+}
+
+impl MacroEnbId {
+    /// The wire length, in octets.
+    pub const OCTETS: usize = 6;
+
+    /// How many bits the identifier occupies.
+    pub const BITS: u32 = 20;
+
+    /// An identifier, or `None` when the value does not fit 20 bits.
+    #[must_use]
+    pub const fn new(plmn: PlmnId, id: u32) -> Option<Self> {
+        if id < (1 << Self::BITS) {
+            Some(Self { plmn, id })
+        } else {
+            None
+        }
+    }
+
+    /// The network.
+    #[must_use]
+    pub const fn plmn(self) -> PlmnId {
+        self.plmn
+    }
+
+    /// The identifier.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.id
+    }
+
+    /// Decode the six-octet field of 3GPP TS 29.274 §8.21.7.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] for the wrong length or a malformed PLMN identity.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() != Self::OCTETS {
+            return Err(DecodeError::new(0, "exactly 6 octets"));
+        }
+        let id = u32::from_be_bytes([0, bytes[3], bytes[4], bytes[5]]) & 0x000F_FFFF;
+        Self::new(PlmnId::from_bcd(&bytes[..3])?, id)
+            .ok_or_else(|| DecodeError::new(3, "a 20-bit macro eNodeB identifier"))
+    }
+
+    /// Encode to the six-octet field.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; Self::OCTETS] {
+        let plmn = self.plmn.to_bcd();
+        [
+            plmn[0],
+            plmn[1],
+            plmn[2],
+            (self.id >> 16) as u8,
+            (self.id >> 8) as u8,
+            self.id as u8,
+        ]
+    }
+}
+
+impl fmt::Display for MacroEnbId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{:05X}", self.plmn, self.id)
+    }
+}
+
+/// Which of the two extended macro eNodeB shapes a value takes.
+///
+/// The `SMeNB` bit selects between them, and the identifier is a different
+/// width in each — reading one as the other shifts every base station in the
+/// deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExtendedEnbKind {
+    /// `SMeNB` clear: a 21-bit long macro eNodeB identifier.
+    Long,
+    /// `SMeNB` set: an 18-bit short macro eNodeB identifier.
+    Short,
+}
+
+impl ExtendedEnbKind {
+    /// How many bits the identifier occupies.
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        match self {
+            Self::Long => 21,
+            Self::Short => 18,
+        }
+    }
+
+    /// The canonical string form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Long => "LONG",
+            Self::Short => "SHORT",
+        }
+    }
+}
+
+impl fmt::Display for ExtendedEnbKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ExtendedEnbKind {
+    /// Every variant, for exhaustive iteration in tests and mappings.
+    pub const ALL: &'static [Self] = &[Self::Long, Self::Short];
+
+    /// The canonical code of each variant, in [`ALL`](Self::ALL) order.
+    pub const CODES: &'static [&'static str] = &["LONG", "SHORT"];
+}
+
+impl FromStr for ExtendedEnbKind {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .find(|k| k.as_str().eq_ignore_ascii_case(s.trim()))
+            .copied()
+            .ok_or_else(|| ParseError::one_of("ExtendedEnbKind", s, Self::CODES))
+    }
+}
+
+/// An extended macro eNodeB identifier (3GPP TS 29.274 §8.21.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExtendedMacroEnbId {
+    plmn: PlmnId,
+    kind: ExtendedEnbKind,
+    id: u32,
+}
+
+impl ExtendedMacroEnbId {
+    /// The wire length, in octets.
+    pub const OCTETS: usize = 6;
+
+    /// An identifier, or `None` when the value does not fit its shape.
+    #[must_use]
+    pub const fn new(plmn: PlmnId, kind: ExtendedEnbKind, id: u32) -> Option<Self> {
+        if id < (1 << kind.bits()) {
+            Some(Self { plmn, kind, id })
+        } else {
+            None
+        }
+    }
+
+    /// The network.
+    #[must_use]
+    pub const fn plmn(self) -> PlmnId {
+        self.plmn
+    }
+
+    /// Which shape the identifier takes.
+    #[must_use]
+    pub const fn kind(self) -> ExtendedEnbKind {
+        self.kind
+    }
+
+    /// The identifier.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.id
+    }
+
+    /// Decode the six-octet field.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] for the wrong length or a malformed PLMN identity.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() != Self::OCTETS {
+            return Err(DecodeError::new(0, "exactly 6 octets"));
+        }
+        let raw = u32::from_be_bytes([0, bytes[3], bytes[4], bytes[5]]);
+        let kind = if bytes[3] & 0x80 != 0 {
+            ExtendedEnbKind::Short
+        } else {
+            ExtendedEnbKind::Long
+        };
+        let id = raw & ((1 << kind.bits()) - 1);
+        Self::new(PlmnId::from_bcd(&bytes[..3])?, kind, id)
+            .ok_or_else(|| DecodeError::new(3, "an extended macro eNodeB identifier"))
+    }
+
+    /// Encode to the six-octet field.
+    #[must_use]
+    pub fn to_bytes(self) -> [u8; Self::OCTETS] {
+        let plmn = self.plmn.to_bcd();
+        let flag = match self.kind {
+            ExtendedEnbKind::Long => 0,
+            ExtendedEnbKind::Short => 0x0080_0000,
+        };
+        let packed = flag | self.id;
+        [
+            plmn[0],
+            plmn[1],
+            plmn[2],
+            (packed >> 16) as u8,
+            (packed >> 8) as u8,
+            packed as u8,
+        ]
+    }
+}
+
+impl fmt::Display for ExtendedMacroEnbId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}-{:06X}", self.plmn, self.kind, self.id)
+    }
+}
+
+/// The User Location Information element of 3GPP TS 29.274 §8.21.
+///
+/// # A ULI is a *set*, not a location
+///
+/// The element is a flag octet followed by whichever identities the flags
+/// select, and a network commonly reports **more than one** — an ECGI and the
+/// TAI it sits in, or a CGI and its RAI. Modelling it as a single value forces
+/// a decoder to pick one, and the natural pick is whichever field it happened
+/// to check first, which varies between decoders and therefore between the two
+/// sides of a reconciliation.
+///
+/// So this type carries all of them, and [`most_precise`](Self::most_precise)
+/// is the named, documented way to reduce the set to one
+/// [`UserLocation`] when a caller genuinely needs one.
+///
+/// # The field order is fixed and the flags are not
+///
+/// The identities appear in a fixed order — CGI, SAI, RAI, TAI, ECGI, LAI,
+/// macro eNodeB, extended macro eNodeB — regardless of which flags are set, and
+/// each is a different width. A decoder that reads them in flag order, or that
+/// gets one width wrong, does not fail: it reads the *next* identity's PLMN
+/// octets as this one's location area and produces a plausible cell in the
+/// wrong country.
+///
+/// ```rust
+/// use mediation::{Uli, UserLocation};
+///
+/// // Flags 0x18: ECGI and TAI, which is what an LTE record usually carries.
+/// let field = [
+///     0x18,
+///     0x62, 0xF2, 0x20, 0x00, 0x2A, // TAI: 262-02, tracking area 002A
+///     0x62, 0xF2, 0x20, 0x00, 0xA1, 0xB2, 0xC3, // ECGI: 262-02, cell 00A1B2C3
+/// ];
+///
+/// let uli = Uli::decode(&field).unwrap();
+/// assert!(uli.tai.is_some() && uli.ecgi.is_some());
+/// assert_eq!(uli.mcc().unwrap().unwrap().to_string(), "262");
+///
+/// // A cell is more precise than the tracking area containing it.
+/// assert!(matches!(uli.most_precise(), Some(UserLocation::Ecgi(_))));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Uli {
+    /// A 2G cell, when the element carried one.
+    pub cgi: Option<Cgi>,
+    /// A 3G service area.
+    pub sai: Option<Sai>,
+    /// A GPRS routing area.
+    pub rai: Option<Rai>,
+    /// A tracking area.
+    pub tai: Option<Tai>,
+    /// A 4G cell.
+    pub ecgi: Option<Ecgi>,
+    /// A location area.
+    pub lai: Option<Lai>,
+    /// A macro eNodeB.
+    pub macro_enb: Option<MacroEnbId>,
+    /// An extended macro eNodeB.
+    pub extended_macro_enb: Option<ExtendedMacroEnbId>,
+}
+
+impl Uli {
+    /// Bit 1 of the flag octet.
+    const FLAG_CGI: u8 = 0x01;
+    /// Bit 2.
+    const FLAG_SAI: u8 = 0x02;
+    /// Bit 3.
+    const FLAG_RAI: u8 = 0x04;
+    /// Bit 4.
+    const FLAG_TAI: u8 = 0x08;
+    /// Bit 5.
+    const FLAG_ECGI: u8 = 0x10;
+    /// Bit 6.
+    const FLAG_LAI: u8 = 0x20;
+    /// Bit 7.
+    const FLAG_MACRO_ENB: u8 = 0x40;
+    /// Bit 8.
+    const FLAG_EXT_MACRO_ENB: u8 = 0x80;
+
+    /// An empty set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            cgi: None,
+            sai: None,
+            rai: None,
+            tai: None,
+            ecgi: None,
+            lai: None,
+            macro_enb: None,
+            extended_macro_enb: None,
+        }
+    }
+
+    /// Decode the element.
+    ///
+    /// A ULI **inside a ULI** is not a thing, so the element is a flat
+    /// sequence and the decode is a single pass. Trailing octets beyond the
+    /// selected fields are ignored: TS 29.274 declares the element extensible,
+    /// and a later release adding a field must not make today's records
+    /// undecodable.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] for an empty element, for one that ends before a field
+    /// the flags promised, or for a field this crate rejects — a reserved
+    /// location area code, an unassigned MCC.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let (flags, rest) = bytes
+            .split_first()
+            .ok_or_else(|| DecodeError::new(0, "a flag octet"))?;
+        let mut at = 1usize;
+        let mut uli = Self::new();
+
+        // `at` walks the whole element, so every field's error offset and every
+        // slice come from one cursor rather than from a shrinking tail.
+        macro_rules! take {
+            ($flag:expr, $len:expr, $what:literal) => {{
+                if flags & $flag == 0 {
+                    None
+                } else {
+                    let from = at - 1;
+                    if rest.len() < from + $len {
+                        return Err(DecodeError::new(at, $what));
+                    }
+                    at += $len;
+                    Some(&rest[from..from + $len])
+                }
+            }};
+        }
+
+        // TS 29.274 §8.21: "If more than one identity of different type is
+        // present, then they shall be sorted in the following order: CGI, SAI,
+        // RAI, TAI, ECGI, LAI" — which is the flag order, with the two
+        // base-station identifiers appended in the order their flags were
+        // added. Both the reader and the writer below follow it.
+        if let Some(field) = take!(Self::FLAG_CGI, Cgi::OCTETS, "a 7-octet CGI") {
+            uli.cgi = Some(Cgi::from_bytes(field).map_err(|e| shift(e, at - Cgi::OCTETS))?);
+        }
+        if let Some(field) = take!(Self::FLAG_SAI, Sai::OCTETS, "a 7-octet SAI") {
+            uli.sai = Some(Sai::from_bytes(field).map_err(|e| shift(e, at - Sai::OCTETS))?);
+        }
+        if let Some(field) = take!(Self::FLAG_RAI, Rai::OCTETS, "a 7-octet RAI") {
+            uli.rai = Some(Rai::from_bytes(field).map_err(|e| shift(e, at - Rai::OCTETS))?);
+        }
+        if let Some(field) = take!(Self::FLAG_TAI, Tai::EPS_OCTETS, "a 5-octet TAI") {
+            uli.tai = Some(Tai::from_bytes(field).map_err(|e| shift(e, at - Tai::EPS_OCTETS))?);
+        }
+        if let Some(field) = take!(Self::FLAG_ECGI, Ecgi::OCTETS, "a 7-octet ECGI") {
+            uli.ecgi = Some(Ecgi::from_bytes(field).map_err(|e| shift(e, at - Ecgi::OCTETS))?);
+        }
+        if let Some(field) = take!(Self::FLAG_LAI, Lai::OCTETS, "a 5-octet LAI") {
+            uli.lai = Some(Lai::from_bytes(field).map_err(|e| shift(e, at - Lai::OCTETS))?);
+        }
+        if let Some(field) = take!(
+            Self::FLAG_MACRO_ENB,
+            MacroEnbId::OCTETS,
+            "a 6-octet macro eNodeB identifier"
+        ) {
+            uli.macro_enb =
+                Some(MacroEnbId::from_bytes(field).map_err(|e| shift(e, at - MacroEnbId::OCTETS))?);
+        }
+        if let Some(field) = take!(
+            Self::FLAG_EXT_MACRO_ENB,
+            ExtendedMacroEnbId::OCTETS,
+            "a 6-octet extended macro eNodeB identifier"
+        ) {
+            uli.extended_macro_enb = Some(
+                ExtendedMacroEnbId::from_bytes(field)
+                    .map_err(|e| shift(e, at - ExtendedMacroEnbId::OCTETS))?,
+            );
+        }
+        Ok(uli)
+    }
+
+    /// How many octets [`encode`](Self::encode) will write.
+    ///
+    /// The TAI is counted at [`Tai::EPS_OCTETS`], which is the only width this
+    /// element carries — see [`encode`](Self::encode), which refuses a 5GS one
+    /// rather than writing an octet the decoder would misread.
+    #[must_use]
+    pub fn encoded_len(&self) -> usize {
+        1 + self.cgi.map_or(0, |_| Cgi::OCTETS)
+            + self.sai.map_or(0, |_| Sai::OCTETS)
+            + self.rai.map_or(0, |_| Rai::OCTETS)
+            + self.tai.map_or(0, |_| Tai::EPS_OCTETS)
+            + self.ecgi.map_or(0, |_| Ecgi::OCTETS)
+            + self.lai.map_or(0, |_| Lai::OCTETS)
+            + self.macro_enb.map_or(0, |_| MacroEnbId::OCTETS)
+            + self
+                .extended_macro_enb
+                .map_or(0, |_| ExtendedMacroEnbId::OCTETS)
+    }
+
+    /// Encode the element, writing into `out` and returning the octet count.
+    ///
+    /// # A 5GS tracking area is refused
+    ///
+    /// The ULI IE's TAI field is five octets — a 16-bit EPS code (TS 29.274
+    /// §8.21.4). A 24-bit 5GS code does not fit it, and writing six octets
+    /// anyway would shift every field after the TAI by one: this crate's own
+    /// [`decode`](Self::decode) would read the next identity's octets as part
+    /// of the tracking area, and any other decoder would do something else
+    /// again. A 5GS tracking area belongs in a 5GS location reporting element,
+    /// so it is rejected here rather than corrupted.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] when `out` is shorter than
+    /// [`encoded_len`](Self::encoded_len), or when the TAI is a 5GS one.
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, DecodeError> {
+        if let Some(tai) = self.tai
+            && tai.tac().width() != TacWidth::Eps
+        {
+            return Err(DecodeError::new(
+                1,
+                "an EPS tracking area; the ULI element has no 5GS TAI field",
+            ));
+        }
+        let needed = self.encoded_len();
+        if out.len() < needed {
+            return Err(DecodeError::new(0, "a buffer of encoded_len() octets"));
+        }
+        let mut flags = 0u8;
+        for (present, bit) in [
+            (self.cgi.is_some(), Self::FLAG_CGI),
+            (self.sai.is_some(), Self::FLAG_SAI),
+            (self.rai.is_some(), Self::FLAG_RAI),
+            (self.tai.is_some(), Self::FLAG_TAI),
+            (self.ecgi.is_some(), Self::FLAG_ECGI),
+            (self.lai.is_some(), Self::FLAG_LAI),
+            (self.macro_enb.is_some(), Self::FLAG_MACRO_ENB),
+            (self.extended_macro_enb.is_some(), Self::FLAG_EXT_MACRO_ENB),
+        ] {
+            if present {
+                flags |= bit;
+            }
+        }
+        out[0] = flags;
+
+        let mut at = 1usize;
+        macro_rules! put {
+            ($value:expr) => {
+                if let Some(value) = $value {
+                    let encoded = value.to_bytes();
+                    out[at..at + encoded.len()].copy_from_slice(&encoded);
+                    at += encoded.len();
+                }
+            };
+        }
+        put!(self.cgi);
+        put!(self.sai);
+        put!(self.rai);
+        if let Some(tai) = self.tai {
+            at += tai.to_bytes(&mut out[at..])?;
+        }
+        put!(self.ecgi);
+        put!(self.lai);
+        put!(self.macro_enb);
+        put!(self.extended_macro_enb);
+        Ok(at)
+    }
+
+    /// `true` when the element selected no identity at all.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.cgi.is_none()
+            && self.sai.is_none()
+            && self.rai.is_none()
+            && self.tai.is_none()
+            && self.ecgi.is_none()
+            && self.lai.is_none()
+            && self.macro_enb.is_none()
+            && self.extended_macro_enb.is_none()
+    }
+
+    /// The most precise identity the element carried, as a [`UserLocation`].
+    ///
+    /// Cell before area, and newer access before older where both are present:
+    /// ECGI, CGI, SAI, then the areas — TAI, RAI, LAI. The base-station
+    /// identifiers are not locations and are never returned.
+    ///
+    /// `None` for an element that selected nothing, which is a decoding or
+    /// provenance gap rather than a place.
+    #[must_use]
+    pub fn most_precise(&self) -> Option<UserLocation> {
+        if let Some(v) = self.ecgi {
+            return Some(UserLocation::Ecgi(v));
+        }
+        if let Some(v) = self.cgi {
+            return Some(UserLocation::Cgi(v));
+        }
+        if let Some(v) = self.sai {
+            return Some(UserLocation::Sai(v));
+        }
+        if let Some(v) = self.tai {
+            return Some(UserLocation::Tai(v));
+        }
+        if let Some(v) = self.rai {
+            return Some(UserLocation::Rai(v));
+        }
+        self.lai.map(UserLocation::Lai)
+    }
+
+    /// The country every identity in the element agrees on.
+    ///
+    /// `Ok(None)` when the element carried no identity at all, and
+    /// `Err(UliCountryConflict)` when two of them name different countries —
+    /// which is a fault, not a tie to break, exactly as in
+    /// [`crate::jurisdiction`]. The three answers are kept apart because they
+    /// call for three different things: nothing to read, a feed to fix, and a
+    /// country.
+    ///
+    /// ```rust
+    /// use mediation::{Cgi, Lai, Uli};
+    /// # use mediation::{CellId, Lac};
+    /// # let lac = Lac::new(0x0BC4).unwrap();
+    /// let mut uli = Uli::new();
+    /// assert_eq!(uli.mcc(), Ok(None), "nothing to read is not a conflict");
+    ///
+    /// uli.cgi = Some(Cgi::new("262-02".parse().unwrap(), lac, CellId::new(1)));
+    /// assert_eq!(uli.mcc().unwrap().map(|m| m.to_string()), Some("262".into()));
+    ///
+    /// // A second identity from another country is a fault in the feed.
+    /// uli.lai = Some(Lai::new("214-07".parse().unwrap(), lac));
+    /// assert!(uli.mcc().is_err());
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`UliCountryConflict`] naming the two countries that disagreed.
+    pub fn mcc(&self) -> Result<Option<Mcc>, UliCountryConflict> {
+        let mut found: Option<Mcc> = None;
+        for plmn in [
+            self.cgi.map(Cgi::plmn),
+            self.sai.map(Sai::plmn),
+            self.rai.map(Rai::plmn),
+            self.tai.map(Tai::plmn),
+            self.ecgi.map(Ecgi::plmn),
+            self.lai.map(Lai::plmn),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            match found {
+                None => found = Some(plmn.mcc()),
+                Some(seen) if seen != plmn.mcc() => {
+                    return Err(UliCountryConflict {
+                        first: seen,
+                        second: plmn.mcc(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(found)
+    }
+}
+
+/// Two identities in one [`Uli`] named different countries.
+///
+/// A record cannot have been produced in two places, so this is a decoding
+/// fault or a mislabelled element rather than an ambiguity to resolve. Both
+/// codes are carried so a caller can see which feed is wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UliCountryConflict {
+    /// The country the first identity named, in element order.
+    pub first: Mcc,
+    /// The country that disagreed with it.
+    pub second: Mcc,
+}
+
+impl fmt::Display for UliCountryConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the element names both {} and {}",
+            self.first, self.second
+        )
+    }
+}
+
+impl std::error::Error for UliCountryConflict {}
+
+/// Move a field-local decode error onto the enclosing element's offsets.
+fn shift(error: DecodeError, by: usize) -> DecodeError {
+    DecodeError::new(error.at() + by, error.expected())
 }
 
 impl fmt::Display for UserLocation {
@@ -785,6 +1966,8 @@ impl fmt::Display for UserLocation {
             Self::Ecgi(v) => write!(f, "ecgi:{v}"),
             Self::Ncgi(v) => write!(f, "ncgi:{v}"),
             Self::Tai(v) => write!(f, "tai:{v}"),
+            Self::Rai(v) => write!(f, "rai:{v}"),
+            Self::Lai(v) => write!(f, "lai:{v}"),
         }
     }
 }
@@ -794,8 +1977,9 @@ impl fmt::Display for UserLocation {
 #[cfg(feature = "serde")]
 mod serde_impl {
     use super::{
-        CellId, Cgi, Ecgi, Eci, EnbKind, GnbIdLength, Lac, Ncgi, Nci, Sai, ServiceAreaCode,
-        TacWidth, Tai, TrackingAreaCode, UserLocation,
+        CellId, Cgi, Ecgi, Eci, EnbKind, ExtendedEnbKind, ExtendedMacroEnbId, GnbIdLength, Lac,
+        Lai, MacroEnbId, Ncgi, Nci, Rai, RoutingAreaCode, Sai, ServiceAreaCode, TacWidth, Tai,
+        TrackingAreaCode, Uli, UserLocation,
     };
     use crate::plmn::PlmnId;
     use serde::de::{self, Visitor};
@@ -888,6 +2072,7 @@ mod serde_impl {
 
     plain_number!(CellId, u16, CellId::new);
     plain_number!(ServiceAreaCode, u16, ServiceAreaCode::new);
+    plain_number!(RoutingAreaCode, u8, RoutingAreaCode::new);
 
     #[derive(Serialize, Deserialize)]
     #[serde(rename = "TrackingAreaCode")]
@@ -966,6 +2151,132 @@ mod serde_impl {
         use super::*;
         composite!(Tai, "Tai", { plmn: PlmnId, tac: TrackingAreaCode });
     }
+    mod lai {
+        use super::*;
+        composite!(Lai, "Lai", { plmn: PlmnId, lac: Lac });
+    }
+    mod rai {
+        use super::*;
+        composite!(Rai, "Rai", { plmn: PlmnId, lac: Lac, rac: RoutingAreaCode });
+    }
+
+    /// The base-station identifiers name their parts, so a stored value stays
+    /// readable — and the extended one names its shape, because the identifier
+    /// is a different width in each and the two must never read alike.
+    mod macro_enb {
+        use super::*;
+
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename = "MacroEnbId")]
+        struct Repr {
+            plmn: PlmnId,
+            id: u32,
+        }
+
+        impl Serialize for MacroEnbId {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                Repr {
+                    plmn: self.plmn(),
+                    id: self.get(),
+                }
+                .serialize(s)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for MacroEnbId {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let r = Repr::deserialize(d)?;
+                MacroEnbId::new(r.plmn, r.id).ok_or_else(|| {
+                    de::Error::custom(format!("{} is not a 20-bit macro eNodeB id", r.id))
+                })
+            }
+        }
+    }
+
+    mod ext_macro_enb {
+        use super::*;
+
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename = "ExtendedMacroEnbId")]
+        struct Repr {
+            plmn: PlmnId,
+            kind: ExtendedEnbKind,
+            id: u32,
+        }
+
+        impl Serialize for ExtendedMacroEnbId {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                Repr {
+                    plmn: self.plmn(),
+                    kind: self.kind(),
+                    id: self.get(),
+                }
+                .serialize(s)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for ExtendedMacroEnbId {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let r = Repr::deserialize(d)?;
+                ExtendedMacroEnbId::new(r.plmn, r.kind, r.id).ok_or_else(|| {
+                    de::Error::custom(format!("{} does not fit a {} identifier", r.id, r.kind))
+                })
+            }
+        }
+    }
+
+    /// The whole element, one optional field per identity — the same shape the
+    /// flag octet has, so what was carried survives the round trip.
+    mod uli {
+        use super::*;
+
+        #[derive(Serialize, Deserialize, Default)]
+        #[serde(rename = "Uli", default)]
+        struct Repr {
+            cgi: Option<Cgi>,
+            sai: Option<Sai>,
+            rai: Option<Rai>,
+            tai: Option<Tai>,
+            ecgi: Option<Ecgi>,
+            lai: Option<Lai>,
+            macro_enb: Option<MacroEnbId>,
+            extended_macro_enb: Option<ExtendedMacroEnbId>,
+        }
+
+        impl Serialize for Uli {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                Repr {
+                    cgi: self.cgi,
+                    sai: self.sai,
+                    rai: self.rai,
+                    tai: self.tai,
+                    ecgi: self.ecgi,
+                    lai: self.lai,
+                    macro_enb: self.macro_enb,
+                    extended_macro_enb: self.extended_macro_enb,
+                }
+                .serialize(s)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for Uli {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let r = Repr::deserialize(d)?;
+                Ok(Uli {
+                    cgi: r.cgi,
+                    sai: r.sai,
+                    rai: r.rai,
+                    tai: r.tai,
+                    ecgi: r.ecgi,
+                    lai: r.lai,
+                    macro_enb: r.macro_enb,
+                    extended_macro_enb: r.extended_macro_enb,
+                })
+            }
+        }
+    }
+
+    string_enum!(ExtendedEnbKind, "LONG or SHORT");
 
     /// Internally tagged on `kind`, so adding an access generation does not
     /// renumber the others.
@@ -982,6 +2293,10 @@ mod serde_impl {
         Ncgi(Ncgi),
         #[serde(rename = "TAI")]
         Tai(Tai),
+        #[serde(rename = "RAI")]
+        Rai(Rai),
+        #[serde(rename = "LAI")]
+        Lai(Lai),
     }
 
     impl Serialize for UserLocation {
@@ -992,6 +2307,8 @@ mod serde_impl {
                 UserLocation::Ecgi(v) => LocationRepr::Ecgi(v),
                 UserLocation::Ncgi(v) => LocationRepr::Ncgi(v),
                 UserLocation::Tai(v) => LocationRepr::Tai(v),
+                UserLocation::Rai(v) => LocationRepr::Rai(v),
+                UserLocation::Lai(v) => LocationRepr::Lai(v),
             }
             .serialize(s)
         }
@@ -1005,6 +2322,8 @@ mod serde_impl {
                 LocationRepr::Ecgi(v) => UserLocation::Ecgi(v),
                 LocationRepr::Ncgi(v) => UserLocation::Ncgi(v),
                 LocationRepr::Tai(v) => UserLocation::Tai(v),
+                LocationRepr::Rai(v) => UserLocation::Rai(v),
+                LocationRepr::Lai(v) => UserLocation::Lai(v),
             })
         }
     }

@@ -12,7 +12,7 @@ default:
     @just --list
 
 # ✅ Everything CI runs, in CI order
-ci: fmt-check lint purity test doc package
+ci: fmt-check lint purity no-floats test doc site-check package
     @echo "✅ all checks passed"
 
 # 🧊 Enforce the "zero I/O, no clock" guarantee over non-comment source lines
@@ -84,13 +84,37 @@ features:
 msrv:
     RUSTUP_TOOLCHAIN={{ msrv }} cargo check --all-features --all-targets
 
-# 📚 Build the docs with warnings denied
+# 📚 Build the API docs with warnings denied
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
 # 📚 Build and open the docs
 doc-open:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --open
+
+# 🌐 Build the documentation site (needs `zola`: https://www.getzola.org)
+site:
+    cd site && zola build
+
+# 🌐 Serve the site with live reload at http://127.0.0.1:1111
+site-serve:
+    cd site && zola serve --open
+
+# 🔗 Check every internal link on the site, and every page for orphans
+#
+# The site's Rust examples are covered by `test`, because `src/lib.rs` includes
+# every page as a doctest. Skipped with a note when `zola` is not installed, so
+# a contributor working on the crate is not blocked by a tool they do not need;
+# CI installs it and runs this for real.
+site-check:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! command -v zola >/dev/null 2>&1; then
+        echo "⏭️  zola not installed — skipping the site link check"
+        echo "   install it from https://www.getzola.org to run \`just site\`"
+        exit 0
+    fi
+    cd site && zola check
 
 # 📦 Dry-run the crates.io package (catches bad metadata before tagging)
 # `--allow-dirty` is local-only convenience; CI runs this on a clean checkout.

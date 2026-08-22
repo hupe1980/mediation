@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="{{ lang | default(value="en") }}" data-theme="auto" class="no-js">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+{#- Title and description come straight from the page or section rather than
+    from a variable a child template set: Tera does not carry a child `set` into
+    the parent, and a silently inherited site-wide description on every page is
+    the single most common way a documentation site loses its search results. #}
+{%- if page -%}
+  {%- set page_title = page.title -%}
+  {%- set page_desc = page.description | default(value=config.description) -%}
+  {%- set canonical = page.permalink -%}
+{%- elif section and not section.extra.is_home -%}
+  {%- set page_title = section.title -%}
+  {%- set page_desc = section.description | default(value=config.description) -%}
+  {%- set canonical = section.permalink -%}
+{%- else -%}
+  {%- set page_title = config.title -%}
+  {%- set page_desc = config.description -%}
+  {%- set canonical = config.base_url ~ "/" -%}
+{%- endif -%}
+{%- set social = config.base_url ~ config.extra.og_image -%}
+
+<title>{% if page_title != config.title %}{{ page_title }} · {{ config.title }}{% else %}{{ config.title }} — telecom usage mediation for Rust{% endif %}</title>
+<meta name="description" content="{{ page_desc }}">
+<link rel="canonical" href="{{ canonical | safe }}">
+<meta name="author" content="{{ config.extra.author }}">
+<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+<meta name="color-scheme" content="light dark">
+{#- Applied before the first paint, so a reader who chose light does not get a
+    flash of dark on every navigation. Inline and tiny for the same reason. #}
+<script>
+(function () {
+  var root = document.documentElement;
+  root.classList.remove('no-js');
+  try {
+    var saved = localStorage.getItem('theme');
+    if (saved === 'light' || saved === 'dark') root.dataset.theme = saved;
+  } catch (e) { /* private mode: fall back to the system preference */ }
+})();
+</script>
+<meta name="theme-color" content="#0b1020" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+
+<meta property="og:type" content="{% if page %}article{% else %}website{% endif %}">
+<meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:title" content="{{ page_title }}">
+<meta property="og:description" content="{{ page_desc }}">
+<meta property="og:url" content="{{ canonical | safe }}">
+<meta property="og:image" content="{{ social | safe }}">
+<meta property="og:locale" content="en_GB">
+
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ page_title }}">
+<meta name="twitter:description" content="{{ page_desc }}">
+<meta name="twitter:image" content="{{ social | safe }}">
+
+<link rel="icon" href="{{ get_url(path='favicon.svg') | safe }}" type="image/svg+xml">
+<link rel="apple-touch-icon" href="{{ get_url(path='favicon.svg') | safe }}">
+<link rel="stylesheet" href="{{ get_url(path='style.css', cachebust=true) | safe }}">
+{#- Two syntax themes, one active per colour scheme. The light and dark
+    stylesheets use disjoint class prefixes, so the media query is what selects
+    between them rather than cascade order. #}
+<link id="syntax-light" rel="stylesheet" href="{{ get_url(path='giallo-light.css') | safe }}" media="(prefers-color-scheme: light)">
+<link id="syntax-dark" rel="stylesheet" href="{{ get_url(path='giallo-dark.css') | safe }}" media="(prefers-color-scheme: dark)">
+
+<script type="application/ld+json">
+{% block structured_data %}{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "name": "{{ config.title }}",
+  "url": "{{ config.base_url }}",
+  "description": "{{ config.description }}"
+}{% endblock %}
+</script>
+</head>
+<body class="{% block body_class %}{% endblock %}">
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-head">
+  <div class="wrap">
+    <a class="brand" href="{{ get_url(path='@/_index.md') | safe }}">
+      <span class="brand-mark" aria-hidden="true">◈</span>
+      <span class="brand-name">{{ config.title }}</span>
+    </a>
+    <nav class="site-nav" aria-label="Main">
+      <a href="{{ get_url(path='@/docs/_index.md') | safe }}">Documentation</a>
+      <a href="{{ config.extra.docs_rs }}" rel="noopener">API reference</a>
+      <a href="{{ config.extra.crates_io }}" rel="noopener">crates.io</a>
+      <a class="ghost" href="{{ config.extra.repository }}" rel="noopener">GitHub</a>
+      <button class="theme" type="button" aria-live="polite"
+              title="Switch between system, light and dark"
+              aria-label="Colour theme: following the system setting">
+        <span class="on-auto" aria-hidden="true">◐</span>
+        <span class="on-light" aria-hidden="true">☀</span>
+        <span class="on-dark" aria-hidden="true">☾</span>
+      </button>
+    </nav>
+  </div>
+</header>
+
+<main id="main">{% block content %}{% endblock %}</main>
+
+<footer class="site-foot">
+  <div class="wrap">
+    <p>
+      <strong>{{ config.title }}</strong> — telecom usage mediation as a pure Rust
+      library. Dual-licensed {{ config.extra.license }}.
+    </p>
+    <nav aria-label="Footer">
+      <a href="{{ get_url(path='@/docs/_index.md') | safe }}">Documentation</a>
+      <a href="{{ config.extra.docs_rs }}" rel="noopener">API reference</a>
+      <a href="{{ config.extra.repository }}" rel="noopener">Source</a>
+      <a href="{{ config.extra.repository }}/issues" rel="noopener">Issues</a>
+    </nav>
+    <p class="fine">
+      Not legal advice. The crate implements arithmetic and classification rules
+      derived from published standards and regulations; verify against the
+      current text for your use case.
+    </p>
+  </div>
+</footer>
+
+<script>
+// Cycles system → light → dark. The syntax stylesheets are selected by media
+// query, so an explicit choice overrides them by rewriting `media` rather than
+// by loading a third sheet.
+(function () {
+  var root = document.documentElement;
+  var button = document.querySelector('.theme');
+  if (!button) return;
+
+  var LABEL = {
+    auto: 'Colour theme: following the system setting',
+    light: 'Colour theme: light',
+    dark: 'Colour theme: dark',
+  };
+  var NEXT = { auto: 'light', light: 'dark', dark: 'auto' };
+
+  function apply(mode) {
+    root.dataset.theme = mode;
+    button.setAttribute('aria-label', LABEL[mode]);
+    var light = document.getElementById('syntax-light');
+    var dark = document.getElementById('syntax-dark');
+    if (!light || !dark) return;
+    if (mode === 'auto') {
+      light.media = '(prefers-color-scheme: light)';
+      dark.media = '(prefers-color-scheme: dark)';
+    } else {
+      light.media = mode === 'light' ? 'all' : 'not all';
+      dark.media = mode === 'dark' ? 'all' : 'not all';
+    }
+  }
+
+  var stored = 'auto';
+  try { stored = localStorage.getItem('theme') || 'auto'; } catch (e) {}
+  apply(stored === 'light' || stored === 'dark' ? stored : 'auto');
+
+  button.addEventListener('click', function () {
+    var mode = NEXT[root.dataset.theme] || 'light';
+    apply(mode);
+    try {
+      if (mode === 'auto') localStorage.removeItem('theme');
+      else localStorage.setItem('theme', mode);
+    } catch (e) { /* nothing to remember, and nothing breaks */ }
+  });
+})();
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

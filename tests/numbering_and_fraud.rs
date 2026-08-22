@@ -4,9 +4,10 @@
 //! mostly about what happens when that data does not answer.
 
 use mediation::{
-    CalledParty, ChargedParty, Msisdn, NumberRange, NumberRangeSet, PlmnId, RecordType, Seconds,
-    Signal, SourceRef, SubscriberRef, TrafficShape, UsageRecord, ait_signature, bypass_signature,
-    impossible_travel, is_ported, premium_destination, terminating_plmn, wangiri_pattern,
+    CalledParty, ChargedParty, Mcc, Msisdn, NumberRange, NumberRangeSet, PlmnId, RecordType,
+    Seconds, Signal, SourceRef, SubscriberRef, TrafficShape, UniformTransit, UsageRecord,
+    ait_signature, bypass_signature, impossible_travel, is_ported, premium_destination,
+    terminating_plmn, wangiri_pattern,
 };
 use time::Duration;
 
@@ -382,9 +383,108 @@ fn detection_is_replayable() {
         ),
     ];
 
-    let first = impossible_travel(&records, Duration::hours(4));
-    let second = impossible_travel(&records, Duration::hours(4));
+    let first = impossible_travel(&records, &UniformTransit::new(Duration::hours(4)));
+    let second = impossible_travel(&records, &UniformTransit::new(Duration::hours(4)));
     assert_eq!(first, second);
     assert_eq!(first.len(), 2, "there and back again");
     assert!(first.iter().all(|i| i.signal.is_arithmetic()));
+}
+
+/// A national numbering plan is hundreds of thousands of ranges and every call
+/// needs one lookup. A linear scan is fine on the toy set a test builds and is
+/// why a run that worked in staging takes a week in production — so the lookup
+/// probes the number's own prefixes rather than walking the ranges.
+#[test]
+fn a_lookup_is_independent_of_how_many_ranges_are_loaded() {
+    let mut ranges: NumberRangeSet<u32> = NumberRangeSet::new();
+    // 100 000 ranges, none of which matches the number under test.
+    for block in 0..100_000u32 {
+        let prefix = format!("1{block:06}");
+        ranges.insert(prefix.parse().unwrap(), block);
+    }
+    ranges.insert("49151".parse().unwrap(), 1);
+    ranges.insert("4915123".parse().unwrap(), 2);
+
+    let number: Msisdn = "491512345678".parse().unwrap();
+    let (range, value) = ranges.longest_match(number).unwrap();
+
+    assert_eq!(range.to_string(), "4915123", "longest prefix wins");
+    assert_eq!(*value, 2);
+    assert_eq!(ranges.len(), 100_002);
+}
+
+/// A duplicated range in reference data means two answers to one question, and
+/// which one wins is otherwise an accident of load order.
+#[test]
+fn a_duplicated_range_keeps_both_values_and_is_reported() {
+    let mut ranges: NumberRangeSet<&str> = NumberRangeSet::new();
+    ranges.insert("49151".parse().unwrap(), "first");
+    ranges.insert("49151".parse().unwrap(), "second");
+    ranges.insert("49152".parse().unwrap(), "only");
+
+    let number: Msisdn = "491511234567".parse().unwrap();
+    assert_eq!(*ranges.longest_match(number).unwrap().1, "first");
+    assert_eq!(
+        ranges.longest_match_all(number).unwrap().1,
+        ["first", "second"]
+    );
+
+    assert_eq!(
+        ranges
+            .duplicates()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["49151"]
+    );
+    assert_eq!(ranges.ranges(), 2);
+    assert_eq!(ranges.len(), 3);
+}
+
+/// A range at least as long as the number does not contain it: `49151` is not a
+/// block that `4915` belongs to.
+#[test]
+fn a_range_longer_than_the_number_does_not_match() {
+    let mut ranges: NumberRangeSet<&str> = NumberRangeSet::new();
+    ranges.insert("49151".parse().unwrap(), "mobile");
+
+    assert!(ranges.longest_match("4915".parse().unwrap()).is_none());
+    assert!(ranges.longest_match("49151".parse().unwrap()).is_some());
+}
+
+/// An unmodelled country pair is not evidence of anything. A fraud signal
+/// raised out of ignorance costs an analyst the same time as a real one and
+/// teaches them to discount the next.
+#[test]
+fn an_unknown_country_pair_never_fires() {
+    let records = vec![
+        record(
+            RecordType::MobileOriginatedCall,
+            "2026-07-28T10:00:00+02:00",
+            "262-02",
+        ),
+        record(
+            RecordType::MobileOriginatedCall,
+            "2026-07-28T10:20:00+02:00",
+            "310-260",
+        ),
+    ];
+
+    // A resolver that models nothing.
+    let silent = |_: Mcc, _: Mcc| None;
+    assert!(impossible_travel(&records, &silent).is_empty());
+
+    // One that models this pair generously does not fire either.
+    let generous = |_: Mcc, _: Mcc| Some(Duration::minutes(10));
+    assert!(impossible_travel(&records, &generous).is_empty());
+
+    // And one that knows the journey is long does.
+    let realistic = |from: Mcc, to: Mcc| {
+        if from.is_north_american() || to.is_north_american() {
+            Some(Duration::hours(8))
+        } else {
+            Some(Duration::hours(1))
+        }
+    };
+    assert_eq!(impossible_travel(&records, &realistic).len(), 1);
 }

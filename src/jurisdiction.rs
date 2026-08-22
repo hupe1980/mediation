@@ -75,6 +75,19 @@ pub enum Ambiguity {
     /// not answer this question — so a caller who has an independent position
     /// fix can still resolve it. Nothing else can.
     ExtraTerritorialAccess,
+    /// The serving network's country code names no country.
+    ///
+    /// ITU-T E.212 sets aside codes for test networks, trial networks, internal
+    /// use, and the shared codes international operators use — see
+    /// [`Mcc::is_geographic`]. They are well-formed and they answer no question
+    /// about where the subscriber was, which is a different problem from a
+    /// missing field and has a different remedy: the record needs a position
+    /// from somewhere else, or it is a test record that should never have
+    /// entered the feed.
+    NonGeographicNetwork {
+        /// The code the record carried.
+        mcc: Mcc,
+    },
     /// Two sources in the record name different countries.
     ///
     /// A fault, not a tie to break: the serving network and the reported cell
@@ -96,6 +109,7 @@ impl Ambiguity {
         match self {
             Self::NoEvidence => "NO_EVIDENCE",
             Self::ExtraTerritorialAccess => "EXTRA_TERRITORIAL_ACCESS",
+            Self::NonGeographicNetwork { .. } => "NON_GEOGRAPHIC_NETWORK",
             Self::Conflicting { .. } => "CONFLICTING",
         }
     }
@@ -115,6 +129,9 @@ impl fmt::Display for Ambiguity {
         match self {
             Self::Conflicting { serving, reported } => {
                 write!(f, "CONFLICTING (serving {serving}, reported {reported})")
+            }
+            Self::NonGeographicNetwork { mcc } => {
+                write!(f, "NON_GEOGRAPHIC_NETWORK ({mcc})")
             }
             other => f.write_str(other.as_str()),
         }
@@ -217,13 +234,18 @@ pub fn usage_country(record: &UsageRecord) -> Jurisdiction {
     let serving = record.serving_plmn.map(|plmn| plmn.mcc());
     let reported = record.session.serving_country();
 
-    match (serving, reported) {
+    let country = match (serving, reported) {
         (Some(serving), Some(reported)) if serving != reported => {
-            Jurisdiction::Unresolved(Ambiguity::Conflicting { serving, reported })
+            return Jurisdiction::Unresolved(Ambiguity::Conflicting { serving, reported });
         }
-        (Some(country), _) | (None, Some(country)) => Jurisdiction::Country(country),
-        (None, None) => Jurisdiction::Unresolved(Ambiguity::NoEvidence),
+        (Some(country), _) | (None, Some(country)) => country,
+        (None, None) => return Jurisdiction::Unresolved(Ambiguity::NoEvidence),
+    };
+    // A well-formed code that names no territory is not an answer to "where".
+    if !country.is_geographic() {
+        return Jurisdiction::Unresolved(Ambiguity::NonGeographicNetwork { mcc: country });
     }
+    Jurisdiction::Country(country)
 }
 
 // ── Where the customer is ────────────────────────────────────────────────────
@@ -248,15 +270,42 @@ pub fn usage_country(record: &UsageRecord) -> Jurisdiction {
 /// IMSI-form identity yields [`Ambiguity::NoEvidence`]: there is no presumption
 /// to make, and falling back to the serving network would answer the *other*
 /// question.
+///
+/// A SIM whose MCC names no territory — a test range, a shared international
+/// code; see [`Mcc::is_geographic`] — yields
+/// [`Ambiguity::NonGeographicNetwork`], for the same reason
+/// [`usage_country`] does. The presumption is that the customer is *in* the
+/// country of the MCC, and `001` is not a country anyone can be taxed in.
+///
+/// ```rust
+/// use mediation::{Ambiguity, Jurisdiction, customer_country_presumption};
+/// # use mediation::{ChargedParty, RecordType, SourceRef, SubscriberRef, UsageRecord};
+/// # let test_sim = UsageRecord::new(
+/// #     RecordType::PduSession,
+/// #     ChargedParty::Subscriber(SubscriberRef::new("imsi-001010000000001".parse().unwrap())),
+/// #     "2026-07-28T10:00:00+02:00".parse().unwrap(),
+/// #     SourceRef::new("pgw-01".parse().unwrap(), 0),
+/// # );
+/// // A test IMSI has no tax country, and saying "001" would invent one.
+/// assert!(matches!(
+///     customer_country_presumption(&test_sim),
+///     Jurisdiction::Unresolved(Ambiguity::NonGeographicNetwork { .. }),
+/// ));
+/// ```
 #[must_use]
 pub fn customer_country_presumption(record: &UsageRecord) -> Jurisdiction {
-    record
+    let Some(imsi) = record
         .party
         .subscriber()
         .and_then(|subscriber| subscriber.supi.as_imsi())
-        .map_or(Jurisdiction::Unresolved(Ambiguity::NoEvidence), |imsi| {
-            Jurisdiction::Country(imsi.mcc())
-        })
+    else {
+        return Jurisdiction::Unresolved(Ambiguity::NoEvidence);
+    };
+    let mcc = imsi.mcc();
+    if !mcc.is_geographic() {
+        return Jurisdiction::Unresolved(Ambiguity::NonGeographicNetwork { mcc });
+    }
+    Jurisdiction::Country(mcc)
 }
 
 // ── The two together ─────────────────────────────────────────────────────────
@@ -295,6 +344,8 @@ mod serde_impl {
         NoEvidence,
         #[serde(rename = "EXTRA_TERRITORIAL_ACCESS")]
         ExtraTerritorialAccess,
+        #[serde(rename = "NON_GEOGRAPHIC_NETWORK")]
+        NonGeographicNetwork { mcc: Mcc },
         #[serde(rename = "CONFLICTING")]
         Conflicting { serving: Mcc, reported: Mcc },
     }
@@ -304,6 +355,9 @@ mod serde_impl {
             match *self {
                 Ambiguity::NoEvidence => AmbiguityRepr::NoEvidence,
                 Ambiguity::ExtraTerritorialAccess => AmbiguityRepr::ExtraTerritorialAccess,
+                Ambiguity::NonGeographicNetwork { mcc } => {
+                    AmbiguityRepr::NonGeographicNetwork { mcc }
+                }
                 Ambiguity::Conflicting { serving, reported } => {
                     AmbiguityRepr::Conflicting { serving, reported }
                 }
@@ -317,6 +371,9 @@ mod serde_impl {
             Ok(match AmbiguityRepr::deserialize(deserializer)? {
                 AmbiguityRepr::NoEvidence => Ambiguity::NoEvidence,
                 AmbiguityRepr::ExtraTerritorialAccess => Ambiguity::ExtraTerritorialAccess,
+                AmbiguityRepr::NonGeographicNetwork { mcc } => {
+                    Ambiguity::NonGeographicNetwork { mcc }
+                }
                 AmbiguityRepr::Conflicting { serving, reported } => {
                     Ambiguity::Conflicting { serving, reported }
                 }

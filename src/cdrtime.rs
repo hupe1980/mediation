@@ -298,6 +298,59 @@ impl fmt::Display for QuarterHourOffset {
 const OFFSET_FORMAT: &str =
     "a UTC offset in 15-minute steps such as +02:00, +0545, -03:30 or Z (UTC-12:00 to UTC+14:00)";
 
+/// Two ASCII digits read as a number, or `None` if either is not a digit.
+///
+/// Every date and time field this module parses is a fixed pair of ASCII
+/// digits, so parsing is done over **bytes**. Slicing the `&str` at those
+/// offsets instead would panic the moment a caller handed over a value with a
+/// multi-byte character straddling one — and a decoder that panics on a
+/// malformed field is worse than one that rejects it.
+const fn two_digits(bytes: &[u8], at: usize) -> Option<u8> {
+    if at + 1 >= bytes.len() {
+        return None;
+    }
+    let (tens, units) = (bytes[at], bytes[at + 1]);
+    if !tens.is_ascii_digit() || !units.is_ascii_digit() {
+        return None;
+    }
+    Some((tens - b'0') * 10 + (units - b'0'))
+}
+
+/// Four ASCII digits read as a year, or `None` if any is not a digit.
+const fn four_digits(bytes: &[u8], at: usize) -> Option<i32> {
+    match (two_digits(bytes, at), two_digits(bytes, at + 2)) {
+        (Some(high), Some(low)) => Some(high as i32 * 100 + low as i32),
+        _ => None,
+    }
+}
+
+/// Parse `±HH:MM`, `±HHMM`, `±HH` or `Z` from ASCII bytes.
+///
+/// Shared by [`QuarterHourOffset`] and [`CdrTimestamp`], so the two cannot
+/// drift apart on which spellings they accept.
+fn offset_from_ascii(bytes: &[u8]) -> Option<QuarterHourOffset> {
+    if bytes.len() == 1 && bytes[0].eq_ignore_ascii_case(&b'z') {
+        return Some(QuarterHourOffset::UTC);
+    }
+    let sign: i16 = match bytes.first() {
+        Some(b'+') => 1,
+        Some(b'-') => -1,
+        _ => return None,
+    };
+    let hours = two_digits(bytes, 1)?;
+    let minutes = match bytes.len() {
+        3 => 0,
+        5 => two_digits(bytes, 3)?,
+        6 if bytes[3] == b':' => two_digits(bytes, 4)?,
+        _ => return None,
+    };
+    if minutes > 59 {
+        return None;
+    }
+    let total = sign * (i16::from(hours) * 60 + i16::from(minutes));
+    QuarterHourOffset::from_minutes(total)
+}
+
 impl FromStr for QuarterHourOffset {
     type Err = ParseError;
 
@@ -306,30 +359,8 @@ impl FromStr for QuarterHourOffset {
     /// Lenient on the way in, canonical on the way out: all four spellings of
     /// UTC+02:00 render as `+02:00`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let err = || ParseError::format("QuarterHourOffset", s, OFFSET_FORMAT);
-        let t = s.trim();
-        if t.eq_ignore_ascii_case("z") {
-            return Ok(Self::UTC);
-        }
-        let (sign, rest) = match t.as_bytes().first() {
-            Some(b'+') => (1i16, &t[1..]),
-            Some(b'-') => (-1i16, &t[1..]),
-            _ => return Err(err()),
-        };
-        let digits: &str = rest;
-        let (hh, mm) = match digits.len() {
-            2 => (digits, "00"),
-            4 => digits.split_at(2),
-            5 if digits.as_bytes()[2] == b':' => (&digits[..2], &digits[3..]),
-            _ => return Err(err()),
-        };
-        let hours: i16 = hh.parse().map_err(|_| err())?;
-        let minutes: i16 = mm.parse().map_err(|_| err())?;
-        if minutes > 59 {
-            return Err(err());
-        }
-        let total = sign * (hours.checked_mul(60).ok_or_else(err)? + minutes);
-        Self::from_minutes(total).ok_or_else(err)
+        offset_from_ascii(s.trim().as_bytes())
+            .ok_or_else(|| ParseError::format("QuarterHourOffset", s, OFFSET_FORMAT))
     }
 }
 
@@ -691,6 +722,18 @@ impl Century {
     pub const fn year(self, two_digit: u8) -> i32 {
         self.0 + two_digit as i32
     }
+
+    /// The century's first year.
+    #[must_use]
+    pub const fn first_year(self) -> i32 {
+        self.0
+    }
+
+    /// `true` when `year` falls in this century.
+    #[must_use]
+    pub const fn contains(self, year: i32) -> bool {
+        year >= self.0 && year <= self.0 + 99
+    }
 }
 
 impl CdrTimestamp {
@@ -715,7 +758,7 @@ impl CdrTimestamp {
     /// let ts = CdrTimestamp::from_bcd(&octets, Century::TWENTY_FIRST).unwrap();
     ///
     /// assert_eq!(ts.to_string(), "2026-07-28T10:00:00+02:00");
-    /// assert_eq!(ts.to_bcd().unwrap(), octets);
+    /// assert_eq!(ts.to_bcd(Century::TWENTY_FIRST).unwrap(), octets);
     /// ```
     ///
     /// # Errors
@@ -758,17 +801,32 @@ impl CdrTimestamp {
 
     /// Encode to the nine-octet `TimeStamp` of 3GPP TS 32.298.
     ///
+    /// The century is a **parameter**, and the year must fall inside it. The
+    /// field carries `YY`, so an encoder that simply wrote `year % 100` would
+    /// turn 1999 and 2099 into the same nine octets and hand the reader no way
+    /// to tell them apart. Naming the century here is the same refusal
+    /// [`from_bcd`](Self::from_bcd) makes on the way in, from the other side:
+    /// the ambiguity is in the encoding, so it is resolved where the encoding
+    /// is, not silently downstream.
+    ///
+    /// ```rust
+    /// use mediation::{CdrTimestamp, Century};
+    ///
+    /// let ts: CdrTimestamp = "2026-07-28T10:00:00+02:00".parse().unwrap();
+    /// assert!(ts.to_bcd(Century::TWENTY_FIRST).is_ok());
+    ///
+    /// // The same value cannot be written as a 20th-century record.
+    /// assert!(ts.to_bcd(Century::new(1900).unwrap()).is_err());
+    /// ```
+    ///
     /// # Errors
     ///
-    /// [`DecodeError`] when the year falls outside the two digits the encoding
-    /// carries. Refusing is deliberate: writing `YY` for a year the reader will
-    /// resolve into a different century is how a record moves a hundred years
-    /// without anything reporting an error.
-    pub fn to_bcd(self) -> Result<[u8; Self::BCD_OCTETS], DecodeError> {
+    /// [`DecodeError`] when the year does not fall in `century`.
+    pub fn to_bcd(self, century: Century) -> Result<[u8; Self::BCD_OCTETS], DecodeError> {
         let date = self.local.date();
         let year = date.year();
-        if !(0..=9999).contains(&year) {
-            return Err(DecodeError::new(0, "a year the two-digit field can carry"));
+        if !century.contains(year) {
+            return Err(DecodeError::new(0, "a year inside the stated century"));
         }
         let time = self.local.time();
         let minutes = self.offset.total_minutes();
@@ -786,6 +844,106 @@ impl CdrTimestamp {
             bcd((magnitude / 60) as u8),
             bcd((magnitude % 60) as u8),
         ])
+    }
+}
+
+impl CdrTimestamp {
+    /// The width of a TAP3 `LocalTimeStamp`, in characters.
+    pub const TAP_LOCAL_CHARS: usize = 14;
+
+    /// The width of a TAP3 `UtcTimeOffset`, in characters.
+    pub const TAP_OFFSET_CHARS: usize = 5;
+
+    /// Read the two fields a GSMA TD.57 timestamp is split across.
+    ///
+    /// TAP3 carries local time and its offset as **two separate fields** —
+    /// `LocalTimeStamp`, fourteen digits of `YYYYMMDDhhmmss`, and
+    /// `UtcTimeOffset`, five characters of `±hhmm` — usually with a
+    /// `UtcTimeOffsetCode` indirection so a whole file's offsets are declared
+    /// once and referenced by number.
+    ///
+    /// That indirection is where the bug lives. A decoder that reads the local
+    /// timestamp and forgets to resolve the offset code produces a value that
+    /// looks complete, parses cleanly, and is wrong by up to fourteen hours for
+    /// every event in the file. Requiring both fields here means the offset
+    /// cannot be forgotten: there is no constructor that takes the local half
+    /// alone.
+    ///
+    /// ```rust
+    /// use mediation::CdrTimestamp;
+    ///
+    /// let ts = CdrTimestamp::from_tap("20260728103045", "+0545").unwrap();
+    /// assert_eq!(ts.to_string(), "2026-07-28T10:30:45+05:45");
+    /// assert_eq!(ts.to_tap(), ("20260728103045".to_owned(), "+0545".to_owned()));
+    /// ```
+    ///
+    /// Note the four-digit year: unlike the 3GPP BCD encoding, TAP carries the
+    /// century, so no [`Century`] is needed and none is accepted.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] for the wrong field widths, a non-digit, an impossible
+    /// date or time, or an offset that is not a multiple of 15 minutes.
+    pub fn from_tap(local: &str, offset: &str) -> Result<Self, DecodeError> {
+        let local = local.trim().as_bytes();
+        if local.len() != Self::TAP_LOCAL_CHARS {
+            return Err(DecodeError::new(0, "exactly 14 digits of YYYYMMDDhhmmss"));
+        }
+        let year = four_digits(local, 0).ok_or_else(|| DecodeError::new(0, "a four-digit year"))?;
+        let field = |at: usize, what: &'static str| {
+            two_digits(local, at).ok_or_else(|| DecodeError::new(at, what))
+        };
+        let month = field(4, "a two-digit month")?;
+        let day = field(6, "a two-digit day")?;
+        let hour = field(8, "a two-digit hour")?;
+        let minute = field(10, "a two-digit minute")?;
+        let second = field(12, "a two-digit second")?;
+
+        let month = Month::try_from(month).map_err(|_| DecodeError::new(4, "a month in 1..=12"))?;
+        let date = Date::from_calendar_date(year, month, day)
+            .map_err(|_| DecodeError::new(0, "a date that exists"))?;
+        let time = Time::from_hms(hour, minute, second)
+            .map_err(|_| DecodeError::new(8, "a time that exists"))?;
+
+        let offset = offset.trim();
+        if offset.len() != Self::TAP_OFFSET_CHARS {
+            return Err(DecodeError::new(
+                0,
+                "exactly 5 characters of +hhmm or -hhmm",
+            ));
+        }
+        let offset = offset_from_ascii(offset.as_bytes())
+            .ok_or_else(|| DecodeError::new(0, "an assigned offset in 15-minute steps"))?;
+
+        Ok(Self::new(PrimitiveDateTime::new(date, time), offset))
+    }
+
+    /// Write the two fields a GSMA TD.57 timestamp is split across.
+    ///
+    /// Returns `(LocalTimeStamp, UtcTimeOffset)`. The offset is the literal
+    /// five-character form rather than a code, because the code table belongs
+    /// to the file rather than to the timestamp.
+    #[must_use]
+    pub fn to_tap(self) -> (String, String) {
+        let (d, t) = (self.local.date(), self.local.time());
+        let local = format!(
+            "{:04}{:02}{:02}{:02}{:02}{:02}",
+            d.year(),
+            u8::from(d.month()),
+            d.day(),
+            t.hour(),
+            t.minute(),
+            t.second()
+        );
+        let minutes = self.offset.total_minutes();
+        let magnitude = minutes.unsigned_abs();
+        let offset = format!(
+            "{}{:02}{:02}",
+            if minutes < 0 { '-' } else { '+' },
+            magnitude / 60,
+            magnitude % 60
+        );
+        (local, offset)
     }
 }
 
@@ -824,40 +982,31 @@ impl FromStr for CdrTimestamp {
     /// every spelling [`QuarterHourOffset`] does.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let err = || ParseError::format("CdrTimestamp", s, TIMESTAMP_FORMAT);
-        let t = s.trim();
-        if t.len() < 20 {
-            return Err(err());
-        }
-        let bytes = t.as_bytes();
-        if !matches!(bytes[10], b'T' | b't' | b' ') {
-            return Err(err());
-        }
-        let (date_part, rest) = t.split_at(10);
-        let rest = &rest[1..];
-        // The time is `hh:mm:ss`; everything after it is the offset.
-        if rest.len() < 8 {
-            return Err(err());
-        }
-        let (time_part, offset_part) = rest.split_at(8);
-
-        let year: i32 = date_part[..4].parse().map_err(|_| err())?;
-        let month: u8 = date_part[5..7].parse().map_err(|_| err())?;
-        let day: u8 = date_part[8..10].parse().map_err(|_| err())?;
-        if date_part.as_bytes()[4] != b'-' || date_part.as_bytes()[7] != b'-' {
+        // Parsed over bytes at fixed offsets. The shape is entirely ASCII, and
+        // indexing a `&str` at those offsets would panic on a multi-byte
+        // character that happened to straddle one.
+        let bytes = s.trim().as_bytes();
+        if bytes.len() < 20
+            || bytes[4] != b'-'
+            || bytes[7] != b'-'
+            || !matches!(bytes[10], b'T' | b't' | b' ')
+            || bytes[13] != b':'
+            || bytes[16] != b':'
+        {
             return Err(err());
         }
 
-        let hour: u8 = time_part[..2].parse().map_err(|_| err())?;
-        let minute: u8 = time_part[3..5].parse().map_err(|_| err())?;
-        let second: u8 = time_part[6..8].parse().map_err(|_| err())?;
-        if time_part.as_bytes()[2] != b':' || time_part.as_bytes()[5] != b':' {
-            return Err(err());
-        }
+        let year = four_digits(bytes, 0).ok_or_else(err)?;
+        let month = two_digits(bytes, 5).ok_or_else(err)?;
+        let day = two_digits(bytes, 8).ok_or_else(err)?;
+        let hour = two_digits(bytes, 11).ok_or_else(err)?;
+        let minute = two_digits(bytes, 14).ok_or_else(err)?;
+        let second = two_digits(bytes, 17).ok_or_else(err)?;
 
         let month = Month::try_from(month).map_err(|_| err())?;
         let date = Date::from_calendar_date(year, month, day).map_err(|_| err())?;
         let time = Time::from_hms(hour, minute, second).map_err(|_| err())?;
-        let offset: QuarterHourOffset = offset_part.parse().map_err(|_| err())?;
+        let offset = offset_from_ascii(&bytes[19..]).ok_or_else(err)?;
         Ok(Self::new(PrimitiveDateTime::new(date, time), offset))
     }
 }
@@ -1336,7 +1485,7 @@ mod tests {
         let octets = [0x26, 0x07, 0x28, 0x10, 0x00, 0x00, b'+', 0x02, 0x00];
         let ts = CdrTimestamp::from_bcd(&octets, Century::TWENTY_FIRST).unwrap();
         assert_eq!(ts.to_string(), "2026-07-28T10:00:00+02:00");
-        assert_eq!(ts.to_bcd().unwrap(), octets);
+        assert_eq!(ts.to_bcd(Century::TWENTY_FIRST).unwrap(), octets);
     }
 
     /// A negative offset uses the ASCII `-`, and quarter-hour zones survive.
@@ -1349,7 +1498,7 @@ mod tests {
         let newfoundland = [0x26, 0x07, 0x28, 0x09, 0x30, 0x00, b'-', 0x03, 0x30];
         let ts = CdrTimestamp::from_bcd(&newfoundland, Century::TWENTY_FIRST).unwrap();
         assert_eq!(ts.offset().to_string(), "-03:30");
-        assert_eq!(ts.to_bcd().unwrap(), newfoundland);
+        assert_eq!(ts.to_bcd(Century::TWENTY_FIRST).unwrap(), newfoundland);
     }
 
     /// There is no correct default century, so the decoder takes one.

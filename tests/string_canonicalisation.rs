@@ -14,9 +14,9 @@
 //! - **injectivity** — distinct values never share a string
 
 use mediation::{
-    ByteScale, CdrTimestamp, DstAdjustment, Iccid, Imei, Imeisv, Imsi, Mcc, Mnc, MsTimeZone,
-    Msisdn, NodeId, Octets, PartyId, PlmnId, QuarterHourOffset, RecordType, Seconds, ServiceDomain,
-    TadigCode, UnattributableReason, VolumePair,
+    ByteScale, CdrTimestamp, DigitString, DstAdjustment, Iccid, Imei, Imeisv, Imsi, Mcc, Mnc,
+    MsTimeZone, Msisdn, NodeId, Octets, PartyId, PlmnId, QuarterHourOffset, RecordType, Seconds,
+    ServiceDomain, TadigCode, UnattributableReason, VolumePair,
 };
 use proptest::prelude::*;
 use std::collections::HashSet;
@@ -290,4 +290,100 @@ fn every_accepted_spelling_maps_onto_one_canonical_form() {
     for raw in ["data", "DATA", " Data "] {
         assert_eq!(raw.parse::<ServiceDomain>().unwrap().to_string(), "DATA");
     }
+}
+
+// ── Ordering ─────────────────────────────────────────────────────────────────
+
+/// Digits are packed two per byte with the *earlier* digit in the low nibble,
+/// so a derived `Ord` compares the second digit before the first: `"19"` sorts
+/// after `"21"`. Every prefix table, sorted report and `BTreeMap` keyed on an
+/// identifier would then be in an order no reader could predict.
+#[test]
+fn digit_runs_sort_the_way_their_strings_do() {
+    let mut runs: Vec<DigitString> = ["21", "19", "123", "12", "9", "1", "100", "0", "00"]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    runs.sort();
+
+    let rendered: Vec<String> = runs.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        rendered,
+        ["0", "00", "1", "100", "12", "123", "19", "21", "9"]
+    );
+
+    // The same order a `str` comparison gives, over every pair.
+    for a in &runs {
+        for b in &runs {
+            assert_eq!(
+                Ord::cmp(a, b),
+                a.to_string().cmp(&b.to_string()),
+                "{a} vs {b}"
+            );
+        }
+    }
+}
+
+/// The identifiers built on `DigitString` inherit the ordering, so a sorted
+/// subscriber report reads the way a human expects.
+#[test]
+fn identifiers_sort_by_their_digits() {
+    let mut numbers: Vec<Msisdn> = ["4919", "4921", "49123"]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    numbers.sort();
+    assert_eq!(
+        numbers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        ["49123", "4919", "4921"]
+    );
+}
+
+/// A prefix is not a shorter number that happens to compare small; the test a
+/// longest-prefix lookup actually needs.
+#[test]
+fn a_prefix_test_is_not_an_ordering_test() {
+    let number: DigitString = "49151234".parse().unwrap();
+    assert!(number.starts_with("49151".parse().unwrap()));
+    assert!(!number.starts_with("49152".parse().unwrap()));
+    // A prefix longer than the run is not a prefix of it.
+    assert!(!number.starts_with("491512345".parse().unwrap()));
+    assert_eq!(number.prefix(5).to_string(), "49151");
+    assert_eq!(number.prefix(99), DigitString::EMPTY);
+}
+
+/// IEC 80000-13 gives `B` to the byte and `b` to the bit, so `kb` is a kilobit.
+/// Accepting it as a kilobyte is a factor-of-eight error in exactly the
+/// direction this crate exists to prevent — a silent unit confusion producing a
+/// plausible number.
+#[test]
+fn a_bit_spelling_is_refused_rather_than_helpfully_coerced() {
+    for bits in ["b", "kb", "mb", "gb", "tb", "Kb", "Mb"] {
+        assert!(
+            bits.parse::<ByteScale>().is_err(),
+            "{bits:?} is a bit, not a byte"
+        );
+    }
+
+    // The byte spellings still parse, including the ubiquitous capital `KB`.
+    for (text, expected) in [
+        ("B", ByteScale::Byte),
+        ("bytes", ByteScale::Byte),
+        ("kB", ByteScale::Kilo),
+        ("KB", ByteScale::Kilo),
+        ("MB", ByteScale::Mega),
+    ] {
+        assert_eq!(text.parse::<ByteScale>().unwrap(), expected);
+    }
+
+    // The binary prefixes carry an `i`, which disambiguates them on its own.
+    for text in ["KiB", "kib", "KIB", "MiB", "GiB", "TiB"] {
+        assert!(text.parse::<ByteScale>().unwrap().is_binary(), "{text}");
+    }
+
+    // And the two kilobytes are still a factor of 1.024 apart, not the same.
+    assert_ne!(
+        Octets::from_scaled(5, ByteScale::Kilo),
+        Octets::from_scaled(5, ByteScale::Kibi)
+    );
 }

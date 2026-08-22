@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img"
+     aria-label="mediation — telecom usage mediation for Rust">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="1" stop-color="#132033"/>
+    </linearGradient>
+    <linearGradient id="rule" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5eead4"/>
+      <stop offset="1" stop-color="#f472b6"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect y="0" width="1200" height="6" fill="url(#rule)"/>
+
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+    <text x="80" y="130" fill="#5eead4" font-size="26" letter-spacing="4">RUST · ZERO I/O · NO CLOCK</text>
+  </g>
+
+  <g font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
+    <text x="80" y="238" fill="#e6ecf5" font-size="82" font-weight="700" letter-spacing="-2">mediation</text>
+    <text x="80" y="312" fill="#a7b2c4" font-size="36" font-weight="400">Telecom usage mediation, as a domain library.</text>
+
+    <text x="80" y="392" fill="#8794a8" font-size="27">Normalise · validate · deduplicate · correlate —</text>
+    <text x="80" y="432" fill="#8794a8" font-size="27">and prove no record was lost.</text>
+  </g>
+
+  <g transform="translate(80 486)">
+    <rect width="1040" height="72" rx="12" fill="#0f2b28" stroke="#1d4b45"/>
+    <text x="28" y="46" fill="#5eead4" font-size="24"
+          font-family="ui-monospace, SFMono-Regular, Menlo, monospace">carried_in + ingested == billable + suppressed + duplicate + rejected + held</text>
+  </g>
+</svg>

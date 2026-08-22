@@ -13,11 +13,11 @@
 //! directions.
 
 use mediation::{
-    BatchDiscrepancy, BatchReconciliation, ChargedParty, ChargingId, CorrelationKeys,
-    DedupDecision, DedupStore, DedupWindow, Disposition, Octets, PeriodLedger, RapReturn,
-    RecordKey, RecordType, ScaledAmount, SequenceSpace, SequenceTracker, SequenceValue, SourceRef,
-    SubscriberRef, TapBatch, UsageRecord, ValidationConfig, VolumePair, aggregate_released,
-    score_batch, validate_records,
+    BatchDiscrepancy, BatchReconciliation, BatchTotals, CdrTimestamp, ChargedParty, ChargingId,
+    CorrelationKeys, DedupDecision, DedupStore, DedupWindow, Disposition, Octets, PeriodLedger,
+    RapReturn, RecordKey, RecordType, ScaledAmount, SequenceSpace, SequenceTracker, SequenceValue,
+    SourceRef, SubscriberRef, TapBatch, TotalKind, UsageRecord, ValidationConfig, VolumePair,
+    aggregate_released, score_batch, validate_records,
 };
 use std::net::Ipv4Addr;
 use time::{Duration, OffsetDateTime, macros::datetime};
@@ -56,6 +56,8 @@ fn batch(declared_events: u64, declared_charge: ScaledAmount) -> TapBatch {
         earliest_event: Some("2026-07-25T10:00:00+02:00".parse().unwrap()),
         latest_event: Some("2026-07-25T12:00:00+02:00".parse().unwrap()),
         declared_charge,
+        declared_discount: None,
+        declared_tax: None,
     }
 }
 
@@ -106,7 +108,7 @@ fn a_clean_roaming_batch_reconciles_end_to_end() {
     let charge = ScaledAmount::new(12_500, 3);
     assert!(
         batch(5, charge)
-            .audit(released.total().records(), charge)
+            .audit(BatchTotals::new(released.total().records(), charge))
             .is_empty()
     );
 
@@ -130,7 +132,7 @@ fn a_batch_that_miscounts_itself_is_rejected_with_every_reason() {
 
     let declared = ScaledAmount::new(99_999, 3);
     let actual = ScaledAmount::new(12_500, 3);
-    let found = batch(9, declared).audit(released.total().records(), actual);
+    let found = batch(9, declared).audit(BatchTotals::new(released.total().records(), actual));
 
     assert_eq!(found.len(), 2);
     assert!(found.contains(&BatchDiscrepancy::EventCountMismatch {
@@ -160,7 +162,11 @@ fn a_partner_resend_inside_one_file_is_suppressed_without_breaking_the_audit() {
 
     // The file declared four events, and four arrived.
     let charge = ScaledAmount::zero(3);
-    assert!(batch(4, charge).audit(4, charge).is_empty());
+    assert!(
+        batch(4, charge)
+            .audit(BatchTotals::new(4, charge))
+            .is_empty()
+    );
     // …while only three were billed, which is a different number by design.
     assert_eq!(released.total().records(), 3);
 }
@@ -181,7 +187,7 @@ fn an_event_past_the_inclusion_window_is_caught_at_both_levels() {
     let mut aged = batch(1, ScaledAmount::zero(3));
     aged.earliest_event = Some("2026-01-01T10:00:00+02:00".parse().unwrap());
     assert!(
-        aged.audit(1, ScaledAmount::zero(3))
+        aged.audit(BatchTotals::new(1, ScaledAmount::zero(3)))
             .iter()
             .any(|d| matches!(d, BatchDiscrepancy::EventBeyondInclusionWindow { .. }))
     );
@@ -299,4 +305,158 @@ fn a_credit_nets_against_a_charge() {
     assert_eq!(credit.to_string(), "-1.234");
     assert_eq!(charge.checked_add(credit).unwrap(), ScaledAmount::zero(3));
     assert!(charge.checked_add(credit).unwrap().is_zero());
+}
+
+/// A severe return moves the returned events out of `billable` and touches
+/// nothing else. Rebuilding the reconciliation record by record used to drop
+/// the carry and turn every duplicate into a suppression — an unbalanced period
+/// and a wrong revenue-assurance report, from a partner's routine rejection.
+#[test]
+fn a_severe_return_moves_only_the_returned_events() {
+    let mut batch = BatchReconciliation::EMPTY;
+    batch.observe_carried(&Disposition::Billable);
+    batch.observe(&Disposition::Billable);
+    batch.observe(&Disposition::Billable);
+    batch.observe(&Disposition::Duplicate(RecordKey::RecordingEntity {
+        entity: "msc-01".parse().unwrap(),
+        local_sequence: 1,
+    }));
+    batch.observe(&Disposition::Held(mediation::HoldReason::AwaitingPartial));
+
+    let after = RapReturn::Severe { returned_events: 1 }
+        .effect_on(batch)
+        .unwrap();
+
+    assert_eq!(after.carried_in(), 1, "the carry survives");
+    assert_eq!(after.ingested(), batch.ingested());
+    assert_eq!(after.released(), 2);
+    assert_eq!(after.rejected(), 1);
+    assert_eq!(after.duplicate(), 1, "a duplicate is not a suppression");
+    assert_eq!(after.held(), 1);
+    assert!(after.balances());
+
+    // More back than went out is a disagreement with the partner, not
+    // arithmetic to absorb.
+    assert!(
+        RapReturn::Severe {
+            returned_events: 99
+        }
+        .effect_on(batch)
+        .is_none()
+    );
+}
+
+/// A fatal return unwinds what the batch ingested. What it *carried in* was a
+/// predecessor's hold and is outstanding again — dropping it would break the
+/// period chain at the boundary nobody audits.
+#[test]
+fn a_fatal_return_leaves_the_carry_outstanding() {
+    let mut batch = BatchReconciliation::EMPTY;
+    batch.observe_carried(&Disposition::Billable);
+    batch.observe_carried(&Disposition::Billable);
+    batch.observe(&Disposition::Billable);
+
+    let after = RapReturn::Fatal.effect_on(batch).unwrap();
+
+    assert_eq!(after.ingested(), 0, "nothing this batch ingested counted");
+    assert_eq!(after.carried_in(), 2);
+    assert_eq!(after.held(), 2, "still owed by the period");
+    assert!(after.balances());
+}
+
+/// TD.57's audit block declares three totals, and a discrepancy in each sends
+/// someone to a different place.
+#[test]
+fn each_declared_total_is_checked_and_names_itself() {
+    let charge = ScaledAmount::new(1_000, 3);
+    let mut batch = batch(2, charge);
+    batch.declared_discount = Some(ScaledAmount::new(100, 3));
+    batch.declared_tax = Some(ScaledAmount::new(190, 3));
+
+    // Everything agrees.
+    let agreeing = BatchTotals::new(2, charge)
+        .with_discount(ScaledAmount::new(100, 3))
+        .with_tax(ScaledAmount::new(190, 3));
+    assert!(batch.audit(agreeing).is_empty());
+
+    // The tax is out, and the finding says so rather than saying "totals".
+    let wrong_tax = BatchTotals::new(2, charge)
+        .with_discount(ScaledAmount::new(100, 3))
+        .with_tax(ScaledAmount::new(200, 3));
+    let found = batch.audit(wrong_tax);
+    assert_eq!(found.len(), 1);
+    assert!(matches!(
+        found[0],
+        BatchDiscrepancy::ChargeMismatch {
+            kind: TotalKind::Tax,
+            ..
+        }
+    ));
+    assert!(
+        found[0].to_string().contains("totalTaxValue"),
+        "{}",
+        found[0]
+    );
+}
+
+/// A total the batch did not declare is not a disagreement. Comparing an absent
+/// optional field against zero raises a discrepancy on every well-formed file
+/// from a partner who simply omits it.
+#[test]
+fn an_undeclared_total_is_not_a_discrepancy() {
+    let charge = ScaledAmount::new(1_000, 3);
+    let batch = batch(2, charge); // no discount, no tax declared
+
+    let with_extras = BatchTotals::new(2, charge)
+        .with_discount(ScaledAmount::new(100, 3))
+        .with_tax(ScaledAmount::new(190, 3));
+    assert!(batch.audit(with_extras).is_empty());
+}
+
+/// TAP carries local time and its offset as **two separate fields**, usually
+/// with the offset behind a code table declared once per file. A decoder that
+/// reads the local timestamp and forgets to resolve the code produces a value
+/// that looks complete, parses cleanly, and is wrong by up to fourteen hours
+/// for every event in the file — so there is no constructor that takes the
+/// local half alone.
+#[test]
+fn a_tap_timestamp_needs_both_of_its_fields() {
+    let ts = CdrTimestamp::from_tap("20260728103045", "+0545").unwrap();
+    assert_eq!(ts.to_string(), "2026-07-28T10:30:45+05:45");
+    assert_eq!(
+        ts.to_tap(),
+        ("20260728103045".to_owned(), "+0545".to_owned())
+    );
+
+    // Unlike the 3GPP BCD form, TAP carries the century — so no pivot, and no
+    // hundred-year relocation.
+    let last_century = CdrTimestamp::from_tap("19990101000000", "+0000").unwrap();
+    assert_eq!(last_century.local_date().year(), 1999);
+
+    // Every quarter-hour zone survives both directions.
+    for offset in [
+        "-1200", "-0330", "+0000", "+0530", "+0545", "+0845", "+1400",
+    ] {
+        let ts = CdrTimestamp::from_tap("20260728103045", offset).unwrap();
+        assert_eq!(ts.to_tap().1, offset);
+    }
+}
+
+#[test]
+fn a_malformed_tap_timestamp_is_refused() {
+    for (local, offset) in [
+        ("2026072810304", "+0200"),   // thirteen digits
+        ("202607281030455", "+0200"), // fifteen
+        ("2026072810304X", "+0200"),  // not a digit
+        ("20260230103045", "+0200"),  // 30 February
+        ("20260728253045", "+0200"),  // hour 25
+        ("20260728103045", "+02:00"), // the RFC 3339 spelling is not TAP's
+        ("20260728103045", "+0220"),  // not a multiple of 15 minutes
+        ("20260728103045", "+1500"),  // beyond the assigned range
+    ] {
+        assert!(
+            CdrTimestamp::from_tap(local, offset).is_err(),
+            "{local:?}/{offset:?} must not decode"
+        );
+    }
 }

@@ -111,6 +111,15 @@ pub enum Rule {
     /// **V17** — the record is a retransmission of one already seen.
     DuplicateRecord,
     /// **V18** — a source's sequence has an unfilled hole.
+    ///
+    /// A **warning**, and the one entry in the catalogue whose severity needs
+    /// explaining. The hole itself is enforced elsewhere and harder: every
+    /// record from that source is held
+    /// ([`HoldReason::SequenceGap`](crate::HoldReason::SequenceGap)), because
+    /// its completeness cannot be proved. This finding is the *evidence* — the
+    /// files to ask the partner to resend — and blocking the batch on it as
+    /// well would stop records from every other source, whose completeness is
+    /// not in question. Escalate it if you would rather the whole batch waited.
     SequenceGap,
     /// **V19** — a run of partials cannot be reassembled at all.
     OrphanPartial,
@@ -225,12 +234,12 @@ impl Rule {
             | Self::NotKeyable
             | Self::BeyondDeadline
             | Self::VolumeOverflow
-            | Self::SequenceGap
             | Self::OrphanPartial
             | Self::IncompleteReassembly
             | Self::JurisdictionConflict => Severity::Blocking,
             // Suspicious, but the record may still be right.
-            Self::ImplausibleVolume
+            Self::SequenceGap
+            | Self::ImplausibleVolume
             | Self::ZeroUsage
             | Self::LateArrival
             | Self::ServingNetworkAbsent
@@ -333,9 +342,20 @@ impl Finding {
     /// The finding a [`crate::sequence::SequenceTracker`] hole produces.
     ///
     /// Batch-level: a hole belongs to a source, not to any record that arrived.
+    ///
+    /// `missing` is the bounded list of identities and `missing_count` the
+    /// exact total, so a report says how bad the hole is even where naming
+    /// every file in it would be a four-billion-element allocation.
     #[must_use]
-    pub fn sequence_gap(source: &str, missing: &[u32]) -> Self {
-        Self::batch(Rule::SequenceGap, format!("{source} missing {missing:?}"))
+    pub fn sequence_gap(source: &impl fmt::Display, missing: &[u32], missing_count: u64) -> Self {
+        Self::batch(
+            Rule::SequenceGap,
+            if missing_count > missing.len() as u64 {
+                format!("{source} missing {missing_count}, first {missing:?}")
+            } else {
+                format!("{source} missing {missing:?}")
+            },
+        )
     }
 
     /// The finding a [`Reassembly`] produces, if it produces one.
@@ -357,10 +377,18 @@ impl Finding {
                     }
                 },
             )),
-            Reassembly::Incomplete { missing, .. } if !missing.is_empty() => Some(Self::new(
+            Reassembly::Incomplete {
+                missing,
+                missing_count,
+                ..
+            } if *missing_count > 0 => Some(Self::new(
                 Rule::IncompleteReassembly,
                 record_index,
-                format!("missing partials {missing:?}"),
+                if *missing_count > missing.len() as u64 {
+                    format!("{missing_count} missing partials, first {missing:?}")
+                } else {
+                    format!("missing partials {missing:?}")
+                },
             )),
             _ => None,
         }
@@ -530,6 +558,21 @@ impl ValidationReport {
             .collect()
     }
 
+    /// Re-apply a configuration's escalations to every finding held.
+    ///
+    /// [`validate_records`] does this before returning, but a report also
+    /// gathers the **stateful** rules — a duplicate, a sequence hole, an
+    /// unfinished run — which are found after it returns and would otherwise
+    /// keep their default severity. A caller who escalates
+    /// [`Rule::DuplicateRecord`] means it whichever stage found the duplicate.
+    ///
+    /// Idempotent, and never loosens: a configuration can only raise a rule.
+    pub fn apply(&mut self, config: &ValidationConfig) {
+        for finding in &mut self.findings {
+            finding.severity = config.severity_of(finding.rule);
+        }
+    }
+
     /// `true` when the record at `index` may not be billed.
     #[must_use]
     pub fn record_blocked(&self, index: usize) -> bool {
@@ -583,9 +626,7 @@ pub fn validate_records(
 
     // Apply escalation once, at the end, so every path through the engine is
     // covered rather than each rule remembering to consult the config.
-    for finding in &mut report.findings {
-        finding.severity = config.severity_of(finding.rule);
-    }
+    report.apply(config);
     report
 }
 
@@ -648,7 +689,12 @@ fn validate_one(
     }
 
     // V05 — a volume the elapsed time could not have carried.
-    if let (Some(volume), Some(span)) = (record.volume, record.wall_clock_span())
+    //
+    // `billable_volume`, not the record-level field: a packet-data record
+    // commonly states its volume only in its containers, and checking the
+    // absent total would skip the plausibility ceiling on exactly the records
+    // that carry the most.
+    if let (Some(volume), Some(span)) = (record.billable_volume(), record.wall_clock_span())
         && !span.is_zero()
         && let Some(total) = volume.checked_total()
     {
@@ -1211,10 +1257,18 @@ mod tests {
         assert_eq!(duplicate.rule, Rule::DuplicateRecord);
         assert_eq!(duplicate.record_index, Some(3));
 
-        let gap = Finding::sequence_gap("pgw-01", &[12, 13]);
+        let gap = Finding::sequence_gap(&"pgw-01", &[12, 13], 2);
         assert_eq!(gap.rule, Rule::SequenceGap);
         assert_eq!(gap.record_index, None);
-        assert!(gap.blocks_billing());
+        // A warning, not a block: the records of that source are held, which is
+        // the stronger consequence, and blocking the batch as well would stop
+        // every other source too.
+        assert!(!gap.blocks_billing());
+        assert!(gap.escalated().blocks_billing());
+
+        // The count is exact even where the list is not.
+        let truncated = Finding::sequence_gap(&"pgw-01", &[12, 13], 4_000);
+        assert!(truncated.detail.contains("4000"));
 
         let complete = Reassembly::Complete { count: 3 };
         assert_eq!(Finding::reassembly(0, &complete), None);
@@ -1234,6 +1288,7 @@ mod tests {
         let open = Reassembly::Incomplete {
             have: vec![1, 2],
             missing: vec![],
+            missing_count: 0,
             terminated: false,
         };
         assert_eq!(Finding::reassembly(0, &open), None);
@@ -1241,6 +1296,7 @@ mod tests {
         let holed = Reassembly::Incomplete {
             have: vec![1, 3],
             missing: vec![2],
+            missing_count: 1,
             terminated: true,
         };
         assert!(Finding::reassembly(0, &holed).is_some());

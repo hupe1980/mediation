@@ -59,6 +59,7 @@ use std::fmt;
 use crate::plmn::PlmnId;
 use crate::record::UsageRecord;
 use crate::volume::Octets;
+use std::collections::BTreeSet;
 use time::Date;
 
 // ── Region ───────────────────────────────────────────────────────────────────
@@ -269,16 +270,31 @@ impl FairUseAssessment {
         self.roaming_consumption
     }
 
-    /// How many days the window actually spanned.
+    /// How many days of the window presence was actually **evidenced** for.
+    ///
+    /// Not the window's length. [`assess`] counts the distinct days the
+    /// presence series covers inside the window, because that is what the
+    /// conclusion rests on: a four-month window holding three weeks of
+    /// registration data has observed three weeks, however it was configured.
+    ///
+    /// Filling this with the window's length instead makes
+    /// [`window_sufficient`](Self::window_sufficient) a restatement of the
+    /// caller's own configuration — always true, since
+    /// [`ObservationWindow::new`] already refuses anything shorter — and the
+    /// gate that is supposed to stop a provider concluding from thin data
+    /// stops nothing.
     #[must_use]
     pub const fn observed_days(&self) -> u32 {
         self.observed_days
     }
 
-    /// `true` when the window is long enough to conclude anything.
+    /// `true` when enough of the window was actually observed to conclude
+    /// anything.
     ///
-    /// Separate from the verdict so a caller cannot act on three months of data
-    /// by reading only the predicate they were looking for.
+    /// Separate from the verdict so a caller cannot act on three weeks of data
+    /// by reading only the predicate they were looking for. Insufficient
+    /// evidence resolves in the customer's favour: [`may_warn`](Self::may_warn)
+    /// is false, which is the direction the regulation puts the burden in.
     #[must_use]
     pub const fn window_sufficient(&self) -> bool {
         self.observed_days >= ObservationWindow::MINIMUM_DAYS
@@ -317,15 +333,43 @@ impl FairUseAssessment {
         self.window_sufficient() && !self.prevailing_domestic()
     }
 
-    /// `true` when the provider may apply a surcharge.
+    /// `true` when the provider may apply a surcharge on `as_of`.
     ///
-    /// The regulation's sequence is observe, warn, then surcharge — so this
-    /// takes whether a warning was actually issued rather than inferring it.
-    /// Surcharging without having warned is the common error, and it is not
-    /// expressible here.
+    /// The regulation's sequence is **observe, alert, wait, then surcharge**,
+    /// and all four steps are required here.
+    ///
+    /// Article 5(3) of Implementing Regulation (EU) 2016/2286 requires the
+    /// customer to be alerted before any surcharge, and Article 5(4) requires
+    /// the alert to give them "a period which cannot be shorter than 2 weeks"
+    /// to change their usage pattern. So this takes the alert itself — with the
+    /// date it was issued — rather than a bare `bool`: surcharging on the day
+    /// of the alert satisfies "was warned" and breaches the regulation, and a
+    /// boolean cannot tell the two apart.
+    ///
+    /// `None` for the alert means none was issued, which is never a surcharge.
+    ///
+    /// ```rust
+    /// use mediation::{FairUseAlert, FairUseAssessment, Octets};
+    /// use time::macros::date;
+    ///
+    /// // Roaming prevails on both indicators over a full window.
+    /// let assessment = FairUseAssessment::from_counts(
+    ///     20, 100, Octets::new(1_000), Octets::new(9_000), 120,
+    /// );
+    /// assert!(assessment.may_warn());
+    ///
+    /// let alert = FairUseAlert::new(date!(2026 - 07 - 01));
+    ///
+    /// // Thirteen days on, the customer still has time to change.
+    /// assert!(!assessment.may_surcharge(Some(alert), date!(2026 - 07 - 14)));
+    /// // Two weeks on, they have had it.
+    /// assert!(assessment.may_surcharge(Some(alert), date!(2026 - 07 - 15)));
+    /// // No alert is never a surcharge, however long ago the window closed.
+    /// assert!(!assessment.may_surcharge(None, date!(2027 - 01 - 01)));
+    /// ```
     #[must_use]
-    pub const fn may_surcharge(&self, customer_was_warned: bool) -> bool {
-        self.may_warn() && customer_was_warned
+    pub fn may_surcharge(&self, alert: Option<FairUseAlert>, as_of: Date) -> bool {
+        self.may_warn() && alert.is_some_and(|alert| alert.has_elapsed(as_of))
     }
 
     /// Why the assessment reached its verdict, for a notice a human reads.
@@ -405,6 +449,11 @@ impl fmt::Display for SafeHarbour {
 /// Records whose serving or home network is unknown are skipped: an
 /// unattributable record cannot be placed in a region, and guessing would put
 /// it on one side of a test with legal consequences.
+///
+/// [`observed_days`](FairUseAssessment::observed_days) comes from the
+/// **presence series**, not from the window's configured length — see that
+/// accessor for why the distinction is what makes
+/// [`window_sufficient`](FairUseAssessment::window_sufficient) mean anything.
 #[must_use]
 pub fn assess(
     usage: &[UsageRecord],
@@ -416,17 +465,30 @@ pub fn assess(
 ) -> FairUseAssessment {
     let start = window.start(ending);
 
-    let (mut domestic_days, mut roaming_days) = (0u32, 0u32);
+    // Distinct days, not entries: a series that reports a subscriber twice on
+    // one day has still observed one day, and counting it twice would tilt a
+    // test with legal consequences by however often the feed repeats itself.
+    let mut domestic: BTreeSet<Date> = BTreeSet::new();
+    let mut roaming: BTreeSet<Date> = BTreeSet::new();
+    let mut observed: BTreeSet<Date> = BTreeSet::new();
     for day in presence
         .iter()
         .filter(|d| d.date >= start && d.date <= ending)
     {
+        observed.insert(day.date);
         match day.region {
-            Region::Domestic => domestic_days = domestic_days.saturating_add(1),
-            Region::Eea => roaming_days = roaming_days.saturating_add(1),
+            Region::Domestic => {
+                domestic.insert(day.date);
+            }
+            Region::Eea => {
+                roaming.insert(day.date);
+            }
+            // Outside the regulated area: evidence that the subscriber was
+            // observed, but on neither side of the ratio.
             Region::RestOfWorld => {}
         }
     }
+    let (domestic_days, roaming_days) = (domestic.len() as u32, roaming.len() as u32);
 
     let (mut domestic_use, mut roaming_use) = (Octets::ZERO, Octets::ZERO);
     for record in usage {
@@ -465,8 +527,116 @@ pub fn assess(
         roaming_days,
         domestic_use,
         roaming_use,
-        window.days(),
+        observed.len() as u32,
     )
+}
+
+// ── FairUseAlert ─────────────────────────────────────────────────────────────
+
+/// The alert Articles 5(3) and 5(4) require before a fair-use surcharge.
+///
+/// Two facts, and both are load-bearing: **when** the customer was told, and
+/// **how long** they were given. Article 5(4) puts a floor of two weeks under
+/// the second, so a provider may be more generous than the regulation and
+/// cannot be less.
+///
+/// Modelled as a value rather than a `bool` because "the customer was warned"
+/// is not the question a surcharge turns on. The question is whether the period
+/// the warning promised has run out, and only a date answers that.
+///
+/// ```rust
+/// use mediation::FairUseAlert;
+/// use time::macros::date;
+///
+/// let alert = FairUseAlert::new(date!(2026 - 07 - 01));
+/// assert_eq!(alert.expires().to_string(), "2026-07-15");
+///
+/// // A longer period is a provider's to give.
+/// assert!(FairUseAlert::with_period(date!(2026 - 07 - 01), 30).is_some());
+/// // A shorter one is not the regulation's to allow.
+/// assert!(FairUseAlert::with_period(date!(2026 - 07 - 01), 7).is_none());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FairUseAlert {
+    issued: Date,
+    period_days: u16,
+}
+
+impl FairUseAlert {
+    /// The floor Article 5(4) puts under the period, in days.
+    ///
+    /// "A period which cannot be shorter than 2 weeks."
+    pub const MINIMUM_PERIOD_DAYS: u16 = 14;
+
+    /// An alert issued on `issued`, giving the regulation's minimum period.
+    #[must_use]
+    pub const fn new(issued: Date) -> Self {
+        Self {
+            issued,
+            period_days: Self::MINIMUM_PERIOD_DAYS,
+        }
+    }
+
+    /// An alert giving a longer period than the minimum.
+    ///
+    /// `None` below [`MINIMUM_PERIOD_DAYS`](Self::MINIMUM_PERIOD_DAYS), which
+    /// the regulation does not permit — a shorter period is not a stricter
+    /// policy, it is a non-compliant one.
+    #[must_use]
+    pub const fn with_period(issued: Date, days: u16) -> Option<Self> {
+        if days < Self::MINIMUM_PERIOD_DAYS {
+            None
+        } else {
+            Some(Self {
+                issued,
+                period_days: days,
+            })
+        }
+    }
+
+    /// When the customer was alerted.
+    #[must_use]
+    pub const fn issued(self) -> Date {
+        self.issued
+    }
+
+    /// How many days the customer was given.
+    #[must_use]
+    pub const fn period_days(self) -> u16 {
+        self.period_days
+    }
+
+    /// The first date on which a surcharge may be applied.
+    ///
+    /// `None` only where the arithmetic leaves the calendar `Date` supports.
+    #[must_use]
+    pub fn checked_expiry(self) -> Option<Date> {
+        self.issued
+            .checked_add(time::Duration::days(i64::from(self.period_days)))
+    }
+
+    /// The first date on which a surcharge may be applied.
+    ///
+    /// # Panics
+    ///
+    /// Only for an alert issued within a fortnight of the maximum date `time`
+    /// supports, which is the year 9999 by default. Use
+    /// [`checked_expiry`](Self::checked_expiry) where that is reachable.
+    #[must_use]
+    pub fn expires(self) -> Date {
+        self.checked_expiry()
+            .expect("an alert date a fortnight inside the supported calendar")
+    }
+
+    /// `true` when the period the alert promised has run out by `as_of`.
+    ///
+    /// The comparison is on the **expiry date itself**: a period that started on
+    /// the first and runs two weeks is over on the fifteenth, not the
+    /// fourteenth.
+    #[must_use]
+    pub fn has_elapsed(self, as_of: Date) -> bool {
+        self.checked_expiry().is_some_and(|expiry| as_of >= expiry)
+    }
 }
 
 // ── VolumeAllowance ──────────────────────────────────────────────────────────
@@ -738,21 +908,49 @@ mod tests {
         assert_eq!(permanent.safe_harbour(), None);
     }
 
-    /// The regulation's sequence is observe, warn, then surcharge — and
-    /// surcharging without warning is not expressible.
+    /// The regulation's sequence is observe, alert, wait, then surcharge — and
+    /// none of the four steps is skippable.
     #[test]
-    fn a_surcharge_requires_a_warning_to_have_been_issued() {
+    fn a_surcharge_requires_an_alert_that_has_run_its_course() {
         let permanent =
             FairUseAssessment::from_counts(20, 100, Octets::new(500), Octets::new(9_500), 120);
         assert!(permanent.may_warn());
-        assert!(!permanent.may_surcharge(false), "no warning, no surcharge");
-        assert!(permanent.may_surcharge(true));
 
-        // And a customer inside the safe harbour cannot be surcharged even if
-        // somebody sent them a warning.
+        let day = date!(2026 - 07 - 01);
+        assert!(
+            !permanent.may_surcharge(None, day),
+            "no alert, no surcharge"
+        );
+
+        // Article 5(4): at least two weeks to change the usage pattern. The day
+        // the alert goes out is not the day a surcharge may start.
+        let alert = FairUseAlert::new(day);
+        assert!(!permanent.may_surcharge(Some(alert), day));
+        assert!(!permanent.may_surcharge(Some(alert), date!(2026 - 07 - 14)));
+        assert!(permanent.may_surcharge(Some(alert), date!(2026 - 07 - 15)));
+
+        // A provider may give longer, and is then held to it.
+        let generous = FairUseAlert::with_period(day, 30).expect("above the floor");
+        assert!(!permanent.may_surcharge(Some(generous), date!(2026 - 07 - 15)));
+        assert!(permanent.may_surcharge(Some(generous), date!(2026 - 07 - 31)));
+
+        // And a customer inside the safe harbour cannot be surcharged however
+        // long ago somebody alerted them.
         let lawful =
             FairUseAssessment::from_counts(80, 40, Octets::new(9_000), Octets::new(1_000), 120);
-        assert!(!lawful.may_surcharge(true));
+        assert!(!lawful.may_surcharge(Some(alert), date!(2027 - 01 - 01)));
+    }
+
+    /// The floor is the regulation's, not a policy knob.
+    #[test]
+    fn an_alert_shorter_than_a_fortnight_is_not_constructible() {
+        let day = date!(2026 - 07 - 01);
+        assert!(FairUseAlert::with_period(day, 13).is_none());
+        assert_eq!(
+            FairUseAlert::with_period(day, 14),
+            Some(FairUseAlert::new(day))
+        );
+        assert_eq!(FairUseAlert::new(day).expires(), date!(2026 - 07 - 15));
     }
 
     /// Ties resolve in the customer's favour: an equal split does not establish
@@ -773,7 +971,10 @@ mod tests {
             FairUseAssessment::from_counts(10, 80, Octets::new(100), Octets::new(9_900), 90);
         assert!(!short.window_sufficient());
         assert!(!short.may_warn());
-        assert!(!short.may_surcharge(true));
+        assert!(!short.may_surcharge(
+            Some(FairUseAlert::new(date!(2026 - 01 - 01))),
+            date!(2026 - 07 - 28)
+        ));
         assert_eq!(short.safe_harbour(), Some(SafeHarbour::WindowTooShort));
 
         assert_eq!(ObservationWindow::new(90), None);

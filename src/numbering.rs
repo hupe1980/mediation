@@ -44,6 +44,7 @@
 //! the block — so [`NumberRangeSet`] resolves by **longest prefix**, which is
 //! the only reading that respects how ranges are actually assigned.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -68,17 +69,26 @@ pub struct NumberRange {
 const RANGE_FORMAT: &str = "1 to 15 decimal digits in international form, such as 49151";
 
 impl NumberRange {
+    /// The widest prefix a range may hold — the E.164 maximum.
+    pub const MAX_DIGITS: usize = 15;
+
     /// A range from its leading digits.
     ///
     /// `None` for an empty prefix, which would match every number and is
     /// therefore a range only in the sense that the universe is.
     #[must_use]
     pub fn new(prefix: DigitString) -> Option<Self> {
-        if prefix.is_empty() || prefix.len() > 15 {
+        if prefix.is_empty() || prefix.len() > Self::MAX_DIGITS {
             None
         } else {
             Some(Self { prefix })
         }
+    }
+
+    /// The range's digits.
+    #[must_use]
+    pub const fn prefix(self) -> DigitString {
+        self.prefix
     }
 
     /// How many digits the prefix holds.
@@ -104,11 +114,7 @@ impl NumberRange {
     /// them.
     #[must_use]
     pub fn contains(self, number: Msisdn) -> bool {
-        let digits = number.digits();
-        if self.prefix.len() > digits.len() {
-            return false;
-        }
-        (0..self.prefix.len()).all(|i| self.prefix.at(i) == digits.at(i))
+        number.digits().starts_with(self.prefix)
     }
 }
 
@@ -125,7 +131,7 @@ impl FromStr for NumberRange {
         let err = || ParseError::format("NumberRange", s, RANGE_FORMAT);
         let t = s.trim();
         let body = t.strip_prefix('+').unwrap_or(t);
-        Self::new(DigitString::parse(body, 15).ok_or_else(err)?).ok_or_else(err)
+        Self::new(DigitString::parse(body, Self::MAX_DIGITS).ok_or_else(err)?).ok_or_else(err)
     }
 }
 
@@ -137,9 +143,25 @@ impl FromStr for NumberRange {
 /// questions: *which operator was this range allocated to* and *is this
 /// destination on a high-risk list*. Both are caller-supplied data this crate
 /// will not vendor.
+///
+/// # Lookup is by probe, not by scan
+///
+/// A national numbering plan is hundreds of thousands of ranges, and every
+/// call needs one lookup. A linear scan over the ranges makes that
+/// *O(ranges)* per record — fine on the toy set a test builds, and the reason
+/// a mediation run that worked in staging takes a week in production.
+///
+/// The ranges are held in a [`BTreeMap`] keyed on their digits, and a lookup
+/// probes the number's own prefixes from longest to shortest. A prefix is at
+/// most 15 digits, so a lookup is at most 15 map probes however many ranges
+/// are loaded: *O(log ranges)*, independent of the plan's size.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NumberRangeSet<T> {
-    entries: Vec<(NumberRange, T)>,
+    /// One entry per distinct prefix. The vector holds every value inserted
+    /// against it, in insertion order, so a duplicated range is visible rather
+    /// than silently overwritten.
+    entries: BTreeMap<DigitString, Vec<T>>,
+    values: usize,
 }
 
 impl<T> NumberRangeSet<T> {
@@ -147,23 +169,31 @@ impl<T> NumberRangeSet<T> {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: BTreeMap::new(),
+            values: 0,
         }
     }
 
     /// Add a range.
     ///
-    /// A range added twice keeps **both** entries, and the lookup returns the
-    /// first of equal length. Silently replacing would hide a duplicate in a
-    /// caller's reference data, which is a fault worth noticing —
+    /// A range added twice keeps **both** values, and the lookup returns the
+    /// first inserted. Silently replacing would hide a duplicate in a caller's
+    /// reference data, which is a fault worth noticing —
     /// [`duplicates`](Self::duplicates) finds them.
     pub fn insert(&mut self, range: NumberRange, value: T) {
-        self.entries.push((range, value));
+        self.entries.entry(range.prefix).or_default().push(value);
+        self.values += 1;
     }
 
-    /// How many ranges are held.
+    /// How many values are held, duplicates included.
     #[must_use]
     pub fn len(&self) -> usize {
+        self.values
+    }
+
+    /// How many distinct ranges are held.
+    #[must_use]
+    pub fn ranges(&self) -> usize {
         self.entries.len()
     }
 
@@ -178,13 +208,40 @@ impl<T> NumberRangeSet<T> {
     /// Longest prefix wins. `None` when the number falls in no range at all —
     /// which is an answer, not a failure: a number outside every known block is
     /// exactly what a caller needs to be told about.
+    ///
+    /// At most [`NumberRange::MAX_DIGITS`] map probes, whatever the plan size.
     #[must_use]
     pub fn longest_match(&self, number: Msisdn) -> Option<(NumberRange, &T)> {
-        self.entries
-            .iter()
-            .filter(|(range, _)| range.contains(number))
-            .max_by_key(|(range, _)| range.len())
-            .map(|(range, value)| (*range, value))
+        let digits = number.digits();
+        let longest = digits.len().min(NumberRange::MAX_DIGITS);
+        for width in (1..=longest).rev() {
+            let prefix = digits.prefix(width);
+            if let Some(values) = self.entries.get(&prefix)
+                && let Some(first) = values.first()
+            {
+                return Some((NumberRange { prefix }, first));
+            }
+        }
+        None
+    }
+
+    /// Every value held against the most specific matching range.
+    ///
+    /// One entry unless the range was inserted more than once — see
+    /// [`duplicates`](Self::duplicates).
+    #[must_use]
+    pub fn longest_match_all(&self, number: Msisdn) -> Option<(NumberRange, &[T])> {
+        let digits = number.digits();
+        let longest = digits.len().min(NumberRange::MAX_DIGITS);
+        for width in (1..=longest).rev() {
+            let prefix = digits.prefix(width);
+            if let Some(values) = self.entries.get(&prefix)
+                && !values.is_empty()
+            {
+                return Some((NumberRange { prefix }, values.as_slice()));
+            }
+        }
+        None
     }
 
     /// Ranges present more than once, ascending.
@@ -193,23 +250,28 @@ impl<T> NumberRangeSet<T> {
     /// and which one wins is then an accident of load order.
     #[must_use]
     pub fn duplicates(&self) -> Vec<NumberRange> {
-        let mut seen: Vec<NumberRange> = self.entries.iter().map(|(range, _)| *range).collect();
-        seen.sort_unstable();
-        let mut found = Vec::new();
-        for window in seen.windows(2) {
-            if window[0] == window[1] && found.last() != Some(&window[0]) {
-                found.push(window[0]);
-            }
-        }
-        found
+        self.entries
+            .iter()
+            .filter(|(_, values)| values.len() > 1)
+            .map(|(prefix, _)| NumberRange { prefix: *prefix })
+            .collect()
+    }
+
+    /// Every range held, ascending by digits.
+    pub fn ranges_iter(&self) -> impl Iterator<Item = NumberRange> + '_ {
+        self.entries
+            .keys()
+            .map(|prefix| NumberRange { prefix: *prefix })
     }
 }
 
 impl<T> FromIterator<(NumberRange, T)> for NumberRangeSet<T> {
     fn from_iter<I: IntoIterator<Item = (NumberRange, T)>>(iter: I) -> Self {
-        Self {
-            entries: iter.into_iter().collect(),
+        let mut set = Self::new();
+        for (range, value) in iter {
+            set.insert(range, value);
         }
+        set
     }
 }
 

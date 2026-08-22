@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block body_class %}doc index{% endblock %}
+
+{% block structured_data %}{
+  "@context": "https://schema.org",
+  "@type": "CollectionPage",
+  "name": "{{ section.title }}",
+  "description": "{{ section.description | default(value=config.description) }}",
+  "url": "{{ section.permalink }}",
+  "inLanguage": "en",
+  "isPartOf": { "@type": "WebSite", "name": "{{ config.title }}", "url": "{{ config.base_url }}" }
+}{% endblock %}
+
+{% set title = section.title %}
+{% set description = section.description | default(value=config.description) %}
+
+{% block content %}
+<div class="doclayout wrap">
+  {% include "docs/nav.html" %}
+
+  <article class="doccontent">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/_index.md') | safe }}">Home</a>
+      <span aria-hidden="true">/</span>
+      <span>Documentation</span>
+    </nav>
+
+    <h1>{{ section.title }}</h1>
+    {%- if section.description %}<p class="lede">{{ section.description }}</p>{% endif %}
+
+    {{ section.content | safe }}
+
+    <h2 id="pages">Every page</h2>
+    <ul class="cards">
+      {%- for p in section.pages %}
+      <li>
+        <a href="{{ p.permalink | safe }}">
+          <strong>{{ p.title }}</strong>
+          {%- if p.description %}<span>{{ p.description }}</span>{% endif %}
+        </a>
+      </li>
+      {%- endfor %}
+    </ul>
+  </article>
+</div>
+{% endblock %}
+
+{% block scripts %}{% include "search.html" %}{% endblock %}

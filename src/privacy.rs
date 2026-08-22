@@ -32,21 +32,21 @@
 //! without it.
 //!
 //! ```rust
-//! use mediation::{Imei, Imsi, Reduction};
+//! use mediation::{Imei, Imsi, reduce_to_country};
 //!
 //! let imsi: Imsi = "262021234567890".parse().unwrap();
 //! let imei: Imei = "490154203237518".parse().unwrap();
 //!
 //! // A country-traffic report needs the country, not the subscriber.
-//! assert_eq!(Reduction::CountryOnly.apply_to_imsi(imsi).to_string(), "262");
+//! assert_eq!(reduce_to_country(imsi).to_string(), "262");
 //!
 //! // A device-mix report needs the model, not the handset.
-//! assert_eq!(Reduction::ModelOnly.apply_to_imei(imei).to_string(), "49015420");
+//! assert_eq!(imei.tac().to_string(), "49015420");
 //! ```
 
 use std::fmt;
 
-use crate::identity::{Imei, Imeisv, Imsi, Msisdn, Pei, Supi, Tac};
+use crate::identity::{Imeisv, Imsi, Msisdn, Pei, Supi, Tac};
 use crate::plmn::{Mcc, MncWidths, PlmnId};
 
 // ── Pseudonym ────────────────────────────────────────────────────────────────
@@ -124,6 +124,15 @@ pub trait Pseudonymiser {
 /// Unlike a pseudonym, a reduction is **irreversible**: the discarded digits
 /// are gone, and nobody — key holder included — can recover them. That is what
 /// makes a reduced dataset genuinely narrower rather than merely obscured.
+///
+/// This enum **names** a policy; it does not perform one. The three reductions
+/// take different inputs and return different types — an [`Mcc`], a [`PlmnId`]
+/// and a [`Tac`] — so a single `apply` would have to return a sum type, or
+/// ignore the variant it was called on. It used to do the latter, which meant
+/// a model reduction applied to an IMSI cheerfully returned a country.
+///
+/// The reductions themselves are [`reduce_to_country`], [`reduce_to_network`]
+/// and [`reduce_equipment`], each named for what it yields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Reduction {
     /// Keep the country only.
@@ -148,34 +157,23 @@ impl Reduction {
     /// Every variant, for exhaustive iteration in tests and mappings.
     pub const ALL: &'static [Self] = &[Self::CountryOnly, Self::NetworkOnly, Self::ModelOnly];
 
-    /// The country an IMSI belongs to.
+    /// The canonical codes, in the order of [`ALL`](Self::ALL).
+    pub const CODES: &'static [&'static str] = &["COUNTRY_ONLY", "NETWORK_ONLY", "MODEL_ONLY"];
+
+    /// What the reduction applies to.
     ///
-    /// Available under every reduction because the MCC needs no table and is
-    /// the least an IMSI can be reduced to while remaining useful.
+    /// A model reduction is meaningless for a subscription identity and a
+    /// network reduction is meaningless for a handset, so a configuration that
+    /// pairs one with the wrong identity can be caught before it runs.
     #[must_use]
-    pub const fn apply_to_imsi(self, imsi: Imsi) -> Mcc {
-        imsi.mcc()
+    pub const fn applies_to_subscription(self) -> bool {
+        matches!(self, Self::CountryOnly | Self::NetworkOnly)
     }
 
-    /// The network an IMSI belongs to, given an assignment table.
-    ///
-    /// `None` when the resolver does not know the country — the same refusal to
-    /// guess as everywhere the MNC width is needed.
+    /// `true` when the reduction needs an [`MncWidths`] resolver.
     #[must_use]
-    pub fn apply_to_imsi_network(self, imsi: Imsi, widths: &impl MncWidths) -> Option<PlmnId> {
-        imsi.plmn(widths)
-    }
-
-    /// The model an equipment identity names.
-    #[must_use]
-    pub fn apply_to_imei(self, imei: Imei) -> Tac {
-        imei.tac()
-    }
-
-    /// The model an equipment identity names, whichever form it took.
-    #[must_use]
-    pub fn apply_to_pei(self, pei: Pei) -> Tac {
-        pei.tac()
+    pub const fn needs_assignment_table(self) -> bool {
+        matches!(self, Self::NetworkOnly)
     }
 
     /// The canonical string form.
@@ -186,6 +184,18 @@ impl Reduction {
             Self::NetworkOnly => "NETWORK_ONLY",
             Self::ModelOnly => "MODEL_ONLY",
         }
+    }
+}
+
+impl std::str::FromStr for Reduction {
+    type Err = crate::error::ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .find(|r| r.as_str().eq_ignore_ascii_case(s.trim()))
+            .copied()
+            .ok_or_else(|| crate::error::ParseError::one_of("Reduction", s, Self::CODES))
     }
 }
 
@@ -296,6 +306,26 @@ impl fmt::Display for ReducedSubscriber {
         }
         Ok(())
     }
+}
+
+/// A subscription identity reduced to its country.
+///
+/// Needs no assignment table: the MCC is always the first three digits, which
+/// is why this is the least an IMSI can be reduced to while remaining useful.
+/// Many-to-one and irreversible — a country holds tens of millions of
+/// subscribers.
+#[must_use]
+pub const fn reduce_to_country(imsi: Imsi) -> Mcc {
+    imsi.mcc()
+}
+
+/// A subscription identity reduced to its network.
+///
+/// `None` when the resolver does not know the country — the same refusal to
+/// guess as everywhere the MNC width is needed. See [`crate::plmn`].
+#[must_use]
+pub fn reduce_to_network(imsi: Imsi, widths: &impl MncWidths) -> Option<PlmnId> {
+    imsi.plmn(widths)
 }
 
 /// Equipment reduced to its model.
@@ -485,21 +515,20 @@ mod tests {
     #[test]
     fn a_reduction_discards_rather_than_obscures() {
         let imsi: Imsi = "262021234567890".parse().unwrap();
-        let country = Reduction::CountryOnly.apply_to_imsi(imsi);
+        let country = reduce_to_country(imsi);
         assert_eq!(country.to_string(), "262");
 
         // Two subscribers in one country reduce to the same value, and nothing
         // recovers which was which.
         let other: Imsi = "262029999999999".parse().unwrap();
-        assert_eq!(Reduction::CountryOnly.apply_to_imsi(other), country);
+        assert_eq!(reduce_to_country(other), country);
     }
 
     #[test]
     fn a_network_reduction_needs_the_same_table_as_everything_else() {
         let imsi: Imsi = "262021234567890".parse().unwrap();
         assert_eq!(
-            Reduction::NetworkOnly
-                .apply_to_imsi_network(imsi, &NorthAmericanRule)
+            reduce_to_network(imsi, &NorthAmericanRule)
                 .unwrap()
                 .to_string(),
             "262-02"
@@ -507,7 +536,7 @@ mod tests {
 
         let unknown = |_: Mcc| None;
         assert_eq!(
-            Reduction::NetworkOnly.apply_to_imsi_network(imsi, &unknown),
+            reduce_to_network(imsi, &unknown),
             None,
             "an unresolvable network is not guessed"
         );
@@ -521,10 +550,7 @@ mod tests {
 
         assert_eq!(reduce_equipment(imei).to_string(), "49015420");
         assert_eq!(reduce_equipment(imei), reduce_equipment(imeisv));
-        assert_eq!(
-            Reduction::ModelOnly.apply_to_pei(imei),
-            reduce_equipment(imei)
-        );
+        assert_eq!(reduce_equipment(imei), reduce_equipment(imei));
     }
 
     /// A software-version report needs no device identity at all.

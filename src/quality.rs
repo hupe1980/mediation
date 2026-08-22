@@ -21,6 +21,12 @@
 //! Releasing it invoices an amount nobody can prove is right, so it is a hard
 //! gate rather than a score that enough good records could outvote.
 //!
+//! It is per **source**, not per batch. [`crate::pipeline::process`] holds the
+//! records of a source with a hole and releases everybody else's, so the
+//! question this gate asks is whether anything *released* came from a source
+//! that cannot account for itself. Blocking the whole batch instead would stop
+//! an operator's billing run on one gateway's lost file.
+//!
 //! # Why a grade at all
 //!
 //! The gate is a boolean, but an operator needs to know whether a batch is
@@ -186,11 +192,17 @@ impl fmt::Display for QualityReport {
 
 /// Grade a batch and decide whether it may be released.
 ///
-/// `sources_complete` is the caller's answer to *"does every
-/// [`crate::sequence::SequenceTracker`] feeding this batch report
-/// [`is_complete`](crate::sequence::SequenceTracker::is_complete)?"* — the crate
-/// cannot know how many sources a batch drew on, and guessing would be the one
-/// mistake that lets an incomplete batch through.
+/// `sources_complete` is the caller's answer to *"is every source whose records
+/// this batch **releases** complete?"* — the crate cannot know how many sources
+/// a batch drew on, and guessing would be the one mistake that lets an
+/// incomplete batch through.
+///
+/// Note *releases*, not *touches*. [`crate::pipeline::process`] holds every
+/// record from a source with an unfilled hole
+/// ([`HoldReason::SequenceGap`](crate::HoldReason::SequenceGap)), so what it
+/// releases is complete by construction and it passes `true` here. A caller
+/// assembling their own batch, and releasing records from a source they cannot
+/// prove complete, passes `false` — and the gate stops them.
 ///
 /// The grade is derived, not configurable: the boundaries encode when an
 /// operator should look, and a per-deployment threshold would make two teams'
@@ -235,10 +247,15 @@ pub fn score_batch(
 /// Thresholds are proportions rather than counts, so a batch of a hundred and a
 /// batch of a hundred million grade the same way for the same defect rate.
 fn grade_clean_batch(counts: &BatchReconciliation, warnings: usize) -> QualityGrade {
-    let ingested = counts.ingested();
-    if ingested == 0 {
+    // Everything the batch had to account for, carried-in records included. A
+    // batch that only re-presents what a predecessor held has `ingested == 0`
+    // and is still a batch: grading it against `ingested` alone would hand an
+    // A to a re-presentation full of warnings, and a period whose held records
+    // keep failing is exactly the case a grade is meant to surface.
+    let presented = counts.presented().unwrap_or(0);
+    if presented == 0 {
         // An empty batch is trivially clean. It is also not evidence of
-        // anything, which the caller sees in `ingested`.
+        // anything, which the caller sees in `presented`.
         return QualityGrade::A;
     }
 
@@ -247,7 +264,7 @@ fn grade_clean_batch(counts: &BatchReconciliation, warnings: usize) -> QualityGr
         return QualityGrade::A;
     }
     // Below one percent noise, and under a tenth held, is a working batch.
-    if warnings * 100 <= ingested && counts.held() * 10 <= ingested {
+    if warnings.saturating_mul(100) <= presented && counts.held().saturating_mul(10) <= presented {
         return QualityGrade::B;
     }
     QualityGrade::C
@@ -426,9 +443,13 @@ mod tests {
             r#"{"ingested":10,"billable":3,"suppressed":0,"duplicate":0,"rejected":0,"held":0}"#,
         )
         .unwrap();
-        let findings: ValidationReport = vec![Finding::sequence_gap("pgw-01", &[7])]
-            .into_iter()
-            .collect();
+        let findings: ValidationReport = vec![Finding::new(
+            crate::validation::Rule::ClosedBeforeOpened,
+            0,
+            "",
+        )]
+        .into_iter()
+        .collect();
 
         let report = score_batch(&broken, &findings, false);
         assert_eq!(report.blockers, ReleaseBlocker::ALL.to_vec());

@@ -9,8 +9,8 @@
 //! reading either the wrong way round produces a well-formed, wrong value.
 
 use mediation::{
-    CdrTimestamp, Century, DigitString, Imei, Imsi, Msisdn, QuarterHourOffset, SliceServiceType,
-    Snssai,
+    AddressString, CdrTimestamp, Century, ChargingCharacteristics, DigitString, Imei, Imsi, Msisdn,
+    NatureOfAddress, NumberingPlan, QuarterHourOffset, SliceServiceType, Snssai,
 };
 use proptest::prelude::*;
 
@@ -160,7 +160,7 @@ fn the_timestamp_layout_matches_the_specification() {
     assert_eq!(ts.to_string(), "2026-07-28T10:30:45+02:00");
     assert_eq!(ts.local_date().to_string(), "2026-07-28");
     assert_eq!(ts.offset(), QuarterHourOffset::from_minutes(120).unwrap());
-    assert_eq!(ts.to_bcd().unwrap(), octets);
+    assert_eq!(ts.to_bcd(Century::TWENTY_FIRST).unwrap(), octets);
 }
 
 /// Every quarter-hour zone the crate models survives the encoding, including
@@ -172,7 +172,7 @@ fn every_quarter_hour_zone_survives_the_timestamp_encoding() {
         let local = "2026-07-28T10:30:45".to_owned() + &offset.to_string();
         let ts: CdrTimestamp = local.parse().unwrap();
 
-        let octets = ts.to_bcd().unwrap();
+        let octets = ts.to_bcd(Century::TWENTY_FIRST).unwrap();
         assert_eq!(
             octets[6],
             if minutes < 0 { b'-' } else { b'+' },
@@ -197,8 +197,14 @@ fn the_century_is_the_callers_decision() {
 
     assert_eq!(twentieth.local_date().year(), 1999);
     assert_eq!(twenty_first.local_date().year(), 2099);
-    // Both encode back to the same nine octets, which is the whole problem.
-    assert_eq!(twentieth.to_bcd().unwrap(), twenty_first.to_bcd().unwrap());
+    // Both encode back to the same nine octets, which is the whole problem —
+    // and why the encoder makes the caller name the century too.
+    assert_eq!(
+        twentieth.to_bcd(Century::new(1900).unwrap()).unwrap(),
+        twenty_first.to_bcd(Century::TWENTY_FIRST).unwrap()
+    );
+    // A timestamp cannot be written into a century it does not belong to.
+    assert!(twentieth.to_bcd(Century::TWENTY_FIRST).is_err());
 }
 
 /// A decode error names the octet that failed, because a caller holding a
@@ -233,7 +239,7 @@ proptest! {
         );
         let ts: CdrTimestamp = text.parse().unwrap();
 
-        let octets = ts.to_bcd().unwrap();
+        let octets = ts.to_bcd(Century::TWENTY_FIRST).unwrap();
         prop_assert_eq!(octets.len(), CdrTimestamp::BCD_OCTETS);
         prop_assert_eq!(
             CdrTimestamp::from_bcd(&octets, Century::TWENTY_FIRST).unwrap(),
@@ -287,4 +293,106 @@ proptest! {
         // …and through its string form too.
         prop_assert_eq!(slice.to_string().parse::<Snssai>().unwrap(), slice);
     }
+}
+
+// ── AddressString ────────────────────────────────────────────────────────────
+
+/// The single most common decoding error in this area, and the one that is
+/// invisible without a reference decode: a `servedMSISDN` is an
+/// `ISDN-AddressString`, whose first octet is a qualifier rather than a digit
+/// pair. Reading it as TBCD prepends two digits and produces a valid-looking
+/// number belonging to somebody else.
+#[test]
+fn a_served_msisdn_is_not_a_bare_tbcd_field() {
+    // 0x91: extension bit set, international, E.164 — then 491701234567.
+    let field = [0x91, 0x94, 0x71, 0x10, 0x32, 0x54, 0x76];
+
+    let address = AddressString::from_bytes(&field).unwrap();
+    assert_eq!(address.nature(), NatureOfAddress::International);
+    assert_eq!(address.plan(), NumberingPlan::Isdn);
+    assert_eq!(address.to_msisdn().unwrap().to_string(), "491701234567");
+
+    // The wrong reading parses, validates and bills the wrong subscriber.
+    let wrong = Msisdn::from_tbcd(&field).unwrap();
+    assert_eq!(wrong.to_string(), "19491701234567");
+    assert_ne!(wrong, address.to_msisdn().unwrap());
+}
+
+/// An MSISDN is international by definition. Turning a national number into one
+/// needs the operator's dialling plan, and prefixing a country code by
+/// assumption settles the call against the wrong partner.
+#[test]
+fn only_an_international_address_becomes_an_msisdn() {
+    let national = [0xA1, 0x03, 0x21, 0x43, 0x65];
+    let address = AddressString::from_bytes(&national).unwrap();
+    assert_eq!(address.nature(), NatureOfAddress::NationalSignificant);
+    assert_eq!(address.to_msisdn(), None);
+    // The digits are still available to a caller who does hold a dialling plan.
+    assert_eq!(address.digits().to_string(), "30123456");
+}
+
+#[test]
+fn an_address_string_round_trips() {
+    let field = [0x91, 0x94, 0x71, 0x10, 0x32, 0x54, 0x76];
+    let address = AddressString::from_bytes(&field).unwrap();
+
+    let mut out = [0u8; 16];
+    let written = address.to_bytes(&mut out).unwrap();
+    assert_eq!(&out[..written], &field);
+    assert_eq!(address.to_string(), "INTERNATIONAL/ISDN:491701234567");
+}
+
+/// TS 29.002 fixes the extension bit at 1. A zero there means the octets are
+/// not an `AddressString` at all — most often, that a decoder is one field out.
+#[test]
+fn a_qualifier_without_the_extension_bit_is_refused() {
+    assert!(AddressString::from_bytes(&[0x11, 0x94, 0x71]).is_err());
+    assert!(AddressString::from_bytes(&[]).is_err());
+}
+
+/// Sixteen operator-defined behaviours, and the crate reads none of them.
+/// TS 32.251 §A.1: the bits are "freely defined by Operators", so `0x0800` is
+/// prepaid at one operator and a lab profile at the next.
+#[test]
+fn charging_characteristics_carry_the_bits_and_interpret_nothing() {
+    let profile = ChargingCharacteristics::from_bits(0x0800);
+
+    assert_eq!(profile.to_bytes(), [0x08, 0x00]);
+    assert_eq!(
+        ChargingCharacteristics::from_bytes(&[0x08, 0x00]).unwrap(),
+        profile
+    );
+    assert_eq!(profile.to_string(), "0800");
+
+    // Behaviour 11, and nothing else.
+    assert!(profile.behaviour(11));
+    assert_eq!(profile.count(), 1);
+    assert_eq!(profile.set_behaviours().collect::<Vec<_>>(), vec![11]);
+    // An index past the field is not selected, and does not panic.
+    assert!(!profile.behaviour(16));
+    assert!(!profile.behaviour(255));
+
+    // Nothing selected is not the same as no field at all.
+    assert!(ChargingCharacteristics::NONE.is_empty());
+    assert_eq!(ChargingCharacteristics::NONE.to_string(), "0000");
+
+    // Every value round-trips through both forms.
+    for bits in [0x0000u16, 0x0001, 0x8000, 0xFFFF, 0x1234] {
+        let profile = ChargingCharacteristics::from_bits(bits);
+        assert_eq!(
+            ChargingCharacteristics::from_bytes(&profile.to_bytes()).unwrap(),
+            profile
+        );
+        assert_eq!(
+            profile
+                .to_string()
+                .parse::<ChargingCharacteristics>()
+                .unwrap(),
+            profile
+        );
+    }
+
+    // Any length but two is refused rather than padded.
+    assert!(ChargingCharacteristics::from_bytes(&[0x08]).is_err());
+    assert!(ChargingCharacteristics::from_bytes(&[0x08, 0x00, 0x00]).is_err());
 }

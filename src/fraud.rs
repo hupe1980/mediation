@@ -34,7 +34,7 @@
 //! cellular edge, radio measurements — that never reaches a charging record.
 //!
 //! ```rust
-//! use mediation::{Signal, impossible_travel};
+//! use mediation::{Signal, UniformTransit, impossible_travel};
 //! # use mediation::{ChargedParty, RecordType, SourceRef, SubscriberRef, UsageRecord};
 //! # use time::Duration;
 //! # fn at(opened: &str, serving: &str) -> UsageRecord {
@@ -51,7 +51,7 @@
 //!     at("2026-07-28T10:20:00+02:00", "310-260"),
 //! ];
 //!
-//! let found = impossible_travel(&records, Duration::hours(4));
+//! let found = impossible_travel(&records, &UniformTransit::new(Duration::hours(4)));
 //! assert_eq!(found.len(), 1);
 //! assert_eq!(found[0].signal, Signal::ImpossibleTravel);
 //! ```
@@ -190,6 +190,77 @@ impl fmt::Display for Indication {
 
 // ── Impossible travel ────────────────────────────────────────────────────────
 
+/// The shortest plausible journey between two countries.
+///
+/// A physical claim, not a threshold to tune — and one this crate will not
+/// make on a caller's behalf, for the same reason it ships no E.212 table and
+/// no EEA membership list. Four hours is a sensible floor for an
+/// intercontinental hop and absurd for Germany to Austria, where a train ride
+/// is ninety minutes and a flight is fifty. One number for every pair therefore
+/// either misses real fraud or accuses real travellers, depending which way it
+/// is set.
+///
+/// Returning `None` means *unknown*, and an unknown pair **never fires**. A
+/// fraud signal raised out of ignorance costs an analyst the same time as a
+/// real one and teaches them to discount the next.
+///
+/// Implement it over whatever you have — a matrix of great-circle distances, a
+/// timetable, a flat rule for pairs you have not modelled. [`UniformTransit`]
+/// is the flat rule, spelled out.
+pub trait TransitTimes {
+    /// The shortest time in which a subscriber could get from `from` to `to`,
+    /// or `None` when the pair is unknown.
+    fn minimum_transit(&self, from: Mcc, to: Mcc) -> Option<Duration>;
+}
+
+/// One minimum for every pair of countries.
+///
+/// The simplest possible [`TransitTimes`], and the right starting point: it
+/// catches the intercontinental cases that need no geography at all, and says
+/// so in the type rather than in a comment beside a constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UniformTransit(Duration);
+
+impl UniformTransit {
+    /// A flat minimum for every pair.
+    #[must_use]
+    pub const fn new(minimum: Duration) -> Self {
+        Self(minimum)
+    }
+
+    /// The minimum this rule applies.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
+impl TransitTimes for UniformTransit {
+    fn minimum_transit(&self, from: Mcc, to: Mcc) -> Option<Duration> {
+        // Same country is not a journey; the detector never asks, but a caller
+        // reading this trait directly might.
+        if from == to { None } else { Some(self.0) }
+    }
+}
+
+impl<F> TransitTimes for F
+where
+    F: Fn(Mcc, Mcc) -> Option<Duration>,
+{
+    fn minimum_transit(&self, from: Mcc, to: Mcc) -> Option<Duration> {
+        self(from, to)
+    }
+}
+
+/// One record's contribution to a subscriber's movement: where they were, when
+/// they got there, and when they were last demonstrably still there.
+struct Sighting {
+    index: usize,
+    country: Mcc,
+    arrived: CdrTimestamp,
+    departed: CdrTimestamp,
+}
+
 /// Two records placing the subscriber in different countries sooner than any
 /// journey allows.
 ///
@@ -198,10 +269,9 @@ impl fmt::Display for Indication {
 /// Two records from adjacent cells minutes apart are ordinary; two from
 /// Germany and the United States twenty minutes apart are not.
 ///
-/// `min_transit` is the shortest plausible journey between any two countries,
-/// supplied by the caller. It is a physical claim, not a threshold to tune:
-/// four hours is a reasonable floor for intercontinental travel and far too
-/// long for neighbouring countries, which is why the crate does not pick it.
+/// The minimum comes from a caller-supplied [`TransitTimes`], per country pair
+/// — see that trait for why one global number is the wrong shape. Pass
+/// [`UniformTransit`] for the flat rule.
 ///
 /// Records are compared in **instant order** whatever order they arrive in, so
 /// a shuffled input does not manufacture journeys — and **per charged party**,
@@ -211,29 +281,73 @@ impl fmt::Display for Indication {
 /// Only adjacent records in time are compared, which loses nothing: if two
 /// records are impossibly far apart, some adjacent pair between them changes
 /// country in no more time, and that pair fires.
+///
+/// # Travel time runs from the first record's **close**
+///
+/// The subscriber was demonstrably in the first country until that record
+/// closed, so that is when the journey could begin. Measuring from the record's
+/// *open* instant instead grants a four-hour call four extra hours of travel
+/// time — and hides the clearest evidence there is, two sessions that overlap
+/// in two countries, which is a cloned or shared SIM rather than an
+/// improbably fast journey. Overlapping sessions say so in the detail line.
+///
+/// ```rust
+/// use mediation::{UniformTransit, impossible_travel};
+/// use time::Duration;
+/// # use mediation::{ChargedParty, RecordType, SourceRef, SubscriberRef, UsageRecord};
+/// # fn at(opened: &str, serving: &str) -> UsageRecord {
+/// #     UsageRecord::new(
+/// #         RecordType::MobileOriginatedCall,
+/// #         ChargedParty::Subscriber(SubscriberRef::new("imsi-262021234567890".parse().unwrap())),
+/// #         opened.parse().unwrap(),
+/// #         SourceRef::new("msc-01".parse().unwrap(), 0),
+/// #     ).with_networks(serving.parse().unwrap(), "262-02".parse().unwrap())
+/// # }
+/// let records = vec![
+///     at("2026-07-28T10:00:00+02:00", "262-02"), // Germany
+///     at("2026-07-28T10:20:00+02:00", "310-260"), // United States
+/// ];
+///
+/// let found = impossible_travel(&records, &UniformTransit::new(Duration::hours(4)));
+/// assert_eq!(found.len(), 1);
+/// ```
 #[must_use]
-pub fn impossible_travel(records: &[UsageRecord], min_transit: Duration) -> Vec<Indication> {
-    let mut by_party: BTreeMap<&ChargedParty, Vec<(usize, Mcc, CdrTimestamp)>> = BTreeMap::new();
+pub fn impossible_travel(records: &[UsageRecord], transit: &impl TransitTimes) -> Vec<Indication> {
+    // Three fields per record: when it began, when the subscriber was last
+    // demonstrably still in that country, and which country that was.
+    let mut by_party: BTreeMap<&ChargedParty, Vec<Sighting>> = BTreeMap::new();
     for (index, record) in records.iter().enumerate() {
         if let Some(plmn) = record.serving_plmn {
-            by_party
-                .entry(&record.party)
-                .or_default()
-                .push((index, plmn.mcc(), record.opened));
+            by_party.entry(&record.party).or_default().push(Sighting {
+                index,
+                country: plmn.mcc(),
+                arrived: record.opened,
+                // The subscriber was in this country until the record closed,
+                // not until it opened. Measuring departure from the *open*
+                // instant grants a four-hour call four extra hours of travel
+                // time and lets the clearest evidence there is — two sessions
+                // overlapping in two countries — pass as ordinary movement.
+                departed: record.closed.unwrap_or(record.opened),
+            });
         }
     }
 
     let mut found = Vec::new();
     for placed in by_party.values_mut() {
-        placed.sort_by(|a, b| CdrTimestamp::cmp_instant(&a.2, &b.2));
+        placed.sort_by(|a, b| CdrTimestamp::cmp_instant(&a.arrived, &b.arrived));
         for pair in placed.windows(2) {
-            let (first_index, first_country, first_at) = pair[0];
-            let (second_index, second_country, second_at) = pair[1];
+            let (first, second) = (&pair[0], &pair[1]);
+            let (first_index, first_country) = (first.index, first.country);
+            let (second_index, second_country) = (second.index, second.country);
             if first_country == second_country {
                 continue;
             }
-            let elapsed = second_at.to_utc() - first_at.to_utc();
-            if elapsed >= min_transit {
+            // An unmodelled pair is not evidence of anything.
+            let Some(minimum) = transit.minimum_transit(first_country, second_country) else {
+                continue;
+            };
+            let elapsed = second.arrived.to_utc() - first.departed.to_utc();
+            if elapsed >= minimum {
                 continue;
             }
             let mut involved = [first_index, second_index];
@@ -241,7 +355,18 @@ pub fn impossible_travel(records: &[UsageRecord], min_transit: Duration) -> Vec<
             found.push(Indication::new(
                 Signal::ImpossibleTravel,
                 involved.to_vec(),
-                format!("{first_country} to {second_country} in {elapsed}"),
+                if elapsed.is_negative() {
+                    // The sessions overlap: the subscriber was in two countries
+                    // at once. Worth saying so, because no travel time explains
+                    // it and the shape is a cloned or shared SIM rather than an
+                    // improbably fast journey.
+                    format!(
+                        "{first_country} and {second_country} overlap by {}",
+                        -elapsed
+                    )
+                } else {
+                    format!("{first_country} to {second_country} in {elapsed}")
+                },
             ));
         }
     }
@@ -669,7 +794,7 @@ mod tests {
             ),
         ];
 
-        let found = impossible_travel(&records, Duration::hours(4));
+        let found = impossible_travel(&records, &UniformTransit::new(Duration::hours(4)));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].signal, Signal::ImpossibleTravel);
         assert_eq!(found[0].records, vec![0, 1]);
@@ -690,7 +815,7 @@ mod tests {
                 "310-260",
             ),
         ];
-        assert!(impossible_travel(&records, Duration::hours(4)).is_empty());
+        assert!(impossible_travel(&records, &UniformTransit::new(Duration::hours(4))).is_empty());
     }
 
     /// Two cells in one country minutes apart are ordinary, whatever the
@@ -709,7 +834,7 @@ mod tests {
                 "262-01",
             ),
         ];
-        assert!(impossible_travel(&records, Duration::hours(4)).is_empty());
+        assert!(impossible_travel(&records, &UniformTransit::new(Duration::hours(4))).is_empty());
     }
 
     /// Two subscribers in two countries are two subscribers. Reading a whole
@@ -730,13 +855,17 @@ mod tests {
         there.party = subscriber("imsi-262022222222222");
 
         assert!(
-            impossible_travel(&[here.clone(), there.clone()], Duration::hours(4)).is_empty(),
+            impossible_travel(
+                &[here.clone(), there.clone()],
+                &UniformTransit::new(Duration::hours(4))
+            )
+            .is_empty(),
             "different parties are never compared against each other"
         );
 
         // The same two records charged to one subscriber do fire.
         there.party = here.party.clone();
-        let found = impossible_travel(&[here, there], Duration::hours(4));
+        let found = impossible_travel(&[here, there], &UniformTransit::new(Duration::hours(4)));
         assert_eq!(found.len(), 1);
     }
 
@@ -768,7 +897,7 @@ mod tests {
             "310-260",
         ));
 
-        let found = impossible_travel(&records, Duration::hours(4));
+        let found = impossible_travel(&records, &UniformTransit::new(Duration::hours(4)));
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].records, vec![0, 7]);
     }
@@ -788,8 +917,11 @@ mod tests {
             "310-260",
         );
 
-        let forward = impossible_travel(&[a.clone(), b.clone()], Duration::hours(4));
-        let reversed = impossible_travel(&[b, a], Duration::hours(4));
+        let forward = impossible_travel(
+            &[a.clone(), b.clone()],
+            &UniformTransit::new(Duration::hours(4)),
+        );
+        let reversed = impossible_travel(&[b, a], &UniformTransit::new(Duration::hours(4)));
         assert_eq!(forward.len(), reversed.len());
         // The indices refer to each caller's own slice, so they differ; the
         // finding does not.
@@ -819,7 +951,7 @@ mod tests {
                 "262-02",
             ),
         ];
-        assert!(impossible_travel(&records, Duration::hours(4)).is_empty());
+        assert!(impossible_travel(&records, &UniformTransit::new(Duration::hours(4))).is_empty());
     }
 
     // ── Premium destination ──────────────────────────────────────────────────

@@ -1,0 +1,50 @@
+<script src="{{ get_url(path='elasticlunr.min.js') | safe }}" defer></script>
+<script src="{{ get_url(path='search_index.en.js') | safe }}" defer></script>
+<script>
+// Client-side search over the static index Zola builds. No server, no third
+// party, no tracking — the index is a file the page fetches once.
+window.addEventListener('load', function () {
+  var input = document.getElementById('q');
+  var list = document.getElementById('results');
+  if (!input || !list || !window.elasticlunr || !window.searchIndex) return;
+
+  var index = elasticlunr.Index.load(window.searchIndex);
+
+  function render(hits) {
+    list.innerHTML = '';
+    if (!hits.length) { list.hidden = true; return; }
+    hits.slice(0, 8).forEach(function (hit) {
+      var doc = index.documentStore.getDoc(hit.ref);
+      var li = document.createElement('li');
+      var a = document.createElement('a');
+      a.href = hit.ref;
+      a.textContent = doc.title;
+      li.appendChild(a);
+      list.appendChild(li);
+    });
+    list.hidden = false;
+  }
+
+  input.addEventListener('input', function () {
+    var term = input.value.trim();
+    if (term.length < 2) { list.hidden = true; return; }
+    render(index.search(term, { bool: 'AND', expand: true }));
+  });
+
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') { input.value = ''; list.hidden = true; }
+  });
+
+  document.addEventListener('click', function (e) {
+    if (!list.contains(e.target) && e.target !== input) list.hidden = true;
+  });
+
+  // `/` focuses search, the convention every documentation site shares.
+  document.addEventListener('keydown', function (e) {
+    if (e.key === '/' && document.activeElement !== input) {
+      e.preventDefault();
+      input.focus();
+    }
+  });
+});
+</script>

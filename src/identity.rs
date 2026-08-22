@@ -303,7 +303,16 @@ impl Msisdn {
 }
 
 impl Msisdn {
-    /// Decode from the Telephony BCD an `MSISDN` field carries on the wire.
+    /// Decode a run of Telephony BCD digits as a number.
+    ///
+    /// # This is not the decoder for a `servedMSISDN` field
+    ///
+    /// The number fields of a 3GPP charging record are `ISDN-AddressString`s,
+    /// whose **first octet is a qualifier, not a digit pair** — see
+    /// [`AddressString`]. Passing one here reads that octet as two swapped
+    /// digits and produces a valid-looking number belonging to a different
+    /// subscriber. Use [`AddressString::from_bytes`] for anything that arrived
+    /// in a record, and this only for a field you know is bare digits.
     ///
     /// # Errors
     ///
@@ -346,6 +355,296 @@ impl FromStr for Msisdn {
         let t = s.trim();
         let body = t.strip_prefix('+').unwrap_or(t);
         digits_in_range("Msisdn", MSISDN_FORMAT, body, 1, 15).map(Self)
+    }
+}
+
+// ── AddressString ────────────────────────────────────────────────────────────
+
+/// What kind of number an [`AddressString`] holds (3GPP TS 29.002, bits 7–5 of
+/// the first octet).
+///
+/// The distinction is load-bearing: `4930123456` is a Berlin number if it is
+/// international and a completely different subscriber if it is national
+/// significant. An [`Msisdn`] is international by definition, so converting one
+/// of the other kinds requires the caller's own dialling plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NatureOfAddress {
+    /// `000` — the element did not say.
+    Unknown,
+    /// `001` — a full E.164 number, country code first.
+    International,
+    /// `010` — national significant number: no country code.
+    NationalSignificant,
+    /// `011` — meaningful only inside the network that wrote it.
+    NetworkSpecific,
+    /// `100` — subscriber number: no country code and no area code.
+    Subscriber,
+    /// `110` — an abbreviated (short) code.
+    Abbreviated,
+    /// A value TS 29.002 reserves. Carried rather than rejected, so a decoder
+    /// can report it instead of silently reading the digits as something else.
+    Reserved(u8),
+}
+
+impl NatureOfAddress {
+    /// Decode the three-bit field.
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Self {
+        match bits & 0b111 {
+            0 => Self::Unknown,
+            1 => Self::International,
+            2 => Self::NationalSignificant,
+            3 => Self::NetworkSpecific,
+            4 => Self::Subscriber,
+            6 => Self::Abbreviated,
+            other => Self::Reserved(other),
+        }
+    }
+
+    /// Encode to the three-bit field.
+    #[must_use]
+    pub const fn to_bits(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::International => 1,
+            Self::NationalSignificant => 2,
+            Self::NetworkSpecific => 3,
+            Self::Subscriber => 4,
+            Self::Abbreviated => 6,
+            Self::Reserved(other) => other & 0b111,
+        }
+    }
+
+    /// The canonical string form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "UNKNOWN",
+            Self::International => "INTERNATIONAL",
+            Self::NationalSignificant => "NATIONAL_SIGNIFICANT",
+            Self::NetworkSpecific => "NETWORK_SPECIFIC",
+            Self::Subscriber => "SUBSCRIBER",
+            Self::Abbreviated => "ABBREVIATED",
+            Self::Reserved(_) => "RESERVED",
+        }
+    }
+}
+
+impl fmt::Display for NatureOfAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Which plan an [`AddressString`]'s digits are numbered under (3GPP TS 29.002,
+/// bits 4–1 of the first octet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum NumberingPlan {
+    /// `0000` — the element did not say.
+    Unknown,
+    /// `0001` — ITU-T E.164, the plan an [`Msisdn`] belongs to.
+    Isdn,
+    /// `0011` — X.121 data.
+    Data,
+    /// `0100` — F.69 telex.
+    Telex,
+    /// `0110` — ITU-T E.212 land mobile, which is where an [`Imsi`] lives.
+    LandMobile,
+    /// `1000` — a national numbering plan.
+    National,
+    /// `1001` — a private plan.
+    Private,
+    /// A value TS 29.002 reserves.
+    Reserved(u8),
+}
+
+impl NumberingPlan {
+    /// Decode the four-bit field.
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Self {
+        match bits & 0x0F {
+            0 => Self::Unknown,
+            1 => Self::Isdn,
+            3 => Self::Data,
+            4 => Self::Telex,
+            6 => Self::LandMobile,
+            8 => Self::National,
+            9 => Self::Private,
+            other => Self::Reserved(other),
+        }
+    }
+
+    /// Encode to the four-bit field.
+    #[must_use]
+    pub const fn to_bits(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Isdn => 1,
+            Self::Data => 3,
+            Self::Telex => 4,
+            Self::LandMobile => 6,
+            Self::National => 8,
+            Self::Private => 9,
+            Self::Reserved(other) => other & 0x0F,
+        }
+    }
+
+    /// The canonical string form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "UNKNOWN",
+            Self::Isdn => "ISDN",
+            Self::Data => "DATA",
+            Self::Telex => "TELEX",
+            Self::LandMobile => "LAND_MOBILE",
+            Self::National => "NATIONAL",
+            Self::Private => "PRIVATE",
+            Self::Reserved(_) => "RESERVED",
+        }
+    }
+}
+
+impl fmt::Display for NumberingPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The `AddressString` of 3GPP TS 29.002 §17.7.8: a leading qualifier octet,
+/// then TBCD digits.
+///
+/// # A `servedMSISDN` is not a bare TBCD field
+///
+/// The number fields of a charging record — `servedMSISDN`, `calledNumber`,
+/// `callingNumber`, `recordingEntity` — are `ISDN-AddressString`s, and the
+/// first octet is **not** a digit pair. It carries an extension bit, a
+/// [`NatureOfAddress`] and a [`NumberingPlan`].
+///
+/// Handing those octets straight to [`Msisdn::from_tbcd`] reads that octet as
+/// two swapped digits and prepends them to the number. The result is a
+/// well-formed MSISDN belonging to somebody else — the field parses, the record
+/// validates, and the usage is billed to the wrong subscriber. It is the single
+/// most common decoding error in this area, and it is invisible without a
+/// reference decode to compare against.
+///
+/// ```rust
+/// use mediation::{AddressString, Msisdn, NatureOfAddress, NumberingPlan};
+///
+/// // servedMSISDN as it arrives: 0x91 = international, E.164, then TBCD.
+/// let field = [0x91, 0x94, 0x71, 0x10, 0x32, 0x54, 0x76];
+///
+/// let address = AddressString::from_bytes(&field).unwrap();
+/// assert_eq!(address.nature(), NatureOfAddress::International);
+/// assert_eq!(address.plan(), NumberingPlan::Isdn);
+/// assert_eq!(address.to_msisdn().unwrap().to_string(), "491701234567");
+///
+/// // Reading the same octets as raw TBCD invents two leading digits, and the
+/// // result is a perfectly valid number belonging to somebody else.
+/// assert_eq!(Msisdn::from_tbcd(&field).unwrap().to_string(), "19491701234567");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AddressString {
+    nature: NatureOfAddress,
+    plan: NumberingPlan,
+    digits: DigitString,
+}
+
+impl AddressString {
+    /// An address from its parts.
+    #[must_use]
+    pub const fn new(nature: NatureOfAddress, plan: NumberingPlan, digits: DigitString) -> Self {
+        Self {
+            nature,
+            plan,
+            digits,
+        }
+    }
+
+    /// What kind of number the digits are.
+    #[must_use]
+    pub const fn nature(self) -> NatureOfAddress {
+        self.nature
+    }
+
+    /// The plan the digits are numbered under.
+    #[must_use]
+    pub const fn plan(self) -> NumberingPlan {
+        self.plan
+    }
+
+    /// The digits, without the qualifier octet.
+    #[must_use]
+    pub const fn digits(self) -> DigitString {
+        self.digits
+    }
+
+    /// Decode the qualifier octet and the TBCD digits that follow it.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] for an empty field, for a qualifier octet with the
+    /// extension bit clear — TS 29.002 fixes it at 1, and a zero there means
+    /// the field is not an `AddressString` at all — or for malformed TBCD.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let (qualifier, rest) = bytes
+            .split_first()
+            .ok_or_else(|| DecodeError::new(0, "a qualifier octet"))?;
+        if qualifier & 0x80 == 0 {
+            return Err(DecodeError::new(
+                0,
+                "a qualifier octet with the extension bit set",
+            ));
+        }
+        let digits =
+            DigitString::from_tbcd(rest).map_err(|e| DecodeError::new(1 + e.at(), e.expected()))?;
+        Ok(Self {
+            nature: NatureOfAddress::from_bits((qualifier >> 4) & 0b111),
+            plan: NumberingPlan::from_bits(*qualifier),
+            digits,
+        })
+    }
+
+    /// Encode to the qualifier octet plus TBCD, writing into `out`.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] when `out` is too short.
+    pub fn to_bytes(self, out: &mut [u8]) -> Result<usize, DecodeError> {
+        let needed = 1 + self.digits.len().div_ceil(2);
+        if out.len() < needed {
+            return Err(DecodeError::new(0, "a buffer of 1 + len()/2 octets"));
+        }
+        out[0] = 0x80 | (self.nature.to_bits() << 4) | self.plan.to_bits();
+        self.digits.to_tbcd(&mut out[1..needed])?;
+        Ok(needed)
+    }
+
+    /// The address as an [`Msisdn`], when it is one.
+    ///
+    /// `None` unless the nature of address is
+    /// [`International`](NatureOfAddress::International) and the digits fit
+    /// E.164. A national or network-specific number is **not** converted:
+    /// turning one into an international number needs the operator's dialling
+    /// plan, which this crate does not hold, and prefixing a country code by
+    /// assumption is how a call is settled against the wrong partner.
+    #[must_use]
+    pub fn to_msisdn(self) -> Option<Msisdn> {
+        if self.nature != NatureOfAddress::International {
+            return None;
+        }
+        if self.digits.is_empty() || self.digits.len() > 15 {
+            return None;
+        }
+        Some(Msisdn(self.digits))
+    }
+}
+
+impl fmt::Display for AddressString {
+    /// Writes `NATURE/PLAN:digits`, so the qualifier never disappears from a
+    /// log line the way it disappears from the digits.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}:{}", self.nature, self.plan, self.digits)
     }
 }
 
@@ -644,6 +943,18 @@ impl fmt::Display for Supi {
     }
 }
 
+impl From<Imsi> for Supi {
+    fn from(imsi: Imsi) -> Self {
+        Self::Imsi(imsi)
+    }
+}
+
+impl From<Nai> for Supi {
+    fn from(nai: Nai) -> Self {
+        Self::NetworkSpecific(nai)
+    }
+}
+
 /// The shape [`Supi`] accepts, as rendered in a [`ParseError`].
 const SUPI_FORMAT: &str = "imsi-<digits> or nai-<user@realm>";
 
@@ -668,16 +979,22 @@ impl FromStr for Supi {
 pub struct Nai(String);
 
 impl Nai {
-    /// The user part, before the `@`.
+    /// The user part, before the **last** `@`.
+    ///
+    /// The last rather than the first: RFC 7542 admits a `@` inside a quoted
+    /// user part, and splitting at the first one then puts half the username
+    /// into the realm — which routes the request to a realm that does not
+    /// exist. Splitting at the last is the only reading that is right for both
+    /// shapes.
     #[must_use]
     pub fn user(&self) -> &str {
-        self.0.split_once('@').map_or(&self.0[..], |(u, _)| u)
+        self.0.rsplit_once('@').map_or(&self.0[..], |(u, _)| u)
     }
 
-    /// The realm part, after the `@`.
+    /// The realm part, after the last `@`.
     #[must_use]
     pub fn realm(&self) -> &str {
-        self.0.split_once('@').map_or("", |(_, r)| r)
+        self.0.rsplit_once('@').map_or("", |(_, r)| r)
     }
 }
 
@@ -693,7 +1010,7 @@ impl FromStr for Nai {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let err = || ParseError::format("Nai", s, "a network access identifier such as user@realm");
         let t = s.trim();
-        let (user, realm) = t.split_once('@').ok_or_else(err)?;
+        let (user, realm) = t.rsplit_once('@').ok_or_else(err)?;
         if user.is_empty() || realm.is_empty() || t.contains(char::is_whitespace) {
             return Err(err());
         }
@@ -731,6 +1048,12 @@ impl fmt::Display for Gpsi {
             Self::Msisdn(m) => write!(f, "msisdn-{m}"),
             Self::External(n) => write!(f, "extid-{n}"),
         }
+    }
+}
+
+impl From<Msisdn> for Gpsi {
+    fn from(msisdn: Msisdn) -> Self {
+        Self::Msisdn(msisdn)
     }
 }
 
@@ -796,6 +1119,18 @@ impl fmt::Display for Pei {
     }
 }
 
+impl From<Imei> for Pei {
+    fn from(imei: Imei) -> Self {
+        Self::Imei(imei)
+    }
+}
+
+impl From<Imeisv> for Pei {
+    fn from(imeisv: Imeisv) -> Self {
+        Self::Imeisv(imeisv)
+    }
+}
+
 /// The shape [`Pei`] accepts, as rendered in a [`ParseError`].
 const PEI_FORMAT: &str = "imei-<15 digits> or imeisv-<16 digits>";
 
@@ -818,6 +1153,51 @@ impl FromStr for Pei {
 
 // ── Suci ─────────────────────────────────────────────────────────────────────
 
+/// The Routing Indicator of a [`Suci`]: one to four decimal digits.
+///
+/// Assigned by the home operator and provisioned on the USIM. It is what lets a
+/// serving network route a concealed identity to the right AUSF and UDM without
+/// being able to read it, and it is part of the identity's canonical string —
+/// leaving it out produces a value that no 5G core will accept back.
+///
+/// Leading zeros are significant, exactly as in an [`Mnc`](crate::Mnc): `0` and
+/// `0000` are different indicators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutingIndicator(DigitString);
+
+impl RoutingIndicator {
+    /// An indicator from its digits. `None` for an empty run or more than four.
+    #[must_use]
+    pub fn new(digits: DigitString) -> Option<Self> {
+        if digits.is_empty() || digits.len() > 4 {
+            None
+        } else {
+            Some(Self(digits))
+        }
+    }
+
+    /// The digits, with their leading zeros.
+    #[must_use]
+    pub const fn digits(self) -> DigitString {
+        self.0
+    }
+}
+
+impl fmt::Display for RoutingIndicator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl FromStr for RoutingIndicator {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || ParseError::format("RoutingIndicator", s, "one to four decimal digits");
+        Self::new(DigitString::parse(s.trim(), 4).ok_or_else(err)?).ok_or_else(err)
+    }
+}
+
 /// A 3GPP TS 23.003 Subscription Concealed Identifier.
 ///
 /// # Not an aggregation key
@@ -830,19 +1210,91 @@ impl FromStr for Pei {
 ///
 /// Resolving a SUCI to a [`Supi`] is the network's job. A record that only ever
 /// carried a SUCI is unattributable and should be dispositioned as such.
+///
+/// # The canonical string has seven fields, in one order
+///
+/// TS 23.003 §2.2B:
+///
+/// ```text
+/// suci-<supi type>-<MCC>-<MNC>-<routing indicator>-<scheme id>-<key id>-<output>
+/// ```
+///
+/// The routing indicator is easy to leave out and the scheme identifier and the
+/// key identifier are easy to swap, because both are small integers that look
+/// alike in a debug print. A value spelled either way round is rejected by
+/// every 5G core it is handed to, and only at the point of use.
+///
+/// ```rust
+/// use mediation::Suci;
+///
+/// let suci: Suci = "suci-0-262-02-0678-1-27-0072b7d4c1e8".parse().unwrap();
+/// assert_eq!(suci.home_network.to_string(), "262-02");
+/// assert_eq!(suci.routing_indicator.to_string(), "0678");
+/// assert_eq!(suci.protection_scheme, 1);
+/// assert_eq!(suci.public_key_id, 27);
+/// assert_eq!(suci.to_string(), "suci-0-262-02-0678-1-27-0072b7d4c1e8");
+/// ```
+///
+/// Only the IMSI-based form (SUPI type 0) is modelled. The network-specific
+/// form is an NAI and belongs to [`Nai`]; giving one type both shapes would
+/// mean two thirds of its fields were absent for one of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Suci {
     /// The home network the concealed identity belongs to.
     pub home_network: PlmnId,
-    /// The protection scheme identifier: `0` is the null scheme.
+    /// The routing indicator that steers signalling to the right AUSF and UDM.
+    pub routing_indicator: RoutingIndicator,
+    /// The protection scheme identifier: `0` is the null scheme, `1` profile A,
+    /// `2` profile B. Four bits, so `0`…`15`.
     pub protection_scheme: u8,
-    /// The home network public key identifier used for concealment.
+    /// The home network public key identifier used for concealment, `0`…`255`.
+    ///
+    /// Zero is reserved for the null scheme.
     pub public_key_id: u8,
-    /// The concealed output, as hex.
+    /// The concealed output, lower-case hex.
+    ///
+    /// Under the null scheme this is the MSIN in the clear, which is why a
+    /// null-scheme SUCI is no more anonymous than the IMSI it contains.
     pub scheme_output: String,
 }
 
 impl Suci {
+    /// The SUPI type this crate models: `0`, the IMSI form.
+    pub const IMSI_SUPI_TYPE: u8 = 0;
+
+    /// The protection scheme identifier that means *no concealment at all*.
+    pub const NULL_SCHEME: u8 = 0;
+
+    /// A concealed identity from its parts.
+    ///
+    /// `None` for a protection scheme above 15 — the field is four bits — or a
+    /// scheme output that is not a non-empty run of hex digits. Both are
+    /// rejected rather than carried, because a SUCI that cannot be spelled
+    /// canonically cannot be handed back to a core network.
+    #[must_use]
+    pub fn new(
+        home_network: PlmnId,
+        routing_indicator: RoutingIndicator,
+        protection_scheme: u8,
+        public_key_id: u8,
+        scheme_output: &str,
+    ) -> Option<Self> {
+        if protection_scheme > 0x0F {
+            return None;
+        }
+        let output = scheme_output.trim();
+        if output.is_empty() || !output.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(Self {
+            home_network,
+            routing_indicator,
+            protection_scheme,
+            public_key_id,
+            scheme_output: output.to_ascii_lowercase(),
+        })
+    }
+
     /// `true` for the null protection scheme, where the output is a plain MSIN.
     ///
     /// Even then the value is not an aggregation key here: a null-scheme SUCI
@@ -850,22 +1302,59 @@ impl Suci {
     /// this form.
     #[must_use]
     pub fn is_null_scheme(&self) -> bool {
-        self.protection_scheme == 0
+        self.protection_scheme == Self::NULL_SCHEME
     }
 }
 
 impl fmt::Display for Suci {
-    /// Writes the 3GPP form: `suci-0-262-02-<pki>-<scheme>-<output>`.
+    /// Writes the TS 23.003 §2.2B form:
+    /// `suci-0-<MCC>-<MNC>-<RID>-<scheme>-<key>-<output>`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "suci-0-{}-{}-{}-{}-{}",
+            "suci-{}-{}-{}-{}-{}-{}-{}",
+            Self::IMSI_SUPI_TYPE,
             self.home_network.mcc(),
             self.home_network.mnc(),
-            self.public_key_id,
+            self.routing_indicator,
             self.protection_scheme,
+            self.public_key_id,
             self.scheme_output
         )
+    }
+}
+
+/// The shape [`Suci`] accepts, as rendered in a [`ParseError`].
+const SUCI_FORMAT: &str = "suci-0-<MCC>-<MNC>-<routing indicator>-<scheme id>-<key id>-<hex output>, \
+     such as suci-0-262-02-0678-1-27-0072b7d4c1e8";
+
+impl FromStr for Suci {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || ParseError::format("Suci", s, SUCI_FORMAT);
+        let rest = s.trim().strip_prefix("suci-").ok_or_else(err)?;
+        let fields: Vec<&str> = rest.split('-').collect();
+        let [supi_type, mcc, mnc, rid, scheme, key, output] = fields[..] else {
+            return Err(err());
+        };
+        if supi_type != "0" {
+            // Only the IMSI form has an MCC and MNC to read; the NAI form is a
+            // different shape entirely and is not silently coerced into this one.
+            return Err(err());
+        }
+        let plmn = PlmnId::new(
+            mcc.parse().map_err(|_| err())?,
+            mnc.parse().map_err(|_| err())?,
+        );
+        Self::new(
+            plmn,
+            rid.parse().map_err(|_| err())?,
+            scheme.parse::<u8>().map_err(|_| err())?,
+            key.parse::<u8>().map_err(|_| err())?,
+            output,
+        )
+        .ok_or_else(err)
     }
 }
 
@@ -873,7 +1362,10 @@ impl fmt::Display for Suci {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{Gpsi, Iccid, Imei, Imeisv, Imsi, Msisdn, Nai, Pei, Supi, Tac};
+    use super::{
+        AddressString, DigitString, Gpsi, Iccid, Imei, Imeisv, Imsi, Msisdn, Nai, NatureOfAddress,
+        NumberingPlan, Pei, RoutingIndicator, Suci, Supi, Tac,
+    };
     use serde::de::{self, Visitor};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::fmt;
@@ -913,6 +1405,107 @@ mod serde_impl {
     string_serde!(Supi, "a SUPI such as \"imsi-262021234567890\"");
     string_serde!(Gpsi, "a GPSI such as \"msisdn-491701234567\"");
     string_serde!(Pei, "a PEI such as \"imei-490154203237518\"");
+    string_serde!(RoutingIndicator, "a routing indicator such as \"0678\"");
+
+    /// The two qualifier fields are their codes, not their bit patterns: a
+    /// stored `1` says nothing about whether it was a nature of address or a
+    /// numbering plan, and the two are adjacent fields of the same octet.
+    macro_rules! qualifier_serde {
+        ($ty:ty, $reserved:ident, $expecting:literal, $($code:literal => $variant:ident),* $(,)?) => {
+            impl Serialize for $ty {
+                fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                    match self {
+                        // A reserved value keeps its number, because that is
+                        // the only thing that identifies it.
+                        Self::$reserved(bits) => {
+                            serializer.collect_str(&format_args!("RESERVED_{bits}"))
+                        }
+                        $(Self::$variant => serializer.serialize_str($code),)*
+                    }
+                }
+            }
+
+            impl<'de> Deserialize<'de> for $ty {
+                fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                    struct V;
+                    impl Visitor<'_> for V {
+                        type Value = $ty;
+                        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                            f.write_str($expecting)
+                        }
+                        fn visit_str<E: de::Error>(self, v: &str) -> Result<$ty, E> {
+                            match v {
+                                $($code => Ok(<$ty>::$variant),)*
+                                other => other
+                                    .strip_prefix("RESERVED_")
+                                    .and_then(|bits| bits.parse::<u8>().ok())
+                                    .map(<$ty>::$reserved)
+                                    .ok_or_else(|| de::Error::custom(format!("unknown code {v:?}"))),
+                            }
+                        }
+                    }
+                    deserializer.deserialize_str(V)
+                }
+            }
+        };
+    }
+
+    qualifier_serde!(
+        NatureOfAddress,
+        Reserved,
+        "a nature-of-address code such as \"INTERNATIONAL\"",
+        "UNKNOWN" => Unknown,
+        "INTERNATIONAL" => International,
+        "NATIONAL_SIGNIFICANT" => NationalSignificant,
+        "NETWORK_SPECIFIC" => NetworkSpecific,
+        "SUBSCRIBER" => Subscriber,
+        "ABBREVIATED" => Abbreviated,
+    );
+
+    qualifier_serde!(
+        NumberingPlan,
+        Reserved,
+        "a numbering-plan code such as \"ISDN\"",
+        "UNKNOWN" => Unknown,
+        "ISDN" => Isdn,
+        "DATA" => Data,
+        "TELEX" => Telex,
+        "LAND_MOBILE" => LandMobile,
+        "NATIONAL" => National,
+        "PRIVATE" => Private,
+    );
+
+    /// The qualifier and the digits, named — never the digits alone, which is
+    /// the loss this type exists to prevent.
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename = "AddressString")]
+    struct AddressRepr {
+        nature: NatureOfAddress,
+        plan: NumberingPlan,
+        digits: DigitString,
+    }
+
+    impl Serialize for AddressString {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            AddressRepr {
+                nature: self.nature(),
+                plan: self.plan(),
+                digits: self.digits(),
+            }
+            .serialize(serializer)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for AddressString {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let r = AddressRepr::deserialize(deserializer)?;
+            Ok(AddressString::new(r.nature, r.plan, r.digits))
+        }
+    }
+    string_serde!(
+        Suci,
+        "a SUCI such as \"suci-0-262-02-0678-1-27-0072b7d4c1e8\""
+    );
 
     /// Write-only: a [`Tac`] is derived from an equipment identity and has no
     /// parser of its own.
@@ -1118,13 +1711,49 @@ mod tests {
         //   let _: std::collections::BTreeSet<Suci>;
         assert_not_key::<Suci>();
 
-        let suci = Suci {
-            home_network: "262-02".parse().unwrap(),
-            protection_scheme: 0,
-            public_key_id: 0,
-            scheme_output: "1234567890".into(),
-        };
+        let suci = Suci::new(
+            "262-02".parse().unwrap(),
+            "0".parse().unwrap(),
+            Suci::NULL_SCHEME,
+            0,
+            "1234567890",
+        )
+        .unwrap();
         assert!(suci.is_null_scheme());
-        assert_eq!(suci.to_string(), "suci-0-262-02-0-0-1234567890");
+        assert_eq!(suci.to_string(), "suci-0-262-02-0-0-0-1234567890");
+    }
+
+    /// The field order the specification fixes. A value spelled with the scheme
+    /// and key identifiers the other way round, or with the routing indicator
+    /// left out, is rejected by every core it reaches — and only there.
+    #[test]
+    fn a_suci_round_trips_through_its_canonical_string() {
+        let canonical = "suci-0-262-02-0678-1-27-0072b7d4c1e8";
+        let suci: Suci = canonical.parse().unwrap();
+
+        assert_eq!(suci.routing_indicator.to_string(), "0678");
+        assert_eq!(suci.protection_scheme, 1);
+        assert_eq!(suci.public_key_id, 27);
+        assert_eq!(suci.to_string(), canonical);
+
+        // Leading zeros in the routing indicator are part of the value.
+        let short: Suci = "suci-0-262-02-678-1-27-00ab".parse().unwrap();
+        assert_ne!(short.routing_indicator, suci.routing_indicator);
+    }
+
+    #[test]
+    fn a_suci_rejects_what_it_cannot_spell_back() {
+        for s in [
+            "",
+            "suci-0-262-02-0678-1-27",         // six fields, not seven
+            "suci-1-262-02-0678-1-27-00ab",    // the NAI form is not this shape
+            "suci-0-262-02-06789-1-27-00ab",   // five-digit routing indicator
+            "suci-0-262-02-0678-16-27-00ab",   // scheme identifier is four bits
+            "suci-0-262-02-0678-1-27-",        // no scheme output
+            "suci-0-262-02-0678-1-27-not-hex", // and it must be hex
+            "suci-0-262-2-0678-1-27-00ab",     // an MNC keeps its leading zero
+        ] {
+            assert!(s.parse::<Suci>().is_err(), "{s:?} must not parse");
+        }
     }
 }

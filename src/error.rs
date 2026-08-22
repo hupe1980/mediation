@@ -53,6 +53,15 @@ pub struct ParseError {
 }
 
 impl ParseError {
+    /// How much of a rejected input is kept, in bytes.
+    ///
+    /// Every value this crate parses is far shorter than this — a 20-digit
+    /// ICCID is the longest. The bound is about what a *caller* may hand over:
+    /// a parser fed a megabyte of junk would otherwise copy the megabyte into
+    /// the error and carry it up the stack, once per rejected field. It also
+    /// bounds how much subscriber data an error can put into a log line.
+    pub const MAX_INPUT: usize = 128;
+
     /// A value rejected against a closed set of codes.
     pub(crate) fn one_of(
         type_name: &'static str,
@@ -61,7 +70,7 @@ impl ParseError {
     ) -> Self {
         Self {
             type_name,
-            input: input.to_owned(),
+            input: Self::clip(input),
             expected: Expected::OneOf(codes),
         }
     }
@@ -70,9 +79,24 @@ impl ParseError {
     pub(crate) fn format(type_name: &'static str, input: &str, shape: &'static str) -> Self {
         Self {
             type_name,
-            input: input.to_owned(),
+            input: Self::clip(input),
             expected: Expected::Format(shape),
         }
+    }
+
+    /// Keep at most [`MAX_INPUT`](Self::MAX_INPUT) bytes, cut on a character
+    /// boundary and marked so a reader knows it is not the whole value.
+    fn clip(input: &str) -> String {
+        if input.len() <= Self::MAX_INPUT {
+            return input.to_owned();
+        }
+        let mut end = Self::MAX_INPUT;
+        while end > 0 && !input.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut clipped = input[..end].to_owned();
+        clipped.push('…');
+        clipped
     }
 
     /// The type that rejected the input, e.g. `"Imsi"`.
@@ -84,7 +108,10 @@ impl ParseError {
         self.type_name
     }
 
-    /// The input that was rejected, verbatim.
+    /// The input that was rejected, up to [`MAX_INPUT`](Self::MAX_INPUT) bytes.
+    ///
+    /// A longer input is cut on a character boundary and ends with `…`, so a
+    /// truncated value never reads as a complete one.
     ///
     /// Note that this is subscriber-identifying data for the identifier types.
     /// Logging a [`ParseError`] verbatim writes a malformed IMSI or MSISDN to
@@ -124,7 +151,7 @@ impl std::error::Error for ParseError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Imsi, PlmnId, ServiceDomain};
+    use crate::{Imei, Imsi, PlmnId, ServiceDomain};
 
     #[test]
     fn message_names_the_type_and_the_input() {
@@ -135,6 +162,25 @@ mod tests {
         assert!(msg.contains("ServiceDomain"), "{msg}");
         assert!(msg.contains("TELEPATHY"), "{msg}");
         assert!(msg.contains("VOICE"), "{msg}");
+    }
+
+    /// A parser fed a megabyte of junk must not carry the megabyte up the
+    /// stack — nor put it in a log line, where it is also personal data.
+    #[test]
+    fn a_rejected_input_is_bounded() {
+        let huge = "9".repeat(10_000);
+        let err = huge.parse::<Imsi>().unwrap_err();
+        assert!(err.input().len() <= ParseError::MAX_INPUT + '…'.len_utf8());
+        assert!(err.input().ends_with('…'), "{}", err.input());
+
+        // Anything of a sane length survives untouched.
+        let err = "26202123456789".parse::<Imei>().unwrap_err();
+        assert_eq!(err.input(), "26202123456789");
+
+        // The cut lands on a character boundary, whatever the input holds.
+        let multibyte = "é".repeat(1_000);
+        let err = multibyte.parse::<Imsi>().unwrap_err();
+        assert!(err.input().ends_with('…'));
     }
 
     #[test]

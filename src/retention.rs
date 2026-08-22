@@ -46,9 +46,40 @@
 //! // A call from 1 July is kept six months past the August invoice, not past
 //! // the call.
 //! let event = datetime!(2026-07-01 12:00 UTC);
-//! assert!(policy.deadline() > event + Duration::days(183));
+//! assert!(policy.deadline().unwrap() > event + Duration::days(183));
 //! assert!(!policy.is_expired(datetime!(2027-01-01 00:00 UTC)));
 //! assert!(policy.is_expired(datetime!(2027-03-01 00:00 UTC)));
+//! ```
+//!
+//! # A hold has no deadline, and that is not the same as no policy
+//!
+//! A statutory period has a length. A dispute does not — it is over when it is
+//! resolved, and no arithmetic produces that instant. Giving a hold a nominal
+//! duration anyway means deletion becomes permitted the moment that nominal
+//! period runs out, while the dispute is still open, which is the one retention
+//! error that cannot be undone.
+//!
+//! So [`RetentionPolicy::until_released`] builds a policy with no deadline, and
+//! [`RetentionSchedule::deletion`] has **three** answers rather than an
+//! `Option`: nothing requires this to be kept, keep it until this instant, or
+//! keep it until somebody says stop. The first and the third are opposites, and
+//! an `Option<OffsetDateTime>` spells them the same way.
+//!
+//! ```rust
+//! use mediation::{Deletion, RetentionBasis, RetentionPolicy, RetentionSchedule};
+//! use time::macros::datetime;
+//!
+//! let dispute = RetentionPolicy::until_released(RetentionBasis::DisputeHold {
+//!     raised_at: datetime!(2026-08-10 00:00 UTC),
+//! })
+//! .unwrap();
+//!
+//! let schedule: RetentionSchedule = vec![dispute].into_iter().collect();
+//! assert!(schedule.deletion().is_blocked());
+//! assert!(!schedule.is_deletable(datetime!(2099-01-01 00:00 UTC)));
+//!
+//! // Nothing at all is the opposite answer, not the same one.
+//! assert_eq!(RetentionSchedule::new().deletion(), Deletion::Immediate);
 //! ```
 
 use std::fmt;
@@ -143,11 +174,18 @@ impl fmt::Display for RetentionBasis {
 
 // ── RetentionPolicy ──────────────────────────────────────────────────────────
 
-/// A basis and how long it runs.
+/// A basis and how long it runs — or that it runs until somebody says stop.
+///
+/// A statutory period has a length. A **hold** does not: a dispute is over when
+/// it is resolved, and no date can be computed for that. Modelling the second
+/// as the first is how evidence gets deleted while a customer is still
+/// contesting the bill it supports, so the two are different constructors and
+/// [`deadline`](Self::deadline) has no answer for a hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPolicy {
     basis: RetentionBasis,
-    duration: Duration,
+    /// `None` for an open hold: kept until released, with no computable date.
+    duration: Option<Duration>,
 }
 
 impl RetentionPolicy {
@@ -159,7 +197,53 @@ impl RetentionPolicy {
     #[must_use]
     pub const fn new(basis: RetentionBasis, duration: Duration) -> Option<Self> {
         if duration.is_positive() {
-            Some(Self { basis, duration })
+            Some(Self {
+                basis,
+                duration: Some(duration),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// A hold that runs until it is released, with no computable deadline.
+    ///
+    /// `None` for a basis that is not a hold — see
+    /// [`RetentionBasis::is_a_hold`]. A statutory period without an end is not
+    /// a retention policy but an intention to keep personal data forever, and
+    /// making it expressible would let one slip in beside three lawful ones.
+    ///
+    /// A schedule carrying one of these is never deletable. Releasing the hold
+    /// is done by rebuilding the schedule without it, because a hold that could
+    /// be lifted in place would leave no evidence that it had ever applied.
+    ///
+    /// ```rust
+    /// use mediation::{RetentionBasis, RetentionPolicy, RetentionSchedule};
+    /// use time::{Duration, macros::datetime};
+    ///
+    /// let billing = RetentionPolicy::new(
+    ///     RetentionBasis::BillingTdddg10 { invoice_dispatched_at: datetime!(2026-08-05 0:00 UTC) },
+    ///     Duration::days(183),
+    /// ).unwrap();
+    /// let dispute = RetentionPolicy::until_released(
+    ///     RetentionBasis::DisputeHold { raised_at: datetime!(2026-08-10 0:00 UTC) },
+    /// ).unwrap();
+    ///
+    /// // The billing period runs out; the dispute does not.
+    /// let long_after = datetime!(2030-01-01 0:00 UTC);
+    /// assert!(billing.is_expired(long_after));
+    /// assert!(!dispute.is_expired(long_after));
+    ///
+    /// let schedule: RetentionSchedule = vec![billing, dispute].into_iter().collect();
+    /// assert!(!schedule.is_deletable(long_after), "a hold has no expiry");
+    /// ```
+    #[must_use]
+    pub const fn until_released(basis: RetentionBasis) -> Option<Self> {
+        if basis.is_a_hold() {
+            Some(Self {
+                basis,
+                duration: None,
+            })
         } else {
             None
         }
@@ -171,40 +255,55 @@ impl RetentionPolicy {
         self.basis
     }
 
-    /// How long the period runs.
+    /// How long the period runs, or `None` for a hold that runs until released.
     #[must_use]
-    pub const fn duration(self) -> Duration {
+    pub const fn duration(self) -> Option<Duration> {
         self.duration
     }
 
-    /// The instant after which the record must be deleted.
+    /// `true` when this policy has no computable end.
     #[must_use]
-    pub fn deadline(self) -> OffsetDateTime {
-        self.basis.anchor() + self.duration
+    pub const fn is_open(self) -> bool {
+        self.duration.is_none()
+    }
+
+    /// The instant after which the record must be deleted.
+    ///
+    /// `None` for an open hold. That is not "no deadline, so delete freely" —
+    /// it is the opposite, and [`is_expired`](Self::is_expired) says so.
+    #[must_use]
+    pub fn deadline(self) -> Option<OffsetDateTime> {
+        Some(self.basis.anchor() + self.duration?)
     }
 
     /// `true` when the record must already have been deleted at `as_of`.
+    ///
+    /// Always `false` for an open hold: a dispute is over when it is resolved,
+    /// and no instant establishes that.
     ///
     /// `as_of` is supplied, never sampled — replaying an archive must reproduce
     /// the verdicts it originally received, not today's.
     #[must_use]
     pub fn is_expired(self, as_of: OffsetDateTime) -> bool {
-        as_of > self.deadline()
+        self.deadline().is_some_and(|deadline| as_of > deadline)
     }
 
     /// How long remains before deletion, or how far past it is.
     ///
     /// Negative once the deadline has passed, so a report can say *how* overdue
-    /// a deletion is rather than merely that it is.
+    /// a deletion is rather than merely that it is. `None` for an open hold.
     #[must_use]
-    pub fn remaining(self, as_of: OffsetDateTime) -> Duration {
-        self.deadline() - as_of
+    pub fn remaining(self, as_of: OffsetDateTime) -> Option<Duration> {
+        Some(self.deadline()? - as_of)
     }
 }
 
 impl fmt::Display for RetentionPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} for {}", self.basis, self.duration)
+        match self.duration {
+            Some(duration) => write!(f, "{} for {duration}", self.basis),
+            None => write!(f, "{} until released", self.basis),
+        }
     }
 }
 
@@ -254,29 +353,62 @@ impl RetentionSchedule {
         self.0.len()
     }
 
-    /// The latest deadline any policy imposes.
+    /// What the schedule permits, and when.
     ///
-    /// `None` when no policy applies.
+    /// The one call a deletion path should make. Three answers, because there
+    /// are three situations and collapsing any two of them deletes something it
+    /// should not — see [`Deletion`].
     #[must_use]
-    pub fn governing_deadline(&self) -> Option<OffsetDateTime> {
-        self.0.iter().map(|p| p.deadline()).max()
+    pub fn deletion(&self) -> Deletion {
+        // A hold outranks every dated policy, however far off that date is:
+        // "keep until somebody says stop" has no instant to compare against.
+        if let Some(open) = self.0.iter().find(|p| p.is_open()) {
+            return Deletion::Blocked(open.basis());
+        }
+        match self.0.iter().filter_map(|p| p.deadline()).max() {
+            Some(deadline) => Deletion::After(deadline),
+            None => Deletion::Immediate,
+        }
     }
 
-    /// The policy whose deadline governs.
+    /// The latest deadline any dated policy imposes.
+    ///
+    /// `None` when no policy applies **and** when a hold blocks deletion, which
+    /// are opposite situations — ask [`deletion`](Self::deletion) instead
+    /// wherever the difference matters.
+    #[must_use]
+    pub fn governing_deadline(&self) -> Option<OffsetDateTime> {
+        self.0.iter().filter_map(|p| p.deadline()).max()
+    }
+
+    /// The policy that governs: an open hold if there is one, otherwise the
+    /// latest deadline.
     #[must_use]
     pub fn governing_policy(&self) -> Option<RetentionPolicy> {
-        self.0.iter().copied().max_by_key(|p| p.deadline())
+        self.0
+            .iter()
+            .find(|p| p.is_open())
+            .or_else(|| {
+                self.0
+                    .iter()
+                    .filter(|p| !p.is_open())
+                    .max_by_key(|p| p.deadline())
+            })
+            .copied()
     }
 
     /// `true` when every policy has expired and the record must be deleted.
     ///
     /// An empty schedule is deletable immediately: no basis to keep the data is
-    /// not the same as no deadline.
+    /// not the same as no deadline. An open hold is **never** deletable, at any
+    /// instant — deleting evidence while a customer is contesting the bill it
+    /// supports is the one retention error that cannot be undone.
     #[must_use]
     pub fn is_deletable(&self, as_of: OffsetDateTime) -> bool {
-        match self.governing_deadline() {
-            None => true,
-            Some(deadline) => as_of > deadline,
+        match self.deletion() {
+            Deletion::Immediate => true,
+            Deletion::After(deadline) => as_of > deadline,
+            Deletion::Blocked(_) => false,
         }
     }
 
@@ -284,6 +416,54 @@ impl RetentionSchedule {
     #[must_use]
     pub fn is_held(&self) -> bool {
         self.0.iter().any(|p| p.basis().is_a_hold())
+    }
+}
+
+/// What a [`RetentionSchedule`] permits.
+///
+/// Three answers rather than an `Option<OffsetDateTime>`, because "there is no
+/// deadline" is ambiguous in exactly the direction that costs somebody their
+/// data: it can mean *nothing requires this to be kept*, or *this must be kept
+/// and no date can be put on it*. Those are opposites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deletion {
+    /// No basis requires the record to be kept.
+    ///
+    /// Under GDPR Art. 5(1)(e) that is an instruction to delete, not a licence
+    /// to keep indefinitely.
+    Immediate,
+    /// The record must be kept until this instant, and deleted after it.
+    After(OffsetDateTime),
+    /// A hold suspends deletion, and no date can be computed for its end.
+    ///
+    /// Carries the basis so a report can say which hold, raised when.
+    Blocked(RetentionBasis),
+}
+
+impl Deletion {
+    /// `true` when a hold suspends deletion.
+    #[must_use]
+    pub const fn is_blocked(self) -> bool {
+        matches!(self, Self::Blocked(_))
+    }
+
+    /// The deadline, where there is one.
+    #[must_use]
+    pub const fn deadline(self) -> Option<OffsetDateTime> {
+        match self {
+            Self::After(at) => Some(at),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Deletion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Immediate => f.write_str("delete now: no basis to keep it"),
+            Self::After(at) => write!(f, "delete after {at}"),
+            Self::Blocked(basis) => write!(f, "held by {basis}"),
+        }
     }
 }
 
@@ -384,14 +564,16 @@ mod serde_impl {
     #[serde(rename = "RetentionPolicy")]
     struct PolicyRepr {
         basis: RetentionBasis,
-        duration_s: i64,
+        /// Absent for a hold that runs until released, which has no length.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_s: Option<i64>,
     }
 
     impl Serialize for RetentionPolicy {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             PolicyRepr {
                 basis: self.basis(),
-                duration_s: self.duration().whole_seconds(),
+                duration_s: self.duration().map(Duration::whole_seconds),
             }
             .serialize(serializer)
         }
@@ -400,8 +582,13 @@ mod serde_impl {
     impl<'de> Deserialize<'de> for RetentionPolicy {
         fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
             let r = PolicyRepr::deserialize(deserializer)?;
-            RetentionPolicy::new(r.basis, Duration::seconds(r.duration_s))
-                .ok_or_else(|| serde::de::Error::custom("a retention period must be positive"))
+            match r.duration_s {
+                Some(seconds) => RetentionPolicy::new(r.basis, Duration::seconds(seconds))
+                    .ok_or_else(|| serde::de::Error::custom("a retention period must be positive")),
+                None => RetentionPolicy::until_released(r.basis).ok_or_else(|| {
+                    serde::de::Error::custom("only a hold may run without a duration")
+                }),
+            }
         }
     }
 }
@@ -430,10 +617,10 @@ mod tests {
     fn the_billing_period_runs_from_the_invoice_not_the_event() {
         let policy = billing();
         assert_eq!(policy.basis().anchor(), INVOICED);
-        assert_eq!(policy.deadline(), INVOICED + Duration::days(183));
+        assert_eq!(policy.deadline(), Some(INVOICED + Duration::days(183)));
 
         // The record is kept well past six months from the call itself.
-        assert!(policy.deadline() > EVENT + Duration::days(183));
+        assert!(policy.deadline().unwrap() > EVENT + Duration::days(183));
         assert!(!policy.is_expired(datetime!(2027-01-01 00:00 UTC)));
         assert!(policy.is_expired(datetime!(2027-03-01 00:00 UTC)));
     }
@@ -443,13 +630,13 @@ mod tests {
     #[test]
     fn expiry_is_judged_against_a_supplied_instant() {
         let policy = billing();
-        let just_before = policy.deadline();
-        let just_after = policy.deadline() + Duration::seconds(1);
+        let just_before = policy.deadline().unwrap();
+        let just_after = policy.deadline().unwrap() + Duration::seconds(1);
 
         assert!(!policy.is_expired(just_before), "the deadline is inclusive");
         assert!(policy.is_expired(just_after));
-        assert_eq!(policy.remaining(just_before), Duration::ZERO);
-        assert!(policy.remaining(just_after).is_negative());
+        assert_eq!(policy.remaining(just_before), Some(Duration::ZERO));
+        assert!(policy.remaining(just_after).unwrap().is_negative());
     }
 
     /// A zero period is an instruction to delete on arrival, which a caller
@@ -483,7 +670,7 @@ mod tests {
 
         assert_eq!(schedule.len(), 3);
         assert_eq!(schedule.governing_policy(), Some(dispute));
-        assert_eq!(schedule.governing_deadline(), Some(dispute.deadline()));
+        assert_eq!(schedule.governing_deadline(), dispute.deadline());
         assert!(schedule.is_held());
 
         // The short policy expiring does not make the record deletable.
@@ -491,7 +678,7 @@ mod tests {
         assert!(short.is_expired(after_short));
         assert!(!schedule.is_deletable(after_short));
 
-        assert!(schedule.is_deletable(dispute.deadline() + Duration::seconds(1)));
+        assert!(schedule.is_deletable(dispute.deadline().unwrap() + Duration::seconds(1)));
     }
 
     /// No basis to keep the data is not a licence to keep it indefinitely.

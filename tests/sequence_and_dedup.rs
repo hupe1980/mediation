@@ -10,8 +10,8 @@
 
 use mediation::{
     ChargedParty, ChargingId, CorrelationKeys, DedupDecision, DedupStore, DedupWindow, Disposition,
-    RecordKey, RecordType, SequenceObservation, SequenceSpace, SequenceTracker, SequenceValue,
-    SourceRef, SubscriberRef, SuppressReason, UsageRecord,
+    NotKeyable, RecordKey, RecordType, SequenceObservation, SequenceSpace, SequenceTracker,
+    SequenceValue, SourceRef, SubscriberRef, SuppressReason, UsageRecord,
 };
 use proptest::prelude::*;
 use std::collections::BTreeSet;
@@ -183,7 +183,10 @@ fn a_hole_at_the_end_of_a_stream_is_invisible_until_the_next_file() {
     // File 4 arrives, and only now is file 3 known to be missing.
     assert_eq!(
         tracker.observe_default(4),
-        SequenceObservation::Gap { missing: vec![3] }
+        SequenceObservation::Gap {
+            missing: vec![3],
+            missing_count: 1,
+        }
     );
     assert_eq!(tracker.missing(), vec![3]);
 }
@@ -330,4 +333,140 @@ fn an_unkeyable_record_is_rejected_and_still_counts() {
     assert_eq!(counts.ingested(), 2);
     assert!(counts.balances());
     assert!(counts.is_final());
+}
+
+/// A record is keyed on the most specific **complete** correlator it carries.
+/// A half one is a reason to refuse the record only when nothing else keyed it:
+/// an IMS record that happens to carry a bearer's Charging ID without its
+/// gateway is still perfectly keyable on its ICID, and rejecting it for the
+/// stray field would lose the usage entirely.
+#[test]
+fn a_stray_half_correlator_does_not_defeat_a_complete_one() {
+    let base = UsageRecord::new(
+        RecordType::ImsSession,
+        ChargedParty::Subscriber(SubscriberRef::new("imsi-262021234567890".parse().unwrap())),
+        "2026-07-28T10:00:00+02:00".parse().unwrap(),
+        SourceRef::new("scscf-01".parse().unwrap(), 0),
+    );
+
+    // A complete ICID, plus a Charging ID whose gateway the decoder dropped.
+    let mut keys = CorrelationKeys::default().with_icid("icid-1".parse().unwrap());
+    keys.charging_id = Some(ChargingId::new(42));
+    let record = base.clone().with_correlation(keys);
+
+    let key = RecordKey::of(&record).expect("the ICID keys it");
+    assert_eq!(key.kind(), "IMS");
+
+    // With nothing else to key on, the half identity is the reason, because it
+    // points at a decoder dropping a field rather than at a record type that
+    // never carries one.
+    let only_half = CorrelationKeys {
+        charging_id: Some(ChargingId::new(42)),
+        ..Default::default()
+    };
+    assert_eq!(
+        RecordKey::of(&base.clone().with_correlation(only_half)),
+        Err(NotKeyable::IncompletePacketSessionId)
+    );
+
+    // And a record carrying nothing says so differently again.
+    assert_eq!(RecordKey::of(&base), Err(NotKeyable::NoCorrelatorPresent));
+}
+
+/// A run of partials shares a session scope and does **not** share a key —
+/// which is the point: neither partial deduplicates the other, and the run is
+/// gathered by the scope.
+#[test]
+fn partials_of_one_session_share_a_scope_and_not_a_key() {
+    let keyed = |sequence: u32| {
+        let keys = CorrelationKeys::default()
+            .with_charging_id(ChargingId::new(7))
+            .with_gateway(std::net::Ipv4Addr::new(10, 0, 0, 1).into());
+        let mut keys = keys;
+        keys.record_sequence_number = Some(sequence);
+        RecordKey::of(
+            &UsageRecord::new(
+                RecordType::PduSession,
+                ChargedParty::Subscriber(SubscriberRef::new(
+                    "imsi-262021234567890".parse().unwrap(),
+                )),
+                "2026-07-28T10:00:00+02:00".parse().unwrap(),
+                SourceRef::new("pgw-01".parse().unwrap(), 0),
+            )
+            .with_correlation(keys),
+        )
+        .unwrap()
+    };
+
+    let (first, second) = (keyed(1), keyed(2));
+    assert_ne!(first, second, "neither deduplicates the other");
+    assert_eq!(first.session_scope(), second.session_scope());
+    assert!(first.session_scope().is_some());
+}
+
+/// RFC 1982 leaves the ordering of two values exactly half a space apart
+/// undefined. The crate resolves it forward, and says so: a hole that turns out
+/// to be a regression costs a resend request, while a regression read as an
+/// arrival silently abandons half a cycle of files.
+#[test]
+fn the_undefined_half_space_distance_is_read_forward() {
+    let space = SequenceSpace::TAP;
+    let half = space.size() / 2; // 49 999 for the TAP space
+
+    let from = SequenceValue::new(space, 1).unwrap();
+    let to = SequenceValue::new(space, 1 + half as u32).unwrap();
+
+    assert_eq!(from.gap_to(to), Some(half - 1), "forward, not backward");
+    assert!(!from.is_regression(to));
+
+    // One step further is unambiguously a regression.
+    let beyond = SequenceValue::new(space, 2 + half as u32).unwrap();
+    assert_eq!(from.gap_to(beyond), None);
+    assert!(from.is_regression(beyond));
+}
+
+// ── State survives a restart ─────────────────────────────────────────────────
+
+/// A deduplication store you cannot read out is one you cannot persist, and a
+/// store you cannot persist forgets a window of retransmissions on every
+/// deployment. So the store round-trips.
+#[test]
+fn a_dedup_store_round_trips_through_its_own_accessors() {
+    let window = DedupWindow::from_bound(Duration::days(7)).unwrap();
+    let mut store = DedupStore::new(window);
+
+    let first = RecordKey::of(&record(1, 1)).unwrap();
+    let second = RecordKey::of(&record(2, 1)).unwrap();
+    store.observe(first.clone(), datetime!(2026-07-28 10:00 UTC));
+    store.observe(second.clone(), datetime!(2026-07-28 11:00 UTC));
+
+    let saved: Vec<_> = store.iter().map(|(k, at)| (k.clone(), at)).collect();
+    let restored = DedupStore::restore(window, saved);
+
+    assert_eq!(restored.len(), 2);
+    assert_eq!(restored.first_seen(&first), store.first_seen(&first));
+    assert_eq!(restored.first_seen(&second), store.first_seen(&second));
+
+    // And it still recognises the retransmission it was remembering.
+    let mut restored = restored;
+    assert!(matches!(
+        restored.observe(first, datetime!(2026-07-28 12:00 UTC)),
+        DedupDecision::Duplicate { .. }
+    ));
+}
+
+/// A key restored twice keeps its earliest instant, so concatenating snapshots
+/// cannot extend a key's life past its window.
+#[test]
+fn restoring_a_repeated_key_keeps_the_earliest_instant() {
+    let window = DedupWindow::from_bound(Duration::days(7)).unwrap();
+    let k = RecordKey::of(&record(7, 1)).unwrap();
+    let store = DedupStore::restore(
+        window,
+        [
+            (k.clone(), datetime!(2026-07-28 12:00 UTC)),
+            (k.clone(), datetime!(2026-07-28 10:00 UTC)),
+        ],
+    );
+    assert_eq!(store.first_seen(&k), Some(datetime!(2026-07-28 10:00 UTC)));
 }

@@ -145,25 +145,38 @@ impl fmt::Display for ByteScale {
 impl FromStr for ByteScale {
     type Err = ParseError;
 
-    /// Parses the IEC 80000-13 symbols, case-sensitively for the binary
-    /// prefixes and tolerantly for the decimal ones.
+    /// Parses the IEC 80000-13 symbols.
     ///
-    /// `KB` is accepted as `kB` because the capitalised spelling is ubiquitous
-    /// and unambiguous under IEC — the binary kilobyte is `KiB`, which differs
-    /// by more than case.
+    /// # A lower-case `b` is a **bit**
+    ///
+    /// IEC 80000-13 gives `B` to the byte and `b` to the bit, so `kb` is a
+    /// kilobit and `kB` a kilobyte. Accepting `kb` as a kilobyte is a
+    /// factor-of-eight error in exactly the direction this module exists to
+    /// prevent — a silent unit confusion that produces a plausible number — so
+    /// the bit spellings are **rejected** rather than helpfully coerced. A
+    /// tariff sheet that says "kb" and means kilobytes is ambiguous in the
+    /// tariff sheet; resolve it there.
+    ///
+    /// `KB` is accepted as `kB`, because that capitalisation is ubiquitous and
+    /// is not a bit spelling — the binary kilobyte is `KiB`, which differs by
+    /// more than case. The binary prefixes are matched case-insensitively for
+    /// the same reason: the `i` disambiguates them on its own.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
-            "B" | "b" | "octet" | "octets" | "byte" | "bytes" => Ok(Self::Byte),
-            "kB" | "KB" | "kb" => Ok(Self::Kilo),
-            "KiB" | "kiB" | "kib" | "KIB" => Ok(Self::Kibi),
-            "MB" | "mb" => Ok(Self::Mega),
-            "MiB" | "mib" | "MIB" => Ok(Self::Mebi),
-            "GB" | "gb" => Ok(Self::Giga),
-            "GiB" | "gib" | "GIB" => Ok(Self::Gibi),
-            "TB" | "tb" => Ok(Self::Tera),
-            "TiB" | "tib" | "TIB" => Ok(Self::Tebi),
-            _ => Err(ParseError::one_of("ByteScale", s, Self::CODES)),
+        let t = s.trim();
+        match t {
+            "B" | "octet" | "octets" | "byte" | "bytes" => return Ok(Self::Byte),
+            "kB" | "KB" => return Ok(Self::Kilo),
+            "MB" => return Ok(Self::Mega),
+            "GB" => return Ok(Self::Giga),
+            "TB" => return Ok(Self::Tera),
+            _ => {}
         }
+        for scale in Self::ALL.iter().filter(|s| s.is_binary()) {
+            if t.eq_ignore_ascii_case(scale.as_str()) {
+                return Ok(*scale);
+            }
+        }
+        Err(ParseError::one_of("ByteScale", s, Self::CODES))
     }
 }
 

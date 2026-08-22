@@ -50,7 +50,7 @@
 use std::fmt;
 
 use crate::cdrtime::CdrTimestamp;
-use crate::disposition::BatchReconciliation;
+use crate::disposition::{BatchReconciliation, Outcome};
 use crate::plmn::TadigCode;
 use crate::sequence::{SequenceSpace, SequenceValue};
 
@@ -191,8 +191,96 @@ pub struct TapBatch {
     pub earliest_event: Option<CdrTimestamp>,
     /// The latest event timestamp the audit block claims.
     pub latest_event: Option<CdrTimestamp>,
-    /// The total charge the audit block claims.
+    /// The total charge the audit block claims (`totalCharge`).
     pub declared_charge: ScaledAmount,
+    /// The total discount the audit block claims (`totalDiscountValue`).
+    ///
+    /// Optional because TD.57 makes it optional. `None` means the batch stated
+    /// no discount total, which is not the same as stating zero — a partner
+    /// that omits the field has not told you their discounts sum to nothing,
+    /// and checking against zero would raise a discrepancy on every file they
+    /// send.
+    pub declared_discount: Option<ScaledAmount>,
+    /// The total tax the audit block claims (`totalTaxValue`).
+    ///
+    /// Optional for the same reason as `declared_discount`.
+    pub declared_tax: Option<ScaledAmount>,
+}
+
+/// What a batch's events summed to, for checking against what it claimed.
+///
+/// A struct rather than three arguments so the three totals cannot be passed in
+/// the wrong order — they are the same type, and a transposed discount and tax
+/// produce two discrepancies that each point at the wrong field.
+///
+/// There is no `Default`: a zero charge at an unstated scale is not a
+/// meaningful starting point, and the scale is what the audit compares first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchTotals {
+    /// How many events the caller decoded.
+    pub events: u64,
+    /// What their charges sum to.
+    pub charge: ScaledAmount,
+    /// What their discounts sum to, when the caller computed one.
+    pub discount: Option<ScaledAmount>,
+    /// What their taxes sum to, when the caller computed one.
+    pub tax: Option<ScaledAmount>,
+}
+
+impl BatchTotals {
+    /// Totals with only an event count and a charge.
+    #[must_use]
+    pub const fn new(events: u64, charge: ScaledAmount) -> Self {
+        Self {
+            events,
+            charge,
+            discount: None,
+            tax: None,
+        }
+    }
+
+    /// The same totals with a discount sum.
+    #[must_use]
+    pub const fn with_discount(mut self, discount: ScaledAmount) -> Self {
+        self.discount = Some(discount);
+        self
+    }
+
+    /// The same totals with a tax sum.
+    #[must_use]
+    pub const fn with_tax(mut self, tax: ScaledAmount) -> Self {
+        self.tax = Some(tax);
+        self
+    }
+}
+
+/// Which of a batch's declared totals a discrepancy is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TotalKind {
+    /// `totalCharge`.
+    Charge,
+    /// `totalDiscountValue`.
+    Discount,
+    /// `totalTaxValue`.
+    Tax,
+}
+
+impl TotalKind {
+    /// The canonical string form, as TD.57 names the field.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Charge => "totalCharge",
+            Self::Discount => "totalDiscountValue",
+            Self::Tax => "totalTaxValue",
+        }
+    }
+}
+
+impl fmt::Display for TotalKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl TapBatch {
@@ -207,40 +295,64 @@ impl TapBatch {
 
     /// Check every claim the batch makes about itself.
     ///
-    /// `actual_events` and `actual_charge` come from the events the caller
-    /// decoded, so the check is between what the file *says* and what it
-    /// *holds* — which is the only comparison worth making.
+    /// `actual` comes from the events the caller decoded, so the check is
+    /// between what the file *says* and what it *holds* — which is the only
+    /// comparison worth making.
     ///
     /// Returns every discrepancy found, not the first: a batch with three
     /// problems should be fixed once.
     #[must_use]
-    pub fn audit(&self, actual_events: u64, actual_charge: ScaledAmount) -> Vec<BatchDiscrepancy> {
+    pub fn audit(&self, actual: BatchTotals) -> Vec<BatchDiscrepancy> {
         let mut found = Vec::new();
 
         if self.sender == self.recipient {
             found.push(BatchDiscrepancy::SenderIsRecipient);
         }
-        if self.declared_events != actual_events {
+        if self.declared_events != actual.events {
             found.push(BatchDiscrepancy::EventCountMismatch {
                 declared: self.declared_events,
-                actual: actual_events,
+                actual: actual.events,
             });
         }
-        if self.declared_charge.decimal_places() != actual_charge.decimal_places() {
-            found.push(BatchDiscrepancy::ChargeScaleMismatch {
-                declared: self.declared_charge.decimal_places(),
-                actual: actual_charge.decimal_places(),
-            });
-        } else if self.declared_charge != actual_charge {
-            found.push(BatchDiscrepancy::ChargeMismatch {
-                declared: self.declared_charge,
-                actual: actual_charge,
-            });
-        }
-        if !self.declared_charge.is_representable() {
-            found.push(BatchDiscrepancy::ChargeScaleImplausible {
-                decimal_places: self.declared_charge.decimal_places(),
-            });
+
+        // Each total is checked the same way, and each names itself in the
+        // discrepancy — a mismatch on tax and one on charge send someone to
+        // different places, and one shared "totals disagree" would not.
+        for (kind, declared, actual) in [
+            (
+                TotalKind::Charge,
+                Some(self.declared_charge),
+                Some(actual.charge),
+            ),
+            (TotalKind::Discount, self.declared_discount, actual.discount),
+            (TotalKind::Tax, self.declared_tax, actual.tax),
+        ] {
+            // A total the batch did not declare, or one the caller did not
+            // compute, is not a disagreement. Comparing an absent optional
+            // field against zero raises a discrepancy on every well-formed file
+            // from a partner who simply omits it.
+            let (Some(declared), Some(actual)) = (declared, actual) else {
+                continue;
+            };
+            if !declared.is_representable() {
+                found.push(BatchDiscrepancy::ChargeScaleImplausible {
+                    kind,
+                    decimal_places: declared.decimal_places(),
+                });
+            }
+            if declared.decimal_places() != actual.decimal_places() {
+                found.push(BatchDiscrepancy::ChargeScaleMismatch {
+                    kind,
+                    declared: declared.decimal_places(),
+                    actual: actual.decimal_places(),
+                });
+            } else if declared != actual {
+                found.push(BatchDiscrepancy::ChargeMismatch {
+                    kind,
+                    declared,
+                    actual,
+                });
+            }
         }
 
         if let (Some(earliest), Some(latest)) = (self.earliest_event, self.latest_event)
@@ -254,6 +366,17 @@ impl TapBatch {
                 found.push(BatchDiscrepancy::EventBeyondInclusionWindow { age });
             }
         }
+        // An event cannot postdate the file that carries it. A window ending
+        // after creation is a clock fault at the sender or a decoding fault
+        // here, and either way the file's own account of itself is wrong —
+        // which is exactly what an audit block is for.
+        if let Some(latest) = self.latest_event
+            && latest.to_utc() > self.created.to_utc()
+        {
+            found.push(BatchDiscrepancy::EventAfterFileCreation {
+                ahead: latest.to_utc() - self.created.to_utc(),
+            });
+        }
         if self.declared_events == 0
             && (self.earliest_event.is_some() || self.latest_event.is_some())
         {
@@ -263,18 +386,19 @@ impl TapBatch {
         found
     }
 
-    /// `true` when a timestamp falls inside the window the batch declares.
+    /// Whether a timestamp falls inside the window the batch declares.
     ///
     /// An event outside it is either misfiled or evidence the audit block is
     /// wrong; either way the batch does not describe what it holds.
+    ///
+    /// `None` when the batch declared no window — which is not the same answer
+    /// as `false`. A batch that states no window has said nothing about this
+    /// event, and reading that silence as "not covered" would report every
+    /// event of every windowless file as misfiled.
     #[must_use]
-    pub fn covers(&self, event: CdrTimestamp) -> bool {
-        match (self.earliest_event, self.latest_event) {
-            (Some(earliest), Some(latest)) => {
-                event.to_utc() >= earliest.to_utc() && event.to_utc() <= latest.to_utc()
-            }
-            _ => false,
-        }
+    pub fn covers(&self, event: CdrTimestamp) -> Option<bool> {
+        let (earliest, latest) = (self.earliest_event?, self.latest_event?);
+        Some(event.to_utc() >= earliest.to_utc() && event.to_utc() <= latest.to_utc())
     }
 }
 
@@ -290,8 +414,10 @@ pub enum BatchDiscrepancy {
         /// What the events actually number.
         actual: u64,
     },
-    /// The audit block's total is not the sum of the events.
+    /// One of the audit block's totals is not the sum of the events.
     ChargeMismatch {
+        /// Which total.
+        kind: TotalKind,
         /// What the audit block claimed.
         declared: ScaledAmount,
         /// What the events actually sum to.
@@ -303,13 +429,17 @@ pub enum BatchDiscrepancy {
     /// all, and reporting it as a value difference would send someone hunting a
     /// missing charge that is really a decoding fault.
     ChargeScaleMismatch {
+        /// Which total.
+        kind: TotalKind,
         /// The audit block's scale.
         declared: u8,
         /// The events' scale.
         actual: u8,
     },
-    /// The declared scale is beyond anything a currency uses.
+    /// A declared scale is beyond anything a currency uses.
     ChargeScaleImplausible {
+        /// Which total.
+        kind: TotalKind,
         /// The scale claimed.
         decimal_places: u8,
     },
@@ -319,6 +449,14 @@ pub enum BatchDiscrepancy {
     EventBeyondInclusionWindow {
         /// How old the earliest event was when the file was created.
         age: time::Duration,
+    },
+    /// An event is timestamped after the file that carries it was created.
+    ///
+    /// Impossible: a file cannot hold an event that had not happened when it
+    /// was written. Clock skew at the sender, or a decoding fault.
+    EventAfterFileCreation {
+        /// How far the latest event runs past the file's creation instant.
+        ahead: time::Duration,
     },
     /// The batch declares no events but still states a window.
     EmptyBatchWithAWindow,
@@ -339,6 +477,7 @@ impl BatchDiscrepancy {
                 | Self::ChargeMismatch { .. }
                 | Self::ChargeScaleMismatch { .. }
                 | Self::EventWindowInverted
+                | Self::EventAfterFileCreation { .. }
         )
     }
 }
@@ -350,19 +489,36 @@ impl fmt::Display for BatchDiscrepancy {
             Self::EventCountMismatch { declared, actual } => {
                 write!(f, "audit block claims {declared} events, {actual} arrived")
             }
-            Self::ChargeMismatch { declared, actual } => {
-                write!(f, "audit block claims {declared}, events sum to {actual}")
+            Self::ChargeMismatch {
+                kind,
+                declared,
+                actual,
+            } => {
+                write!(f, "{kind} claims {declared}, events sum to {actual}")
             }
-            Self::ChargeScaleMismatch { declared, actual } => write!(
+            Self::ChargeScaleMismatch {
+                kind,
+                declared,
+                actual,
+            } => write!(
                 f,
-                "audit block uses {declared} decimal places, events use {actual}"
+                "{kind} uses {declared} decimal places, events use {actual}"
             ),
-            Self::ChargeScaleImplausible { decimal_places } => {
-                write!(f, "{decimal_places} decimal places is beyond any currency")
+            Self::ChargeScaleImplausible {
+                kind,
+                decimal_places,
+            } => {
+                write!(
+                    f,
+                    "{kind} at {decimal_places} decimal places is beyond any currency"
+                )
             }
             Self::EventWindowInverted => f.write_str("the earliest event is later than the latest"),
             Self::EventBeyondInclusionWindow { age } => {
                 write!(f, "the earliest event is {age} old, past the 30-day window")
+            }
+            Self::EventAfterFileCreation { ahead } => {
+                write!(f, "the latest event is {ahead} after the file was created")
             }
             Self::EmptyBatchWithAWindow => {
                 f.write_str("no events declared, yet a window is stated")
@@ -415,55 +571,45 @@ impl RapReturn {
 
     /// Apply the return to a reconciliation the batch had produced.
     ///
-    /// A **fatal** return means the batch never counted: the result is empty,
-    /// and the caller re-presents the file when it is resent. A **severe**
-    /// return leaves the batch counted and moves the returned events out of
-    /// `billable` and into `rejected`.
+    /// A **fatal** return means the batch never counted: everything it ingested
+    /// is undone. Records it *carried in* from an earlier batch are not — they
+    /// were held by a predecessor and are still outstanding — so they come back
+    /// as held, which is what keeps
+    /// [`PeriodLedger`](crate::PeriodLedger) chaining.
     ///
-    /// `None` when more events came back than the batch released, which the
-    /// caller should treat as a disagreement with the partner rather than as
-    /// arithmetic to absorb.
+    /// A **severe** return leaves the batch counted and moves the returned
+    /// events from `billable` to `rejected`. Every other counter is untouched:
+    /// a duplicate stays a duplicate and a hold stays a hold, because the
+    /// partner returned events, not opinions about the rest of the file.
+    ///
+    /// `None` when more events came back than the batch released, or when the
+    /// batch's own carry cannot be reconstructed — either is a disagreement
+    /// with the partner rather than arithmetic to absorb.
+    ///
+    /// ```rust
+    /// use mediation::{BatchReconciliation, Disposition, RapReturn, SuppressReason};
+    ///
+    /// let mut batch = BatchReconciliation::EMPTY;
+    /// batch.observe(&Disposition::Billable);
+    /// batch.observe(&Disposition::Billable);
+    /// batch.observe(&Disposition::Suppressed(SuppressReason::ZeroRated));
+    ///
+    /// let after = RapReturn::Severe { returned_events: 1 }.effect_on(batch).unwrap();
+    /// assert_eq!(after.released(), 1);
+    /// assert_eq!(after.rejected(), 1);
+    /// assert_eq!(after.suppressed(), 1, "the rest of the file is untouched");
+    /// assert!(after.balances());
+    /// ```
     #[must_use]
-    pub fn effect_on(self, batch: BatchReconciliation) -> Option<BatchReconciliation> {
+    pub const fn effect_on(self, batch: BatchReconciliation) -> Option<BatchReconciliation> {
         match self {
-            Self::Fatal => Some(BatchReconciliation::EMPTY),
+            // Everything this batch ingested is unwound. What it carried in was
+            // another batch's hold and is outstanding again.
+            Self::Fatal => {
+                BatchReconciliation::EMPTY.observe_carried_many(Outcome::Held, batch.carried_in())
+            }
             Self::Severe { returned_events } => {
-                if returned_events > batch.released() {
-                    return None;
-                }
-                // Rebuild rather than mutate: the counters are private, and
-                // moving records between outcomes is exactly the operation the
-                // conservation law exists to police.
-                let mut adjusted = BatchReconciliation::EMPTY;
-                for _ in 0..(batch.released() - returned_events) {
-                    adjusted.observe(&crate::disposition::Disposition::Billable);
-                }
-                for _ in 0..returned_events {
-                    adjusted.observe(&crate::disposition::Disposition::Rejected(
-                        crate::disposition::RejectReason::Malformed,
-                    ));
-                }
-                for _ in 0..batch.suppressed() {
-                    adjusted.observe(&crate::disposition::Disposition::Suppressed(
-                        crate::disposition::SuppressReason::OperatorPolicy,
-                    ));
-                }
-                for _ in 0..batch.rejected() {
-                    adjusted.observe(&crate::disposition::Disposition::Rejected(
-                        crate::disposition::RejectReason::Malformed,
-                    ));
-                }
-                for _ in 0..batch.held() {
-                    adjusted.observe(&crate::disposition::Disposition::Held(
-                        crate::disposition::HoldReason::AwaitingCorrelation,
-                    ));
-                }
-                for _ in 0..batch.duplicate() {
-                    adjusted.observe(&crate::disposition::Disposition::Suppressed(
-                        crate::disposition::SuppressReason::OperatorPolicy,
-                    ));
-                }
-                Some(adjusted)
+                batch.reclassify(Outcome::Billable, Outcome::Rejected, returned_events)
             }
         }
     }
@@ -484,7 +630,7 @@ impl fmt::Display for RapReturn {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::ScaledAmount;
+    use super::{BatchTotals, ScaledAmount, TotalKind};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     /// The integer and its scale, never a decimal string and never a float —
@@ -512,6 +658,63 @@ mod serde_impl {
             Ok(ScaledAmount::new(r.value, r.decimal_places))
         }
     }
+
+    /// The field name TD.57 uses, so a stored discrepancy names the same thing
+    /// the specification does.
+    impl Serialize for TotalKind {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str(self.as_str())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for TotalKind {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let name = String::deserialize(deserializer)?;
+            match name.as_str() {
+                "totalCharge" => Ok(TotalKind::Charge),
+                "totalDiscountValue" => Ok(TotalKind::Discount),
+                "totalTaxValue" => Ok(TotalKind::Tax),
+                other => Err(serde::de::Error::custom(format!("unknown total {other:?}"))),
+            }
+        }
+    }
+
+    /// Every total the caller computed, named — an unnamed triple of amounts
+    /// is exactly the shape a transposed discount and tax hide in.
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename = "BatchTotals")]
+    struct TotalsRepr {
+        events: u64,
+        charge: ScaledAmount,
+        #[serde(default)]
+        discount: Option<ScaledAmount>,
+        #[serde(default)]
+        tax: Option<ScaledAmount>,
+    }
+
+    impl Serialize for BatchTotals {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            TotalsRepr {
+                events: self.events,
+                charge: self.charge,
+                discount: self.discount,
+                tax: self.tax,
+            }
+            .serialize(serializer)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for BatchTotals {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let r = TotalsRepr::deserialize(deserializer)?;
+            Ok(BatchTotals {
+                events: r.events,
+                charge: r.charge,
+                discount: r.discount,
+                tax: r.tax,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -533,6 +736,8 @@ mod tests {
             earliest_event: Some("2026-07-20T10:00:00+02:00".parse().unwrap()),
             latest_event: Some("2026-07-27T10:00:00+02:00".parse().unwrap()),
             declared_charge: charge,
+            declared_discount: None,
+            declared_tax: None,
         }
     }
 
@@ -583,7 +788,11 @@ mod tests {
     #[test]
     fn a_batch_that_describes_itself_correctly_reports_nothing() {
         let charge = ScaledAmount::new(1_234, 3);
-        assert!(batch(10, charge).audit(10, charge).is_empty());
+        assert!(
+            batch(10, charge)
+                .audit(BatchTotals::new(10, charge))
+                .is_empty()
+        );
     }
 
     /// The check worth having: the file's own claims against what it holds.
@@ -591,7 +800,7 @@ mod tests {
     fn a_count_or_charge_that_disagrees_rejects_the_file() {
         let charge = ScaledAmount::new(1_234, 3);
 
-        let miscounted = batch(10, charge).audit(9, charge);
+        let miscounted = batch(10, charge).audit(BatchTotals::new(9, charge));
         assert_eq!(
             miscounted,
             vec![BatchDiscrepancy::EventCountMismatch {
@@ -601,7 +810,7 @@ mod tests {
         );
         assert!(miscounted[0].rejects_the_file());
 
-        let mischarged = batch(10, charge).audit(10, ScaledAmount::new(1_000, 3));
+        let mischarged = batch(10, charge).audit(BatchTotals::new(10, ScaledAmount::new(1_000, 3)));
         assert!(matches!(
             mischarged.as_slice(),
             [BatchDiscrepancy::ChargeMismatch { .. }]
@@ -616,10 +825,11 @@ mod tests {
         let declared = ScaledAmount::new(1_234, 3);
         let actual = ScaledAmount::new(1_234, 2);
 
-        let found = batch(10, declared).audit(10, actual);
+        let found = batch(10, declared).audit(BatchTotals::new(10, actual));
         assert_eq!(
             found,
             vec![BatchDiscrepancy::ChargeScaleMismatch {
+                kind: TotalKind::Charge,
                 declared: 3,
                 actual: 2,
             }]
@@ -640,7 +850,7 @@ mod tests {
         broken.recipient = broken.sender;
         broken.earliest_event = Some("2026-01-01T10:00:00+02:00".parse().unwrap());
 
-        let found = broken.audit(9, ScaledAmount::new(1, 12));
+        let found = broken.audit(BatchTotals::new(9, ScaledAmount::new(1, 12)));
         assert!(found.len() >= 4, "{found:?}");
         assert!(found.contains(&BatchDiscrepancy::SenderIsRecipient));
         assert!(
@@ -669,7 +879,7 @@ mod tests {
         inside.earliest_event = Some("2026-06-29T10:00:00+02:00".parse().unwrap());
         assert!(
             !inside
-                .audit(1, charge)
+                .audit(BatchTotals::new(1, charge))
                 .iter()
                 .any(|d| matches!(d, BatchDiscrepancy::EventBeyondInclusionWindow { .. })),
             "29 days is inside the window"
@@ -679,7 +889,7 @@ mod tests {
         outside.earliest_event = Some("2026-06-27T10:00:00+02:00".parse().unwrap());
         assert!(
             outside
-                .audit(1, charge)
+                .audit(BatchTotals::new(1, charge))
                 .iter()
                 .any(|d| matches!(d, BatchDiscrepancy::EventBeyondInclusionWindow { .. }))
         );
@@ -707,7 +917,7 @@ mod tests {
         inverted.latest_event = Some("2026-07-20T10:00:00+02:00".parse().unwrap());
         assert!(
             inverted
-                .audit(1, charge)
+                .audit(BatchTotals::new(1, charge))
                 .contains(&BatchDiscrepancy::EventWindowInverted)
         );
 
@@ -715,7 +925,7 @@ mod tests {
         empty.earliest_event = Some("2026-07-27T10:00:00+02:00".parse().unwrap());
         assert!(
             empty
-                .audit(0, charge)
+                .audit(BatchTotals::new(0, charge))
                 .contains(&BatchDiscrepancy::EmptyBatchWithAWindow)
         );
     }
@@ -725,9 +935,23 @@ mod tests {
         let charge = ScaledAmount::zero(3);
         let batch = batch(1, charge);
 
-        assert!(batch.covers("2026-07-25T10:00:00+02:00".parse().unwrap()));
-        assert!(!batch.covers("2026-07-19T10:00:00+02:00".parse().unwrap()));
-        assert!(!batch.covers("2026-07-28T09:00:00+02:00".parse().unwrap()));
+        let at = |s: &str| batch.covers(s.parse().unwrap());
+        assert_eq!(at("2026-07-25T10:00:00+02:00"), Some(true));
+        assert_eq!(at("2026-07-19T10:00:00+02:00"), Some(false));
+        assert_eq!(at("2026-07-28T09:00:00+02:00"), Some(false));
+    }
+
+    /// A batch that declared no window has said nothing about any event, which
+    /// is a different answer from "not covered".
+    #[test]
+    fn a_batch_with_no_window_answers_nothing_rather_than_no() {
+        let mut batch = batch(1, ScaledAmount::zero(3));
+        batch.earliest_event = None;
+        batch.latest_event = None;
+        assert_eq!(
+            batch.covers("2026-07-25T10:00:00+02:00".parse().unwrap()),
+            None
+        );
     }
 
     #[test]

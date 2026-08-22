@@ -30,6 +30,15 @@
 //! every real gap, because no operator loses half a cycle of files without
 //! noticing by other means.
 //!
+//! RFC 1982 leaves the ordering of two values **exactly** half a space apart
+//! undefined, because neither reading has a better claim. This crate resolves
+//! it forward — a jump of 49 999 TAP files is read as a gap rather than as a
+//! regression — because a hole that is reported and turns out to be a
+//! regression costs a resend request, while a regression read as an accepted
+//! arrival silently advances the high-water mark past 49 999 files nobody will
+//! ever ask for again. The two errors are not symmetric, so the tie is broken
+//! toward the one that is recoverable.
+//!
 //! ```rust
 //! use mediation::{SequenceSpace, SequenceValue};
 //!
@@ -48,7 +57,7 @@
 //! exactly those files. A boolean would be true and useless; a count would say
 //! how bad it is without saying what to ask for.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt;
 
 // ── SequenceSpace ────────────────────────────────────────────────────────────
@@ -196,6 +205,12 @@ impl SequenceValue {
     /// ordering — that is a regression, not a gap, and reporting it as a gap of
     /// nearly a full cycle is the classic wrap bug.
     ///
+    /// Two values exactly half a space apart are the case RFC 1982 leaves
+    /// undefined. They are read **forward**, for the reason given in the module
+    /// documentation: a hole that turns out to be a regression costs a resend
+    /// request, while a regression read as an arrival silently abandons half a
+    /// cycle of files.
+    ///
     /// ```rust
     /// use mediation::{SequenceSpace, SequenceValue};
     ///
@@ -262,10 +277,19 @@ pub enum SequenceObservation {
     /// A forward jump: the listed values have not arrived.
     ///
     /// Carries the identities rather than a count, because the operational
-    /// response is a resend request for exactly these.
+    /// response is a resend request for exactly these — and it carries the
+    /// **exact** count beside them, because the list is bounded and the count
+    /// is not. A jump of four billion names ten thousand files and counts all
+    /// four billion; a tracker that only knew what it could list would report a
+    /// source as complete while most of it was missing.
     Gap {
-        /// The sequence numbers that were skipped over.
+        /// The lowest skipped identities, ascending, bounded by the caller's
+        /// listing limit.
         missing: Vec<u32>,
+        /// Exactly how many identities were skipped. May exceed
+        /// `missing.len()`, in which case the list is truncated and the count
+        /// is not.
+        missing_count: u64,
     },
     /// A value behind the high-water mark that fills a known hole.
     FilledGap,
@@ -286,6 +310,30 @@ impl SequenceObservation {
     pub fn opened_a_gap(&self) -> bool {
         matches!(self, Self::Gap { .. })
     }
+
+    /// How many identities the observation revealed as missing.
+    ///
+    /// Zero for every observation but a gap, and exact for a gap even where the
+    /// listed identities were truncated.
+    #[must_use]
+    pub const fn missing_count(&self) -> u64 {
+        match self {
+            Self::Gap { missing_count, .. } => *missing_count,
+            _ => 0,
+        }
+    }
+
+    /// `true` when a gap named fewer identities than it counted.
+    #[must_use]
+    pub fn missing_is_truncated(&self) -> bool {
+        match self {
+            Self::Gap {
+                missing,
+                missing_count,
+            } => *missing_count > missing.len() as u64,
+            _ => false,
+        }
+    }
 }
 
 /// Tracks one source's sequence numbers and reports what is missing.
@@ -295,25 +343,75 @@ impl SequenceObservation {
 /// node, a `localSequenceNumber` is per recording entity. Sharing a tracker
 /// across scopes manufactures gaps that do not exist.
 ///
-/// Holds only the outstanding holes, not every value ever seen, so memory is
-/// proportional to what is actually missing rather than to throughput.
+/// # Holes are stored as runs, so the count is always exact
+///
+/// A jump from file 7 to file 4 000 000 007 leaves four billion holes. Storing
+/// them one per value is not an option — it is a four-billion-element
+/// allocation from one corrupt field — but *forgetting* the ones that do not
+/// fit is worse: [`is_complete`](Self::is_complete) would then read `true` for
+/// a source that is missing almost everything, and completeness is the one
+/// thing this module exists to be right about.
+///
+/// So a run of consecutive holes costs the same as a single hole. Memory is
+/// proportional to the number of **discontiguous** holes, the count is exact
+/// at every size, and only the *listing* of identities is ever bounded.
+///
+/// # Persistence
+///
+/// A tracker is caller-owned state that must survive a restart, so it is
+/// round-trippable: [`snapshot`](Self::snapshot) hands out everything it holds
+/// and [`restore`](Self::restore) rebuilds it. With the `serde` feature the
+/// tracker serialises directly, through that same snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequenceTracker {
     space: SequenceSpace,
     /// The most recent value under RFC 1982 ordering, once anything has arrived.
     high_water: Option<u32>,
-    /// Values skipped over and not yet filled.
-    missing: BTreeSet<u32>,
+    /// Outstanding holes as runs of consecutive **space offsets**, keyed by the
+    /// run's first offset and valued by its length. Offsets rather than raw
+    /// values so a run that crosses the wrap point is two entries with ordinary
+    /// arithmetic rather than one entry with a special case.
+    holes: BTreeMap<u64, u64>,
+    /// The sum of every run's length, maintained incrementally so
+    /// [`missing_count`](Self::missing_count) is O(1) at any scale.
+    missing_count: u64,
+}
+
+/// Everything a [`SequenceTracker`] holds, for persisting and restoring it.
+///
+/// The runs are half-open in **space offsets** — `(first, count)` pairs where
+/// `first` is `value - space.first()` — because that is the form the tracker
+/// stores and converting on the way out would make a snapshot lossy for a run
+/// that crosses the wrap point.
+///
+/// Use [`SequenceTracker::missing_runs`] for the same information as raw
+/// sequence values, which is what a resend request needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SequenceSnapshot {
+    /// The space the tracker follows.
+    pub space: SequenceSpace,
+    /// The high-water mark, if anything has arrived.
+    pub high_water: Option<u32>,
+    /// Outstanding holes as `(first offset, length)` runs, ascending and
+    /// non-overlapping.
+    pub holes: Vec<(u64, u64)>,
 }
 
 impl SequenceTracker {
+    /// The default bound on how many missing identities one observation lists.
+    ///
+    /// It bounds the **list**, never the tracker's own count — see
+    /// [`observe`](Self::observe).
+    pub const DEFAULT_MAX_LISTED: usize = 10_000;
+
     /// A tracker over a sequence space, having seen nothing.
     #[must_use]
     pub const fn new(space: SequenceSpace) -> Self {
         Self {
             space,
             high_water: None,
-            missing: BTreeSet::new(),
+            holes: BTreeMap::new(),
+            missing_count: 0,
         }
     }
 
@@ -329,16 +427,61 @@ impl SequenceTracker {
         self.high_water
     }
 
-    /// The sequence numbers known to be missing, in ascending order.
+    /// The sequence numbers known to be missing, ascending, at most `limit` of
+    /// them.
+    ///
+    /// The count is unbounded and the list is not, so ask
+    /// [`missing_count`](Self::missing_count) how many there really are.
     #[must_use]
-    pub fn missing(&self) -> Vec<u32> {
-        self.missing.iter().copied().collect()
+    pub fn missing_upto(&self, limit: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        'runs: for (first, len) in &self.holes {
+            for step in 0..*len {
+                if out.len() >= limit {
+                    break 'runs;
+                }
+                out.push(self.value_at(first + step));
+            }
+        }
+        out
     }
 
-    /// How many values are known to be missing.
+    /// The sequence numbers known to be missing, ascending, at most
+    /// [`DEFAULT_MAX_LISTED`](Self::DEFAULT_MAX_LISTED) of them.
     #[must_use]
-    pub fn missing_count(&self) -> usize {
-        self.missing.len()
+    pub fn missing(&self) -> Vec<u32> {
+        self.missing_upto(Self::DEFAULT_MAX_LISTED)
+    }
+
+    /// The outstanding holes as inclusive `(first, last)` runs of sequence
+    /// values, ascending.
+    ///
+    /// The compact form, and the one a resend request should quote: four
+    /// billion missing files are one run here and would be four billion entries
+    /// in [`missing`](Self::missing). A run that crosses the space's wrap point
+    /// appears as two.
+    #[must_use]
+    pub fn missing_runs(&self) -> Vec<(u32, u32)> {
+        self.holes
+            .iter()
+            .map(|(first, len)| (self.value_at(*first), self.value_at(first + len - 1)))
+            .collect()
+    }
+
+    /// How many values are known to be missing. Always exact.
+    #[must_use]
+    pub const fn missing_count(&self) -> u64 {
+        self.missing_count
+    }
+
+    /// How many discontiguous holes the tracker is carrying.
+    ///
+    /// The tracker's memory cost, and a useful signal of its own: one run of a
+    /// thousand is a lost file batch, a thousand runs of one is a source that
+    /// is dropping records at random.
+    #[must_use]
+    pub fn hole_count(&self) -> usize {
+        self.holes.len()
     }
 
     /// `true` when nothing is outstanding.
@@ -347,19 +490,24 @@ impl SequenceTracker {
     /// hole has unknown completeness, and billing over unknown completeness
     /// invoices an amount nobody can prove is right.
     #[must_use]
-    pub fn is_complete(&self) -> bool {
-        self.missing.is_empty()
+    pub const fn is_complete(&self) -> bool {
+        self.missing_count == 0
+    }
+
+    /// `true` when `value` is one of the outstanding holes.
+    #[must_use]
+    pub fn is_missing(&self, value: u32) -> bool {
+        self.space.contains(value) && self.run_containing(self.offset_of(value)).is_some()
     }
 
     /// Record an arrival and classify it.
     ///
-    /// A gap larger than `max_gap` is still reported, but the missing
-    /// identities are truncated to that many — an unbounded list would let a
-    /// single corrupt sequence number allocate the whole space. The truncation
-    /// is visible in the returned [`SequenceObservation::Gap`] because the list
-    /// is shorter than the jump, and callers that need the exact set should
-    /// raise the bound deliberately.
-    pub fn observe(&mut self, value: u32, max_gap: usize) -> SequenceObservation {
+    /// `max_listed` bounds the identities the returned
+    /// [`Gap`](SequenceObservation::Gap) *names*. It does **not** bound what
+    /// the tracker remembers: the exact count is always kept, and
+    /// [`is_complete`](Self::is_complete) is therefore never wrong in the
+    /// direction that would let an incomplete source be billed.
+    pub fn observe(&mut self, value: u32, max_listed: usize) -> SequenceObservation {
         let Some(arriving) = SequenceValue::new(self.space, value) else {
             return SequenceObservation::OutOfSpace;
         };
@@ -380,60 +528,242 @@ impl SequenceTracker {
 
         if previous.is_regression(arriving) {
             // Behind the high-water mark: it either fills a hole or is stale.
-            return if self.missing.remove(&value) {
+            return if self.take_hole(self.offset_of(value)) {
                 SequenceObservation::FilledGap
             } else {
                 SequenceObservation::Unexpected
             };
         }
 
-        // Forward. Anything skipped over becomes a hole.
-        //
-        // The distance is computed directly rather than through `gap_to`, whose
-        // `None` cases — equal, and backward — are both already excluded above.
-        // Reading that `None` as "no gap" would hide a hole, which is the one
-        // direction this module must never fail in.
+        // Forward. Everything skipped over becomes a hole — all of it, however
+        // many. The distance is computed directly rather than through `gap_to`,
+        // whose `None` cases — equal, and backward — are both already excluded
+        // above. Reading that `None` as "no gap" would hide a hole, which is
+        // the one direction this module must never fail in.
         self.high_water = Some(value);
         let skipped = self.space.forward_distance(previous.get(), value) - 1;
         if skipped == 0 {
             return SequenceObservation::InOrder;
         }
 
-        let mut missing = Vec::new();
-        let mut cursor = previous.successor();
-        for _ in 0..skipped.min(max_gap as u64) {
-            missing.push(cursor.get());
-            self.missing.insert(cursor.get());
-            cursor = cursor.successor();
+        let from = self.offset_of(previous.successor().get());
+        self.add_run(from, skipped);
+
+        let mut missing = Vec::with_capacity(skipped.min(max_listed as u64) as usize);
+        for step in 0..skipped.min(max_listed as u64) {
+            missing.push(self.value_at((from + step) % self.space.size()));
         }
-        SequenceObservation::Gap { missing }
+        SequenceObservation::Gap {
+            missing,
+            missing_count: skipped,
+        }
     }
 
-    /// Record an arrival with a default bound of 10 000 missing identities.
+    /// Record an arrival, listing at most
+    /// [`DEFAULT_MAX_LISTED`](Self::DEFAULT_MAX_LISTED) missing identities.
     pub fn observe_default(&mut self, value: u32) -> SequenceObservation {
-        self.observe(value, 10_000)
+        self.observe(value, Self::DEFAULT_MAX_LISTED)
     }
 
     /// Forget holes older than the resend window, accepting them as lost.
     ///
-    /// Removes and returns the missing values that are more than `beyond` steps
-    /// behind the high-water mark. A hole a partner will never fill must stop
-    /// blocking every future batch, and abandoning it is a decision the caller
-    /// makes explicitly rather than one the tracker makes quietly.
-    pub fn abandon_older_than(&mut self, beyond: u64) -> Vec<u32> {
+    /// Removes the missing values that are more than `beyond` steps behind the
+    /// high-water mark, and returns how many were abandoned. A hole a partner
+    /// will never fill must stop blocking every future batch, and abandoning it
+    /// is a decision the caller makes explicitly rather than one the tracker
+    /// makes quietly.
+    ///
+    /// A count rather than a list: the set may be enormous, and the values that
+    /// were given up on are recoverable from a snapshot taken before the call.
+    /// [`missing_runs`](Self::missing_runs) names what is left.
+    pub fn abandon_older_than(&mut self, beyond: u64) -> u64 {
         let Some(high) = self.high_water else {
-            return Vec::new();
+            return 0;
         };
-        let abandoned: Vec<u32> = self
-            .missing
-            .iter()
-            .copied()
-            .filter(|v| self.space.forward_distance(*v, high) > beyond)
-            .collect();
-        for value in &abandoned {
-            self.missing.remove(value);
+        // A value is abandoned when its forward distance to the high-water mark
+        // exceeds `beyond`. Distance decreases as the value approaches the
+        // mark, so within one run the abandoned part is always its head.
+        let mut abandoned = 0u64;
+        let mut kept: BTreeMap<u64, u64> = BTreeMap::new();
+        for (first, len) in std::mem::take(&mut self.holes) {
+            let mut start = first;
+            let mut remaining = len;
+            while remaining > 0 && self.space.forward_distance(self.value_at(start), high) > beyond
+            {
+                start += 1;
+                remaining -= 1;
+                abandoned += 1;
+            }
+            if remaining > 0 {
+                kept.insert(start, remaining);
+            }
         }
+        self.holes = kept;
+        self.missing_count -= abandoned;
         abandoned
+    }
+
+    /// Everything the tracker holds, for persisting it.
+    #[must_use]
+    pub fn snapshot(&self) -> SequenceSnapshot {
+        SequenceSnapshot {
+            space: self.space,
+            high_water: self.high_water,
+            holes: self.holes.iter().map(|(k, v)| (*k, *v)).collect(),
+        }
+    }
+
+    /// Rebuild a tracker from a snapshot.
+    ///
+    /// `None` when the snapshot does not describe a tracker this type could
+    /// have produced: a high-water mark outside the space, a run that starts or
+    /// ends outside it, a zero-length run, or runs that overlap. Restoring a
+    /// contradictory snapshot would put the completeness control into a state
+    /// its own invariants do not cover, which is worse than refusing.
+    #[must_use]
+    pub fn restore(snapshot: SequenceSnapshot) -> Option<Self> {
+        let SequenceSnapshot {
+            space,
+            high_water,
+            holes,
+        } = snapshot;
+        if let Some(high) = high_water
+            && !space.contains(high)
+        {
+            return None;
+        }
+        let size = space.size();
+        let mut map = BTreeMap::new();
+        let mut count = 0u64;
+        let mut previous_end = 0u64;
+        for (index, (first, len)) in holes.into_iter().enumerate() {
+            if len == 0 || first >= size || len > size - first {
+                return None;
+            }
+            if index > 0 && first < previous_end {
+                return None;
+            }
+            previous_end = first + len;
+            count = count.checked_add(len)?;
+            if map.insert(first, len).is_some() {
+                return None;
+            }
+        }
+        Some(Self {
+            space,
+            high_water,
+            holes: map,
+            missing_count: count,
+        })
+    }
+
+    // ── Run arithmetic ───────────────────────────────────────────────────────
+
+    /// A value's offset from the space's first value.
+    const fn offset_of(&self, value: u32) -> u64 {
+        (value - self.space.first()) as u64
+    }
+
+    /// The value at an offset from the space's first value.
+    const fn value_at(&self, offset: u64) -> u32 {
+        self.space.first() + offset as u32
+    }
+
+    /// The run containing `offset`, as its key.
+    fn run_containing(&self, offset: u64) -> Option<u64> {
+        self.holes
+            .range(..=offset)
+            .next_back()
+            .filter(|(first, len)| offset < *first + *len)
+            .map(|(first, _)| *first)
+    }
+
+    /// Mark `len` consecutive offsets missing, starting at `from`, wrapping.
+    ///
+    /// Splits at the wrap point so every stored run is linear in offsets, and
+    /// merges with any run it touches so a source that loses files in adjacent
+    /// batches ends up with one hole rather than a chain of them.
+    fn add_run(&mut self, from: u64, len: u64) {
+        let size = self.space.size();
+        if from + len <= size {
+            self.add_linear_run(from, len);
+        } else {
+            let head = size - from;
+            self.add_linear_run(from, head);
+            self.add_linear_run(0, len - head);
+        }
+    }
+
+    /// Mark a run that does not cross the wrap point.
+    fn add_linear_run(&mut self, from: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let (mut start, mut end) = (from, from + len);
+
+        // Absorb the run that starts at or before `start` and reaches it, then
+        // every run that begins inside the widened span. Both are removals from
+        // the map, so the count is recomputed from what survives rather than
+        // adjusted term by term.
+        if let Some(previous) = self
+            .holes
+            .range(..=start)
+            .next_back()
+            .filter(|(first, len)| *first + *len >= start)
+            .map(|(first, len)| (*first, *len))
+        {
+            self.holes.remove(&previous.0);
+            self.missing_count -= previous.1;
+            start = previous.0;
+            end = end.max(previous.0 + previous.1);
+        }
+        let overlapping: Vec<u64> = self
+            .holes
+            .range(start..=end)
+            .map(|(first, _)| *first)
+            .collect();
+        for first in overlapping {
+            let absorbed = self.holes.remove(&first).unwrap_or(0);
+            self.missing_count -= absorbed;
+            end = end.max(first + absorbed);
+        }
+
+        self.holes.insert(start, end - start);
+        self.missing_count += end - start;
+    }
+
+    /// Remove one offset from the holes, `true` when it was there.
+    fn take_hole(&mut self, offset: u64) -> bool {
+        let Some(first) = self.run_containing(offset) else {
+            return false;
+        };
+        let len = self.holes.remove(&first).unwrap_or(0);
+        let end = first + len;
+        self.missing_count -= len;
+        if offset > first {
+            self.holes.insert(first, offset - first);
+            self.missing_count += offset - first;
+        }
+        if offset + 1 < end {
+            self.holes.insert(offset + 1, end - offset - 1);
+            self.missing_count += end - offset - 1;
+        }
+        true
+    }
+}
+
+impl fmt::Display for SequenceTracker {
+    /// The high-water mark and what is outstanding, in one line.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.high_water {
+            None => f.write_str("nothing seen"),
+            Some(high) => write!(
+                f,
+                "high water {high}, {} missing in {} hole(s)",
+                self.missing_count,
+                self.holes.len()
+            ),
+        }
     }
 }
 
@@ -441,7 +771,8 @@ impl SequenceTracker {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{SequenceSpace, SequenceValue};
+    use super::{SequenceSnapshot, SequenceSpace, SequenceTracker, SequenceValue};
+    use serde::de;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     /// Field names are part of the public representation and covered by semver.
@@ -493,6 +824,46 @@ mod serde_impl {
             let r = ValueRepr::deserialize(deserializer)?;
             SequenceValue::new(r.space, r.value)
                 .ok_or_else(|| serde::de::Error::custom("value outside its sequence space"))
+        }
+    }
+
+    /// A tracker is caller-owned state that has to survive a restart, so it
+    /// serialises through its snapshot: the space it follows, how far it has
+    /// got, and the runs of files it is still waiting for. Runs rather than
+    /// values, so a source missing four billion files is three numbers.
+    ///
+    /// Field names are part of the public representation and covered by semver.
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename = "SequenceTracker")]
+    struct TrackerRepr {
+        space: SequenceSpace,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        high_water: Option<u32>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        holes: Vec<(u64, u64)>,
+    }
+
+    impl Serialize for SequenceTracker {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let snapshot = self.snapshot();
+            TrackerRepr {
+                space: snapshot.space,
+                high_water: snapshot.high_water,
+                holes: snapshot.holes,
+            }
+            .serialize(serializer)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for SequenceTracker {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let r = TrackerRepr::deserialize(deserializer)?;
+            SequenceTracker::restore(SequenceSnapshot {
+                space: r.space,
+                high_water: r.high_water,
+                holes: r.holes,
+            })
+            .ok_or_else(|| de::Error::custom("a self-consistent sequence tracker"))
         }
     }
 }
@@ -582,7 +953,8 @@ mod tests {
         assert_eq!(
             tracker.observe_default(15),
             SequenceObservation::Gap {
-                missing: vec![12, 13, 14]
+                missing: vec![12, 13, 14],
+                missing_count: 3,
             }
         );
 
@@ -645,7 +1017,8 @@ mod tests {
         assert_eq!(
             tracker.observe_default(2),
             SequenceObservation::Gap {
-                missing: vec![99_999, 1]
+                missing: vec![99_999, 1],
+                missing_count: 2,
             }
         );
         assert_eq!(tracker.missing(), vec![1, 99_999]);
@@ -663,17 +1036,127 @@ mod tests {
         assert!(tracker.is_complete());
     }
 
-    /// A corrupt sequence number must not be able to allocate the whole space.
+    /// A corrupt sequence number must not be able to allocate the whole space —
+    /// and must not be able to make an incomplete source look complete either.
+    /// The list is bounded; the count never is.
     #[test]
-    fn the_missing_list_is_bounded() {
+    fn the_missing_list_is_bounded_but_the_count_is_exact() {
         let mut tracker = SequenceTracker::new(SequenceSpace::TAP);
         tracker.observe_default(1);
         let observation = tracker.observe(40_000, 100);
         match observation {
-            SequenceObservation::Gap { missing } => assert_eq!(missing.len(), 100),
+            SequenceObservation::Gap {
+                missing,
+                missing_count,
+            } => {
+                assert_eq!(missing.len(), 100, "the list is capped");
+                assert_eq!(missing_count, 39_998, "the count is not");
+            }
             other => panic!("expected a gap, got {other:?}"),
         }
-        assert_eq!(tracker.missing_count(), 100);
+        // The whole hole is remembered, not just the hundred that were named:
+        // a tracker that forgot the rest would call this source complete after
+        // a hundred resends while 39 898 files were still missing.
+        assert_eq!(tracker.missing_count(), 39_998);
+        assert_eq!(tracker.hole_count(), 1, "one run, not 39 998 entries");
+        assert_eq!(tracker.missing_runs(), vec![(2, 39_999)]);
+        assert!(!tracker.is_complete());
+    }
+
+    /// The pathological case the run representation exists for: the largest
+    /// forward jump RFC 1982 will read as a gap — just under half a 32-bit
+    /// space — must cost one run, must be counted exactly, and must not be able
+    /// to allocate two billion entries on the way.
+    #[test]
+    fn the_largest_readable_gap_costs_one_run() {
+        let mut tracker = SequenceTracker::new(SequenceSpace::U32);
+        tracker.observe_default(0);
+
+        let arriving = 2_000_000_000u32;
+        let observation = tracker.observe(arriving, 4);
+        let expected = u64::from(arriving) - 1;
+
+        assert_eq!(observation.missing_count(), expected);
+        assert!(observation.missing_is_truncated());
+        assert_eq!(tracker.hole_count(), 1, "two billion holes, one run");
+        assert_eq!(tracker.missing_count(), expected);
+        assert_eq!(tracker.missing_upto(3), vec![1, 2, 3]);
+        assert_eq!(tracker.missing_runs(), vec![(1, arriving - 1)]);
+    }
+
+    /// The other half of RFC 1982: a jump of *more* than half the space is a
+    /// regression, not a gap, so it opens nothing at all.
+    #[test]
+    fn a_jump_past_half_the_space_is_a_regression_not_a_gap() {
+        let mut tracker = SequenceTracker::new(SequenceSpace::U32);
+        tracker.observe_default(0);
+        assert_eq!(
+            tracker.observe_default(u32::MAX),
+            SequenceObservation::Unexpected
+        );
+        assert!(tracker.is_complete());
+        assert_eq!(tracker.high_water(), Some(0));
+    }
+
+    /// Filling a value in the middle of a run splits it, and the count stays
+    /// exact on both sides.
+    #[test]
+    fn filling_the_middle_of_a_run_splits_it() {
+        let mut tracker = SequenceTracker::new(SequenceSpace::TAP);
+        tracker.observe_default(1);
+        tracker.observe_default(10); // 2..=9 missing
+        assert_eq!(tracker.hole_count(), 1);
+        assert_eq!(tracker.missing_count(), 8);
+
+        assert_eq!(tracker.observe_default(6), SequenceObservation::FilledGap);
+        assert_eq!(tracker.hole_count(), 2);
+        assert_eq!(tracker.missing_count(), 7);
+        assert_eq!(tracker.missing_runs(), vec![(2, 5), (7, 9)]);
+        assert!(tracker.is_missing(5));
+        assert!(!tracker.is_missing(6));
+    }
+
+    /// Two holes that grow into each other become one run, and the count is not
+    /// double-charged for the join.
+    #[test]
+    fn adjacent_runs_merge() {
+        let mut tracker = SequenceTracker::new(SequenceSpace::TAP);
+        tracker.observe_default(1);
+        tracker.observe_default(5); // 2..=4
+        tracker.observe_default(4); // fills 4, leaving 2..=3
+        tracker.observe_default(9); // 6..=8
+        assert_eq!(tracker.missing_runs(), vec![(2, 3), (6, 8)]);
+
+        // 5 arrives late? No — 5 was already seen. Fill the join instead.
+        tracker.observe_default(2);
+        tracker.observe_default(3);
+        assert_eq!(tracker.missing_runs(), vec![(6, 8)]);
+        assert_eq!(tracker.missing_count(), 3);
+    }
+
+    /// A tracker is state a restart must not lose.
+    #[test]
+    fn a_tracker_round_trips_through_its_snapshot() {
+        let mut tracker = SequenceTracker::new(SequenceSpace::TAP);
+        tracker.observe_default(99_998);
+        tracker.observe_default(4); // a hole straddling the wrap
+        tracker.observe_default(2);
+
+        let restored = SequenceTracker::restore(tracker.snapshot()).expect("self-consistent");
+        assert_eq!(restored, tracker);
+        assert_eq!(restored.missing_runs(), tracker.missing_runs());
+        assert_eq!(restored.missing_count(), tracker.missing_count());
+    }
+
+    #[test]
+    fn a_contradictory_snapshot_is_refused_rather_than_restored() {
+        let mut snapshot = SequenceTracker::new(SequenceSpace::TAP).snapshot();
+        snapshot.high_water = Some(200_000);
+        assert!(SequenceTracker::restore(snapshot).is_none());
+
+        let mut overlapping = SequenceTracker::new(SequenceSpace::TAP).snapshot();
+        overlapping.holes = vec![(0, 5), (3, 5)];
+        assert!(SequenceTracker::restore(overlapping).is_none());
     }
 
     /// A hole a partner will never fill must stop blocking future batches, and
@@ -689,12 +1172,11 @@ mod tests {
         assert_eq!(tracker.missing(), vec![2, 3]);
 
         // Nothing older than 100 steps back yet.
-        assert!(tracker.abandon_older_than(100).is_empty());
+        assert_eq!(tracker.abandon_older_than(100), 0);
         assert!(!tracker.is_complete());
 
         // Ten steps back does reach them.
-        let abandoned = tracker.abandon_older_than(10);
-        assert_eq!(abandoned, vec![2, 3]);
+        assert_eq!(tracker.abandon_older_than(10), 2);
         assert!(tracker.is_complete());
     }
 }

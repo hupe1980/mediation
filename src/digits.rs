@@ -52,13 +52,56 @@ const TBCD_FILLER: u8 = 0x0F;
 
 /// A short run of decimal digits, packed two per byte and stored inline.
 ///
+/// # Equality, hashing and ordering all follow the digit sequence
+///
 /// Trailing nibbles beyond the length are always zero, so the derived
-/// [`PartialEq`], [`Ord`] and [`Hash`] agree with the digit sequence rather than
-/// with whatever happened to be in the buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+/// [`PartialEq`] and [`Hash`] agree with the digits rather than with whatever
+/// happened to be in the buffer.
+///
+/// [`Ord`] is written by hand rather than derived, and that is load-bearing.
+/// The packing puts the **earlier** digit in the low nibble, so a byte's
+/// numeric value orders the second digit ahead of the first: derived, `"19"`
+/// would sort after `"21"`. Every prefix table, every sorted report and every
+/// `BTreeMap` keyed on an identifier would then be in an order no reader could
+/// predict. The hand-written comparison walks the digits, so `"19" < "21"` and
+/// `"12" < "123"`, exactly as the strings compare.
+///
+/// ```rust
+/// use mediation::DigitString;
+///
+/// let mut runs: Vec<DigitString> = ["21", "19", "123", "12"]
+///     .iter()
+///     .map(|s| s.parse().unwrap())
+///     .collect();
+/// runs.sort();
+///
+/// let rendered: Vec<String> = runs.iter().map(ToString::to_string).collect();
+/// assert_eq!(rendered, ["12", "123", "19", "21"]);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct DigitString {
     packed: [u8; PACKED_BYTES],
     len: u8,
+}
+
+impl Ord for DigitString {
+    /// Digit-sequence order: leading digits first, then the shorter run.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let common = self.len().min(other.len());
+        for i in 0..common {
+            match self.at(i).cmp(&other.at(i)) {
+                std::cmp::Ordering::Equal => {}
+                unequal => return unequal,
+            }
+        }
+        self.len().cmp(&other.len())
+    }
+}
+
+impl PartialOrd for DigitString {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl DigitString {
@@ -121,8 +164,11 @@ impl DigitString {
     #[must_use]
     pub fn slice(self, start: usize, count: usize) -> Self {
         let mut out = Self::EMPTY;
-        if start + count > self.len() {
-            return out;
+        // Checked: `start + count` wraps in release for absurd arguments, and a
+        // wrapped sum compares below the length and reads past the run.
+        match start.checked_add(count) {
+            Some(end) if end <= self.len() => {}
+            _ => return out,
         }
         for i in 0..count {
             // Unreachable: `count <= self.len() <= MAX_DIGITS`, checked above.
@@ -133,6 +179,23 @@ impl DigitString {
                 .expect("a sub-run of a valid run always fits");
         }
         out
+    }
+
+    /// `true` when `prefix` is a leading run of `self`.
+    ///
+    /// A prefix longer than the run is not a prefix of it — the test a
+    /// longest-prefix number-range lookup needs, and the one place an
+    /// off-by-one puts a short number in a block carved out of it.
+    #[must_use]
+    pub fn starts_with(self, prefix: Self) -> bool {
+        prefix.len() <= self.len() && (0..prefix.len()).all(|i| self.at(i) == prefix.at(i))
+    }
+
+    /// The first `count` digits, or [`EMPTY`](Self::EMPTY) if the run is
+    /// shorter.
+    #[must_use]
+    pub fn prefix(self, count: usize) -> Self {
+        self.slice(0, count)
     }
 
     /// The digits read as a number.

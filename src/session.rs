@@ -408,6 +408,158 @@ impl FromStr for RatType {
     }
 }
 
+// ── ChargingCharacteristics ──────────────────────────────────────────────────
+
+/// The sixteen operator-defined charging behaviours a session ran under
+/// (3GPP TS 32.251 Annex A, carried as `chargingCharacteristics` in TS 32.298).
+///
+/// The HSS supplies it with the subscription, the SGSN or MME forwards it at
+/// IP-CAN bearer activation, and it reaches every CDR the session produces. It
+/// is what decides whether records are generated at all, at what time and
+/// volume limits, and which gateway they go to — so a mediation layer that
+/// discards it has thrown away the record's own account of why it exists.
+///
+/// # Sixteen bits, and the crate reads none of them
+///
+/// TS 32.251 §A.1 is explicit: the parameter is "a string of 16 bits designated
+/// as Behaviours (B), **freely defined by Operators**", each pointing at a
+/// behaviour "defined on a per operator basis". `0x0800` is prepaid at one
+/// operator and a lab profile at the next, and the specification's own tables
+/// are labelled informative examples.
+///
+/// So this type carries the bits, compares them, and renders them. It has no
+/// `is_prepaid`, and it will not get one — the same stance the crate takes on
+/// E.212 MNC widths, EEA membership and high-risk number ranges. Guessing here
+/// would misroute records with a plausible-looking answer, which is worse than
+/// no answer.
+///
+/// ```rust
+/// use mediation::ChargingCharacteristics;
+///
+/// // Four hex digits, the form an operator's provisioning system writes.
+/// let profile: ChargingCharacteristics = "0800".parse().unwrap();
+/// assert_eq!(profile.to_string(), "0800");
+/// assert_eq!(profile.to_bytes(), [0x08, 0x00]);
+///
+/// // Behaviour 11 is set. What behaviour 11 *means* is the operator's.
+/// assert!(profile.behaviour(11));
+/// assert!(!profile.behaviour(0));
+/// assert_eq!(profile.set_behaviours().collect::<Vec<_>>(), vec![11]);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ChargingCharacteristics(u16);
+
+/// The shape [`ChargingCharacteristics`] accepts, as rendered in a [`ParseError`].
+const CHARGING_CHARACTERISTICS_FORMAT: &str = "exactly four hexadecimal digits, such as 0800";
+
+impl ChargingCharacteristics {
+    /// The wire length, in octets.
+    pub const OCTETS: usize = 2;
+
+    /// No behaviour selected.
+    ///
+    /// Distinct from *absent*: a record that carried `0000` said the operator
+    /// selected nothing, and one that carried no field said nothing at all.
+    /// [`UsageRecord`](crate::UsageRecord) keeps the difference in an `Option`.
+    pub const NONE: Self = Self(0);
+
+    /// A profile from its sixteen bits.
+    ///
+    /// Bit `n` of this value is behaviour `n`, counting from the least
+    /// significant — which makes [`to_bytes`](Self::to_bytes) the big-endian
+    /// pair and the [`Display`](std::fmt::Display) form the same four hex
+    /// digits an operator's provisioning system shows.
+    #[must_use]
+    pub const fn from_bits(bits: u16) -> Self {
+        Self(bits)
+    }
+
+    /// The sixteen bits.
+    #[must_use]
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+
+    /// Decode the two-octet field, most significant octet first.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError`] for any length but two.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        match bytes {
+            [high, low] => Ok(Self(u16::from_be_bytes([*high, *low]))),
+            _ => Err(DecodeError::new(0, "exactly 2 octets")),
+        }
+    }
+
+    /// Encode to the two-octet field.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; Self::OCTETS] {
+        self.0.to_be_bytes()
+    }
+
+    /// Whether behaviour `index` is selected. `false` for an index past 15.
+    #[must_use]
+    pub const fn behaviour(self, index: u8) -> bool {
+        index < 16 && self.0 & (1u16 << index) != 0
+    }
+
+    /// The indices of every behaviour selected, ascending.
+    ///
+    /// The form a routing table is keyed by, and the form a report reads: an
+    /// operator's profile document lists behaviour numbers, not a hex value.
+    pub fn set_behaviours(self) -> impl Iterator<Item = u8> {
+        (0u8..16).filter(move |index| self.behaviour(*index))
+    }
+
+    /// How many behaviours are selected.
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        self.0.count_ones()
+    }
+
+    /// `true` when no behaviour is selected.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl fmt::Display for ChargingCharacteristics {
+    /// Four upper-case hex digits, always — the form the field is written in,
+    /// and one spelling per value so two records cannot disagree in a report.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:04X}", self.0)
+    }
+}
+
+impl FromStr for ChargingCharacteristics {
+    type Err = ParseError;
+
+    /// Parses four hex digits, either case.
+    ///
+    /// Exactly four: `800` is not `0800` in a field whose bit positions are the
+    /// whole meaning, and accepting a short form would silently shift every
+    /// behaviour index by four.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let t = s.trim();
+        if t.len() != 4 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ParseError::format(
+                "ChargingCharacteristics",
+                s,
+                CHARGING_CHARACTERISTICS_FORMAT,
+            ));
+        }
+        u16::from_str_radix(t, 16).map(Self).map_err(|_| {
+            ParseError::format(
+                "ChargingCharacteristics",
+                s,
+                CHARGING_CHARACTERISTICS_FORMAT,
+            )
+        })
+    }
+}
+
 // ── SessionContext ───────────────────────────────────────────────────────────
 
 /// What a data session was established against.
@@ -424,6 +576,11 @@ pub struct SessionContext {
     pub rat: Option<RatType>,
     /// Where the subscriber was, in whichever form the access reported.
     pub location: Option<UserLocation>,
+    /// The operator-defined charging behaviours the session ran under.
+    ///
+    /// `None` when the record carried no field, which is not the same as
+    /// [`ChargingCharacteristics::NONE`] — see that constant.
+    pub charging_characteristics: Option<ChargingCharacteristics>,
 }
 
 impl SessionContext {
@@ -435,6 +592,7 @@ impl SessionContext {
             snssai: None,
             rat: None,
             location: None,
+            charging_characteristics: None,
         }
     }
 
@@ -455,6 +613,13 @@ impl SessionContext {
     #[must_use]
     pub const fn with_snssai(mut self, snssai: Snssai) -> Self {
         self.snssai = Some(snssai);
+        self
+    }
+
+    /// The same context with a charging-characteristics profile.
+    #[must_use]
+    pub const fn with_charging_characteristics(mut self, cc: ChargingCharacteristics) -> Self {
+        self.charging_characteristics = Some(cc);
         self
     }
 
@@ -525,7 +690,10 @@ impl fmt::Display for SessionContext {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{Dnn, RatType, SessionContext, SliceServiceType, Snssai, UserLocation};
+    use super::{
+        ChargingCharacteristics, Dnn, RatType, SessionContext, SliceServiceType, Snssai,
+        UserLocation,
+    };
     use serde::de::{self, Visitor};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::fmt;
@@ -559,6 +727,10 @@ mod serde_impl {
     string_serde!(Dnn, "a data network name such as \"internet\"");
     string_serde!(RatType, "a radio access type code such as \"NR\"");
     string_serde!(Snssai, "a slice identity such as \"1-0000a1\"");
+    string_serde!(
+        ChargingCharacteristics,
+        "four hexadecimal digits such as \"0800\""
+    );
 
     impl Serialize for SliceServiceType {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -584,6 +756,8 @@ mod serde_impl {
         rat: Option<RatType>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         location: Option<UserLocation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        charging_characteristics: Option<ChargingCharacteristics>,
     }
 
     impl Serialize for SessionContext {
@@ -593,6 +767,7 @@ mod serde_impl {
                 snssai: self.snssai,
                 rat: self.rat,
                 location: self.location,
+                charging_characteristics: self.charging_characteristics,
             }
             .serialize(serializer)
         }
@@ -606,6 +781,7 @@ mod serde_impl {
                 snssai: r.snssai,
                 rat: r.rat,
                 location: r.location,
+                charging_characteristics: r.charging_characteristics,
             })
         }
     }

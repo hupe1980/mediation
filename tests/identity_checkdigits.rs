@@ -7,7 +7,7 @@
 //! records. The types are separate so the compiler enforces the difference,
 //! and this suite pins the behavioural consequences.
 
-use mediation::{Iccid, Imei, Imeisv, Pei};
+use mediation::{Iccid, Imei, Imeisv, Pei, Suci};
 use proptest::prelude::*;
 
 /// The IMEI used throughout 3GPP documentation and conformance material.
@@ -164,5 +164,55 @@ proptest! {
             "corruption of {} at {} must be caught: {}",
             valid, position, corrupted
         );
+    }
+}
+
+// ── SUCI ─────────────────────────────────────────────────────────────────────
+
+/// TS 23.003 §2.2B fixes seven fields in one order. The routing indicator is
+/// easy to leave out and the scheme and key identifiers are easy to swap — both
+/// are small integers that look alike in a debug print — and a value spelled
+/// either way round is rejected by every core it reaches, only at the point of
+/// use.
+#[test]
+fn a_suci_spells_its_seven_fields_in_the_order_the_spec_fixes() {
+    let canonical = "suci-0-262-02-0678-1-27-0072b7d4c1e8";
+    let suci: Suci = canonical.parse().unwrap();
+
+    assert_eq!(suci.home_network.to_string(), "262-02");
+    assert_eq!(suci.routing_indicator.to_string(), "0678");
+    assert_eq!(suci.protection_scheme, 1);
+    assert_eq!(suci.public_key_id, 27);
+    assert_eq!(suci.scheme_output, "0072b7d4c1e8");
+    assert_eq!(suci.to_string(), canonical);
+    assert!(!suci.is_null_scheme());
+}
+
+/// The routing indicator keeps its leading zeros, exactly as an MNC does: `0`
+/// and `0000` route to different places.
+#[test]
+fn a_routing_indicator_keeps_its_leading_zeros() {
+    let short: Suci = "suci-0-262-02-678-0-0-1234567890".parse().unwrap();
+    let padded: Suci = "suci-0-262-02-0678-0-0-1234567890".parse().unwrap();
+
+    assert_ne!(short, padded);
+    assert_eq!(short.routing_indicator.to_string(), "678");
+    assert_eq!(padded.routing_indicator.to_string(), "0678");
+    assert!(short.is_null_scheme());
+}
+
+#[test]
+fn a_suci_refuses_what_it_cannot_spell_back() {
+    for s in [
+        "",
+        "suci-0-262-02-0678-1-27",       // the pre-fix six-field spelling
+        "suci-1-262-02-0678-1-27-00ab",  // the NAI form is a different shape
+        "suci-0-262-02-06789-1-27-00ab", // five routing digits
+        "suci-0-262-02-0678-16-27-00ab", // the scheme identifier is four bits
+        "suci-0-262-02-0678-1-256-00ab", // the key identifier is one octet
+        "suci-0-262-02-0678-1-27-",      // no scheme output
+        "suci-0-262-2-0678-1-27-00ab",   // an MNC keeps its leading zero
+    ] {
+        assert!(s.parse::<Suci>().is_err(), "{s:?} must not parse");
     }
 }
