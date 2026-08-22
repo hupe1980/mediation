@@ -11,9 +11,6 @@
   "isPartOf": { "@type": "WebSite", "name": "{{ config.title }}", "url": "{{ config.base_url }}" }
 }{% endblock %}
 
-{% set title = section.title %}
-{% set description = section.description | default(value=config.description) %}
-
 {% block content %}
 <div class="doclayout wrap">
   {% include "docs/nav.html" %}

@@ -136,7 +136,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
         with:
-          tool: zola
+          # Pinned: template validation has tightened between patch releases, so
+          # an unpinned CI can reject a site a contributor just checked locally.
+          # Keep in sync with `zola_version` in the justfile.
+          tool: zola@0.23.4
       # `zola check` validates every internal link and reports orphan pages.
       # The site's Rust blocks are compiled by the `test` job above, because
       # `src/lib.rs` includes every page as a doctest — so a page cannot claim

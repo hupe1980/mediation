@@ -7,6 +7,15 @@ set shell := ["bash", "-uc"]
 # MSRV — keep in sync with `rust-version` in Cargo.toml and rust-toolchain.toml.
 msrv := "1.94"
 
+# Zola version CI pins — keep in sync with `tool: zola@…` in the workflows.
+#
+# It is pinned because template validation has tightened between *patch*
+# releases: 0.23.4 rejects a child template that 0.23.3 accepts. An older local
+# build therefore passes a site CI will reject, which is the one failure mode a
+# local check exists to prevent. Homebrew can lag; the release binaries at
+# https://github.com/getzola/zola/releases are the reliable way to match.
+zola_version := "0.23.4"
+
 # 📋 List all recipes
 default:
     @just --list
@@ -113,6 +122,17 @@ site-check:
         echo "⏭️  zola not installed — skipping the site link check"
         echo "   install it from https://www.getzola.org to run \`just site\`"
         exit 0
+    fi
+    have="$(zola --version | awk '{print $2}')"
+    want="{{ zola_version }}"
+    # A *lower* local version is the dangerous direction: it accepts templates
+    # CI rejects, so the check passes here and fails there. Warn rather than
+    # fail, because the link checking it still does is worth having.
+    if [ "$have" != "$want" ] \
+       && [ "$(printf '%s\n%s\n' "$want" "$have" | sort -V | head -1)" = "$have" ]; then
+        echo "⚠️  zola $have is older than the $want that CI pins" >&2
+        echo "   template validation has tightened between patch releases —" >&2
+        echo "   this check can pass locally and still fail in CI." >&2
     fi
     cd site && zola check
 
