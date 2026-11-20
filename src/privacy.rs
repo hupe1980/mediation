@@ -120,7 +120,7 @@ impl FromStr for Pseudonym {
             _ => None,
         };
         let mut digest = [0u8; 32];
-        for (slot, pair) in digest.iter_mut().zip(bytes.chunks_exact(2)) {
+        for (slot, pair) in digest.iter_mut().zip(bytes.as_chunks::<2>().0) {
             *slot = (nibble(pair[0]).ok_or_else(err)? << 4) | nibble(pair[1]).ok_or_else(err)?;
         }
         Ok(Self(digest))
