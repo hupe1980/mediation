@@ -19,12 +19,11 @@
 <section class="hero">
   <div class="wrap">
     <p class="eyebrow">Rust · zero I/O · no async · no clock</p>
-    <h1>The arithmetic between a mobile network and a billing system.</h1>
+    <h1>The arithmetic between a telecom network and a billing system.</h1>
     <p class="lede">
-      <strong>mediation</strong> normalises, validates, deduplicates and correlates
-      telecom usage records — and proves it did not lose any. It computes
-      <em>usage</em>, not money: octets, seconds and event counts, attributed to a
-      charged party, which a rating layer then prices.
+      <strong>mediation</strong> normalises, deduplicates, correlates and reconciles
+      usage records from mobile and fixed-line networks — and proves it lost none.
+      Octets, seconds and events out; pricing stays with your rater.
     </p>
 
     <div class="cta">
@@ -38,157 +37,84 @@
 </section>
 
 <section class="law wrap" aria-labelledby="law-h">
-  <h2 id="law-h">A pipeline moves records. A mediation layer can prove it did not lose any.</h2>
+  <h2 id="law-h">Every record reaches exactly one outcome.</h2>
   <pre class="equation"><code>carried_in + ingested == billable + suppressed + duplicate + rejected + held</code></pre>
-  <p>
-    That equation is a method — <code>BatchReconciliation::balances()</code> — and
-    the crate is built so it holds by construction. A batch that fails it has
-    unknown completeness, and billing over unknown completeness invoices an
-    amount nobody can prove is right.
-  </p>
+  <p>A batch that does not balance is not released.</p>
 </section>
 
 <section class="pillars wrap" aria-labelledby="pillars-h">
-  <h2 id="pillars-h">Four things it refuses to get wrong</h2>
+  <h2 id="pillars-h">Built for the failures that reach invoices</h2>
   <div class="grid">
     <article>
-      <h3>Time is local, plus an offset</h3>
-      <p>
-        A charging record carries a <strong>local</strong> wall clock and a numeric
-        offset counting <strong>quarter-hours</strong> (3GPP TS 32.298). Reading it
-        as UTC books every evening event of a UTC+X network onto the wrong day,
-        and the offset varies per record, so no constant fixes it downstream.
-      </p>
-      <a href="{{ get_url(path='@/docs/time.md') | safe }}">How time works →</a>
+      <h3>Local time, quarter-hour offsets</h3>
+      <p>A CDR timestamp is local time plus an offset that varies per record (TS 32.298).</p>
+      <a href="{{ get_url(path='@/docs/time.md') | safe }}">Time →</a>
     </article>
     <article>
-      <h3>Quantities are integers</h3>
-      <p>
-        A data volume is a count. Above 2<sup>53</sup> octets — about 9 PB, which a
-        national monthly aggregate crosses — an <code>f64</code> can no longer
-        represent consecutive integers. No value here is ever routed through a
-        float, and CI greps for one.
-      </p>
-      <a href="{{ get_url(path='@/docs/quantities.md') | safe }}">Octets, not megabytes →</a>
+      <h3>Integer quantities</h3>
+      <p>Octets are <code>u64</code>, seconds <code>u32</code>. No float, anywhere.</p>
+      <a href="{{ get_url(path='@/docs/quantities.md') | safe }}">Quantities →</a>
     </article>
     <article>
-      <h3>Loss leaves one trace</h3>
-      <p>
-        A lost record file leaves nothing in the surviving data — no short total,
-        no complaint. The only evidence is a hole in a per-source sequence
-        number, and the trap is the wrap at <code>99999 → 00001</code>. RFC 1982
-        arithmetic, exact hole counts, and the source waits until it can account
-        for itself.
-      </p>
+      <h3>Billed once, lost never</h3>
+      <p>Natural-key deduplication, wrap-safe sequence gaps, held partial runs.</p>
       <a href="{{ get_url(path='@/docs/completeness.md') | safe }}">Completeness →</a>
     </article>
     <article>
-      <h3>Every input is untrusted</h3>
-      <p>
-        Records arrive over a network from a partner's equipment. No parser and
-        no decoder may panic on any input, anything sized by the input is
-        bounded, and nothing is silently skipped. A property suite hammers all of
-        them on every build.
-      </p>
-      <a href="{{ get_url(path='@/docs/design.md') | safe }}">Design constraints →</a>
+      <h3>Fixed-line voice</h3>
+      <p>Dial strings to destinations, Call-ID keys, the § 11 TDDDG itemised bill.</p>
+      <a href="{{ get_url(path='@/docs/fixed-voice.md') | safe }}">Fixed-line voice →</a>
     </article>
   </div>
 </section>
 
 <section class="showcase wrap" aria-labelledby="showcase-h">
-  <h2 id="showcase-h">One pass over a batch, in one call</h2>
-  <p>
-    Every piece works on its own. <code>process</code> is the assembly, and it
-    exists because the <em>order</em> of the pieces is itself a decision that is
-    easy to get wrong quietly — deduplicating after rejecting reports one fault
-    twice; holding a partial run after counting it billable double-bills the
-    session when its successor arrives.
-  </p>
+  <h2 id="showcase-h">One pass over a batch</h2>
 
 {% set code = "
-let config = ProcessConfig::default();
-let mut state = ProcessState::new(DedupWindow::from_bound(Duration::days(7))?);
+let mut state = ProcessState::new(DedupWindow::from_bound(Duration::days(7)).unwrap());
 
 let outcome = process(
     &Batch::new(&records),
-    &config,
+    &ProcessConfig::default(),
     datetime!(2026-07-28 12:00:00 UTC),
     &mut state,
 );
 
-// One disposition per record, and the counts that account for all of them.
 assert!(outcome.reconciliation().balances());
-assert!(outcome.is_releasable());
-
-// The files to ask a partner to resend, by name rather than by count.
 for gap in outcome.sequence_gaps() {
     eprintln!(\"resend {:?} from {}\", gap.missing, gap.node);
 }
 " %}
   <pre><code class="language-rust">{{ code | trim }}</code></pre>
 
-  <p>
-    Deduplication and gap detection are inherently stateful, so
-    <code>ProcessState</code> is <strong>caller-owned and passed in</strong>. That
-    keeps <code>process</code> a pure mapping from
-    <code>(batch, config, as_of, state)</code> to <code>(outcome, state′)</code> —
-    which is what makes a replay reproducible in 2026 and in 2031.
-  </p>
-  <a class="btn" href="{{ get_url(path='@/docs/pipeline.md') | safe }}">The order, and why it is that one</a>
+  <p>State is caller-owned and passed in, so a replay in five years gives the same answer.</p>
+  <a class="btn" href="{{ get_url(path='@/docs/pipeline.md') | safe }}">How the pass works</a>
 </section>
 
 <section class="scope wrap" aria-labelledby="scope-h">
-  <h2 id="scope-h">What it is, and what it is not</h2>
+  <h2 id="scope-h">Scope</h2>
   <div class="two">
     <div>
-      <h3>In scope</h3>
+      <h3>In</h3>
       <ul>
-        <li>Local-time-plus-offset arithmetic, DST-aware, quarter-hour offsets</li>
-        <li>Validated identifiers — IMSI, MSISDN, IMEI, ICCID, SUPI, GPSI, PEI, SUCI, PLMN, TADIG</li>
-        <li>Natural-key deduplication over a bounded window</li>
-        <li>Wrap-safe sequence-gap detection, per source</li>
-        <li>Partial-record reassembly and cross-node correlation</li>
-        <li>Wire codecs: BER framing, TBCD/BCD, ISDN-AddressString, PLMN identity, the full ULI element</li>
-        <li>A numbered rule catalogue, a release gate and a conservation law</li>
-        <li>Roaming batch reconciliation, EU regulatory arithmetic, fraud evidence</li>
+        <li>Validated identities — IMSI, MSISDN, IMEI, SUPI (incl. wireline), SUCI, PLMN</li>
+        <li>Deduplication, sequence gaps, partial reassembly, correlation</li>
+        <li>Wire codecs — BER, TBCD/BCD, AddressString, PLMN, ULI</li>
+        <li>Dial plans and destination classes</li>
+        <li>Validation rules V01–V21, release gate, conservation law</li>
+        <li>Roaming reconciliation, EU/German regulatory arithmetic, fraud evidence</li>
       </ul>
     </div>
     <div>
-      <h3>Out of scope, deliberately</h3>
+      <h3>Out</h3>
       <ul>
-        <li><strong>Collection</strong> — GTP′, SFTP, Kafka and Diameter peers are I/O</li>
-        <li><strong>Rating</strong> — no currency, tariff, bundle, discount or balance type exists here</li>
-        <li><strong>Online charging</strong> — a live, stateful conversation with a CHF</li>
-        <li><strong>Orchestration</strong> — no scheduler, no retry, no queue, no store</li>
-        <li><strong>A rules GUI</strong> — rules are compiled functions with a cited clause, not a scripting runtime</li>
+        <li><strong>Collection</strong> — transports are I/O</li>
+        <li><strong>Rating</strong> — no currency or tariff type exists here</li>
+        <li><strong>Online charging</strong> — a live conversation with a CHF</li>
+        <li><strong>Orchestration</strong> — no scheduler, queue or store</li>
       </ul>
-      <p class="note">
-        Parsing is <em>not</em> I/O: decoding a record from bytes you already hold
-        is a pure function, so codecs are in scope and transports are not.
-      </p>
     </div>
-  </div>
-</section>
-
-<section class="closing wrap">
-  <h2>Rules are code, not configuration</h2>
-  <p>
-    Mediation is a mature product category, and the platforms that own it are
-    configurable ones: a workflow canvas, a scripting runtime, a rules
-    repository. Their correctness is the correctness of the scripts a systems
-    integrator wrote in them — untyped, untested, and undocumented as to which
-    clause of which standard they implement. Ten years later nobody can say why a
-    field is truncated at eight characters.
-  </p>
-  <p>
-    This library takes the opposite bet. Every rule is a compiled Rust function
-    that cites its clause at the call site and has a test derived from a
-    published example; behaviour changes only in a semver release; and the
-    correctness claims are <code>proptest</code>s you can run.
-  </p>
-  <div class="cta">
-    <a class="btn primary" href="{{ get_url(path='@/docs/getting-started.md') | safe }}">Get started</a>
-    <a class="btn ghost" href="{{ config.extra.repository }}" rel="noopener">Read the source</a>
   </div>
 </section>
 {% endblock %}

@@ -26,6 +26,18 @@
 //! container at a tariff change and reports the volume on each side.
 //! [`split_measured`] uses those. Prefer it wherever the containers are there.
 //!
+//! # A call splits on its answer time
+//!
+//! For a call, the split runs from [`opened`](crate::UsageRecord::opened) to
+//! [`closed`](crate::UsageRecord::closed), weighted by wall-clock seconds, and
+//! the chargeable duration is apportioned along it. That is exact to the second
+//! only when `opened` is the **answer** time and `closed` is answer plus the
+//! chargeable duration — which is what
+//! [`UsageRecord::call`](crate::UsageRecord::call) builds. A record opened at
+//! seizure time spreads ringing across the bands as though it were talk. The
+//! parts always sum to the record's duration; round to chargeable units once,
+//! after the split.
+//!
 //! # Apportionment conserves
 //!
 //! Splitting 1 000 octets across three unequal slices by integer division loses
@@ -321,13 +333,17 @@ pub enum SplitError {
     NegativeSpan,
     /// A container carried no close time, so a measured split is impossible.
     ContainerNotTimed,
-    /// A container closed before the band it belongs to began.
+    /// A container closed before the record opened.
     ///
-    /// Containers are in record order, which is chronological. One that closes
-    /// earlier than its predecessor is a data fault, and clamping the span to
-    /// zero would report a band that ran no time at all — a plausible number
-    /// for something that did not happen.
+    /// Its usage belongs to no part of the session, and clamping it into the
+    /// first band would report usage at a time the session did not run.
     ContainersOutOfOrder,
+    /// A container closed after the record closed (finding R13).
+    ///
+    /// The record's close bounds every container in it. A later one would
+    /// stretch the last band past the session and report wall-clock time the
+    /// session never ran.
+    ContainerAfterRecordClose,
     /// A container set held no containers to split.
     NoContainers,
     /// The record carries an event count, and containers do not divide one.
@@ -349,7 +365,8 @@ impl SplitError {
             Self::NoCloseTime => "the record has no close time",
             Self::NegativeSpan => "the record closed before it opened",
             Self::ContainerNotTimed => "a container carried no close time",
-            Self::ContainersOutOfOrder => "a container closed before its band began",
+            Self::ContainersOutOfOrder => "a container closed before the record opened",
+            Self::ContainerAfterRecordClose => "a container closed after the record closed",
             Self::NoContainers => "there are no containers to split",
             Self::EventsNotContained => "containers cannot divide an event count",
             Self::Overflow => "a quantity overflowed",
@@ -497,18 +514,29 @@ pub fn split_session(
 /// needs no assumption about when the octets flowed — which is what makes this
 /// a measurement and [`split_session`] an estimate.
 ///
-/// Containers accumulate into the current slice, and a container closed with
-/// [`ChangeCondition::TariffTime`] ends it. The first slice starts when the
-/// **record** opened, not when its first container closed — a container carries
-/// only its end. The result is always [`Apportionment::Measured`].
+/// The tariff boundaries are the close instants of the containers closed with
+/// [`ChangeCondition::TariffTime`]. Every container is grouped into the band
+/// its close instant falls in — up to and including the boundary — **across
+/// rating groups and whatever order the containers arrive in** (finding R12):
+/// a record carrying several rating groups closes one container per group at
+/// each tariff change, and each of them belongs to the band that change ends.
+/// The first band starts when the **record** opened, not when its first
+/// container closed — a container carries only its end — and the last ends at
+/// the latest container close. The result is always
+/// [`Apportionment::Measured`], and its volume sums to the containers' total.
+///
+/// A band's duration is the sum of its containers' durations, `None` when any
+/// of them carries none. Rating groups run concurrently, so with several of
+/// them that sum is not wall-clock time; [`TimeSlice::wall_clock`] is.
 ///
 /// Every container must carry a close time: without one there is nothing to
 /// place a slice boundary at, and inferring one would put the estimate back in
-/// through a side door. A record carrying an **event count** is refused
-/// outright — containers report volume and time and never events, so there is
-/// nothing to divide the count by.
+/// through a side door. A container may not close before the record opened
+/// nor after it closed (finding R13). A record carrying an **event count** is
+/// refused outright — containers report volume and time and never events, so
+/// there is nothing to divide the count by.
 pub fn split_measured(record: &UsageRecord) -> Result<UsageSplit, SplitError> {
-    let containers = &record.containers;
+    let containers = record.containers.as_slice();
     if containers.is_empty() {
         return Err(SplitError::NoContainers);
     }
@@ -519,67 +547,83 @@ pub fn split_measured(record: &UsageRecord) -> Result<UsageSplit, SplitError> {
         return Err(SplitError::EventsNotContained);
     }
 
-    let all = containers.as_slice();
-    let last = all.len() - 1;
-
-    let mut slices: Vec<TimeSlice> = Vec::new();
-    let mut slice_start: CdrTimestamp = record.opened;
-    let mut previous_close: CdrTimestamp = record.opened;
-    let mut volume = VolumePair::ZERO;
-    let mut duration: Option<Seconds> = None;
-    let mut first_of_slice = 0usize;
-
-    for (index, container) in all.iter().enumerate() {
-        let closed = container.closed.ok_or(SplitError::ContainerNotTimed)?;
-        // Containers are in record order, which is chronological. Checked at
-        // *every* container rather than only at the one that ends a band: a
-        // container that closes before its predecessor is a data fault whether
-        // or not the band's own span happens to come out positive, and letting
-        // it through would attribute its volume to a stretch of time that ran
-        // backwards.
-        if closed.to_utc() < previous_close.to_utc() {
+    let opened = record.opened.to_utc();
+    let record_closed = record.closed.map(CdrTimestamp::to_utc);
+    let mut closes: Vec<OffsetDateTime> = Vec::with_capacity(containers.len());
+    for container in containers {
+        let closed = container
+            .closed
+            .ok_or(SplitError::ContainerNotTimed)?
+            .to_utc();
+        if closed < opened {
             return Err(SplitError::ContainersOutOfOrder);
         }
-        previous_close = closed;
+        if record_closed.is_some_and(|end| closed > end) {
+            return Err(SplitError::ContainerAfterRecordClose);
+        }
+        closes.push(closed);
+    }
+    // Non-empty, so there is a latest close.
+    let end = closes.iter().copied().max().unwrap_or(opened);
 
-        volume = volume
+    // Band edges: the record's open, every tariff change strictly inside, and
+    // the last close. Sorted and deduplicated, so the same change reported by
+    // several rating groups is one boundary.
+    let mut edges: Vec<OffsetDateTime> = containers
+        .iter()
+        .zip(&closes)
+        .filter(|(c, at)| {
+            c.change_condition == ChangeCondition::TariffTime && **at > opened && **at < end
+        })
+        .map(|(_, at)| *at)
+        .collect();
+    edges.push(opened);
+    edges.push(end);
+    edges.sort();
+    edges.dedup();
+    if edges.len() == 1 {
+        // Every container closed the instant the record opened.
+        edges.push(end);
+    }
+
+    let bands = edges.len() - 1;
+    let mut volumes = vec![VolumePair::ZERO; bands];
+    let mut durations: Vec<Option<Seconds>> = vec![Some(Seconds::ZERO); bands];
+    let mut populated = vec![false; bands];
+    for (container, at) in containers.iter().zip(&closes) {
+        // The band whose end is the first edge at or after this close.
+        let band = edges[1..].partition_point(|edge| edge < at).min(bands - 1);
+        volumes[band] = volumes[band]
             .checked_add(container.volume)
             .ok_or(SplitError::Overflow)?;
-        // Every container in a slice must carry a duration or the slice has
+        // Every container in a band must carry a duration or the band has
         // none. Folding an absent one in as zero would report a chargeable
-        // time shorter than the band actually ran — the same mistake as
-        // summing a partial container set and calling it a total.
-        duration = if index == first_of_slice {
-            container.duration
-        } else {
-            match (duration, container.duration) {
-                (Some(so_far), Some(more)) => {
-                    Some(so_far.checked_add(more).ok_or(SplitError::Overflow)?)
-                }
-                _ => None,
+        // time shorter than the band actually ran.
+        durations[band] = match (durations[band], container.duration) {
+            (Some(so_far), Some(more)) => {
+                Some(so_far.checked_add(more).ok_or(SplitError::Overflow)?)
             }
+            _ => None,
         };
+        populated[band] = true;
+    }
 
-        // A tariff change ends a band; so does running out of containers.
-        let ends_slice = container.change_condition == ChangeCondition::TariffTime || index == last;
-        if ends_slice {
-            let span = (closed.to_utc() - slice_start.to_utc()).whole_seconds();
-            if span < 0 {
-                return Err(SplitError::ContainersOutOfOrder);
-            }
-            slices.push(TimeSlice {
-                start: slice_start.to_utc(),
-                end: closed.to_utc(),
-                wall_clock: Seconds::new(u32::try_from(span).map_err(|_| SplitError::Overflow)?),
-                duration,
-                volume: Some(volume),
-                events: None,
-            });
-            slice_start = closed;
-            volume = VolumePair::ZERO;
-            duration = None;
-            first_of_slice = index + 1;
-        }
+    let mut slices = Vec::with_capacity(bands);
+    for band in 0..bands {
+        let (start, stop) = (edges[band], edges[band + 1]);
+        let span = (stop - start).whole_seconds();
+        slices.push(TimeSlice {
+            start,
+            end: stop,
+            wall_clock: Seconds::new(u32::try_from(span).map_err(|_| SplitError::Overflow)?),
+            duration: if populated[band] {
+                durations[band]
+            } else {
+                None
+            },
+            volume: Some(volumes[band]),
+            events: None,
+        });
     }
 
     Ok(UsageSplit {
@@ -1004,7 +1048,7 @@ mod tests {
         assert!(
             SplitError::ContainersOutOfOrder
                 .to_string()
-                .contains("before its band began")
+                .contains("before the record opened")
         );
     }
 

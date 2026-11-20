@@ -16,7 +16,7 @@
 //! #     mediation::SubscriberRef::new("imsi-262021234567890".parse().unwrap()));
 //! # let source = SourceRef::new("msc-01".parse().unwrap(), 0);
 //! let call = UsageRecord::new(
-//!     RecordType::MobileOriginatedCall,
+//!     RecordType::OriginatedCall,
 //!     party,
 //!     "2026-07-28T10:00:00+02:00".parse().unwrap(),
 //!     source,
@@ -48,9 +48,10 @@ use std::str::FromStr;
 
 use crate::cdrtime::{CdrTimestamp, Seconds};
 use crate::container::ContainerSet;
-use crate::correlation::CorrelationKeys;
+use crate::correlation::{CallId, CorrelationKeys};
+use crate::dialplan::Destination;
 use crate::error::ParseError;
-use crate::identity::{Iccid, Pei};
+use crate::identity::{Iccid, Msisdn, Pei};
 use crate::partial::PartialInfo;
 use crate::party::ChargedParty;
 use crate::plmn::PlmnId;
@@ -67,7 +68,7 @@ use crate::volume::VolumePair;
 /// wrong service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ServiceDomain {
-    /// Circuit-switched or IMS telephony.
+    /// Telephony over any access — circuit-switched, VoLTE, VoNR or a fixed-line IMS platform.
     Voice,
     /// Short messages.
     Sms,
@@ -77,8 +78,11 @@ pub enum ServiceDomain {
     Data,
     /// IMS sessions other than telephony.
     Ims,
-    /// Fixed-line and broadband access.
-    Fixed,
+    /// Fixed broadband access — a line session measured by volume.
+    ///
+    /// Not fixed-line *telephony*: a call over a fixed line is [`Voice`](Self::Voice),
+    /// measured by duration, like a call over any other access.
+    FixedAccess,
     /// Machine-type communications: NB-IoT, LTE-M and their successors.
     Iot,
     /// Network API invocations exposed to third parties.
@@ -106,7 +110,7 @@ impl ServiceDomain {
         Self::Mms,
         Self::Data,
         Self::Ims,
-        Self::Fixed,
+        Self::FixedAccess,
         Self::Iot,
         Self::NetworkApi,
         Self::Slice,
@@ -119,7 +123,7 @@ impl ServiceDomain {
         "MMS",
         "DATA",
         "IMS",
-        "FIXED",
+        "FIXED_ACCESS",
         "IOT",
         "NETWORK_API",
         "SLICE",
@@ -134,7 +138,7 @@ impl ServiceDomain {
     pub const fn primary_measure(self) -> PrimaryMeasure {
         match self {
             Self::Voice | Self::Ims | Self::Slice => PrimaryMeasure::Duration,
-            Self::Data | Self::Fixed | Self::Iot => PrimaryMeasure::Volume,
+            Self::Data | Self::FixedAccess | Self::Iot => PrimaryMeasure::Volume,
             Self::Sms | Self::Mms | Self::NetworkApi => PrimaryMeasure::Events,
         }
     }
@@ -157,7 +161,7 @@ impl ServiceDomain {
             Self::Mms => "MMS",
             Self::Data => "DATA",
             Self::Ims => "IMS",
-            Self::Fixed => "FIXED",
+            Self::FixedAccess => "FIXED_ACCESS",
             Self::Iot => "IOT",
             Self::NetworkApi => "NETWORK_API",
             Self::Slice => "SLICE",
@@ -191,10 +195,10 @@ impl FromStr for ServiceDomain {
 /// Exhaustive for the same reason [`ServiceDomain`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RecordType {
-    /// A call placed by the subscriber.
-    MobileOriginatedCall,
+    /// A call placed by the subscriber, over any access (TS 32.250, TS 32.260).
+    OriginatedCall,
     /// A call received by the subscriber.
-    MobileTerminatedCall,
+    TerminatedCall,
     /// A call forwarded on the subscriber's behalf.
     ForwardedCall,
     /// A short message sent by the subscriber.
@@ -211,8 +215,8 @@ pub enum RecordType {
     PdpContext,
     /// An IMS session other than telephony.
     ImsSession,
-    /// A fixed-line or broadband access session.
-    FixedSession,
+    /// A fixed broadband access session.
+    FixedAccessSession,
     /// A single invocation of an exposed network API.
     NetworkApiInvocation,
     /// A network slice lifecycle event.
@@ -224,8 +228,8 @@ pub enum RecordType {
 impl RecordType {
     /// Every variant, for exhaustive iteration in tests and mappings.
     pub const ALL: &'static [Self] = &[
-        Self::MobileOriginatedCall,
-        Self::MobileTerminatedCall,
+        Self::OriginatedCall,
+        Self::TerminatedCall,
         Self::ForwardedCall,
         Self::SmsOriginated,
         Self::SmsTerminated,
@@ -234,7 +238,7 @@ impl RecordType {
         Self::PduSession,
         Self::PdpContext,
         Self::ImsSession,
-        Self::FixedSession,
+        Self::FixedAccessSession,
         Self::NetworkApiInvocation,
         Self::SliceLifecycle,
         Self::Registration,
@@ -242,8 +246,8 @@ impl RecordType {
 
     /// The canonical codes, in the order of [`ALL`](Self::ALL).
     pub const CODES: &'static [&'static str] = &[
-        "MO_CALL",
-        "MT_CALL",
+        "ORIGINATED_CALL",
+        "TERMINATED_CALL",
         "FORWARDED_CALL",
         "SMS_MO",
         "SMS_MT",
@@ -252,7 +256,7 @@ impl RecordType {
         "PDU_SESSION",
         "PDP_CONTEXT",
         "IMS_SESSION",
-        "FIXED_SESSION",
+        "FIXED_ACCESS_SESSION",
         "NETWORK_API_INVOCATION",
         "SLICE_LIFECYCLE",
         "REGISTRATION",
@@ -265,14 +269,14 @@ impl RecordType {
     #[must_use]
     pub const fn service_domain(self) -> ServiceDomain {
         match self {
-            Self::MobileOriginatedCall | Self::MobileTerminatedCall | Self::ForwardedCall => {
+            Self::OriginatedCall | Self::TerminatedCall | Self::ForwardedCall => {
                 ServiceDomain::Voice
             }
             Self::SmsOriginated | Self::SmsTerminated => ServiceDomain::Sms,
             Self::MmsOriginated | Self::MmsTerminated => ServiceDomain::Mms,
             Self::PduSession | Self::PdpContext | Self::Registration => ServiceDomain::Data,
             Self::ImsSession => ServiceDomain::Ims,
-            Self::FixedSession => ServiceDomain::Fixed,
+            Self::FixedAccessSession => ServiceDomain::FixedAccess,
             Self::NetworkApiInvocation => ServiceDomain::NetworkApi,
             Self::SliceLifecycle => ServiceDomain::Slice,
         }
@@ -287,13 +291,13 @@ impl RecordType {
     pub const fn is_session(self) -> bool {
         matches!(
             self,
-            Self::MobileOriginatedCall
-                | Self::MobileTerminatedCall
+            Self::OriginatedCall
+                | Self::TerminatedCall
                 | Self::ForwardedCall
                 | Self::PduSession
                 | Self::PdpContext
                 | Self::ImsSession
-                | Self::FixedSession
+                | Self::FixedAccessSession
                 | Self::SliceLifecycle
         )
     }
@@ -302,8 +306,8 @@ impl RecordType {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::MobileOriginatedCall => "MO_CALL",
-            Self::MobileTerminatedCall => "MT_CALL",
+            Self::OriginatedCall => "ORIGINATED_CALL",
+            Self::TerminatedCall => "TERMINATED_CALL",
             Self::ForwardedCall => "FORWARDED_CALL",
             Self::SmsOriginated => "SMS_MO",
             Self::SmsTerminated => "SMS_MT",
@@ -312,7 +316,7 @@ impl RecordType {
             Self::PduSession => "PDU_SESSION",
             Self::PdpContext => "PDP_CONTEXT",
             Self::ImsSession => "IMS_SESSION",
-            Self::FixedSession => "FIXED_SESSION",
+            Self::FixedAccessSession => "FIXED_ACCESS_SESSION",
             Self::NetworkApiInvocation => "NETWORK_API_INVOCATION",
             Self::SliceLifecycle => "SLICE_LIFECYCLE",
             Self::Registration => "REGISTRATION",
@@ -450,6 +454,68 @@ impl fmt::Display for SourceRef {
     }
 }
 
+// ── CallDirection ────────────────────────────────────────────────────────────
+
+/// Which way a call went, from the served subscriber's side.
+///
+/// Access-neutral: a call over a fixed line, VoLTE or a circuit-switched network
+/// is the same kind of usage, measured by chargeable duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CallDirection {
+    /// The subscriber placed the call.
+    Originated,
+    /// The subscriber received the call.
+    Terminated,
+    /// The call was forwarded on the subscriber's behalf.
+    Forwarded,
+}
+
+impl CallDirection {
+    /// Every variant, for exhaustive iteration in tests and mappings.
+    pub const ALL: &'static [Self] = &[Self::Originated, Self::Terminated, Self::Forwarded];
+
+    /// The canonical codes, in the order of [`ALL`](Self::ALL).
+    pub const CODES: &'static [&'static str] = &["ORIGINATED", "TERMINATED", "FORWARDED"];
+
+    /// The record type for a call in this direction.
+    #[must_use]
+    pub const fn record_type(self) -> RecordType {
+        match self {
+            Self::Originated => RecordType::OriginatedCall,
+            Self::Terminated => RecordType::TerminatedCall,
+            Self::Forwarded => RecordType::ForwardedCall,
+        }
+    }
+
+    /// The canonical string form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Originated => "ORIGINATED",
+            Self::Terminated => "TERMINATED",
+            Self::Forwarded => "FORWARDED",
+        }
+    }
+}
+
+impl fmt::Display for CallDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CallDirection {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .find(|d| d.as_str().eq_ignore_ascii_case(s.trim()))
+            .copied()
+            .ok_or_else(|| ParseError::one_of("CallDirection", s, Self::CODES))
+    }
+}
+
 // ── UsageRecord ──────────────────────────────────────────────────────────────
 
 /// One unit of usage, normalised out of whatever format carried it.
@@ -507,6 +573,11 @@ pub struct UsageRecord {
     pub session: SessionContext,
     /// The identifiers that tie this record to its session and its siblings.
     pub correlation: CorrelationKeys,
+    /// The calling party's number (the A-number), where the record carried one.
+    pub calling: Option<Msisdn>,
+    /// Where the call went (the B-number), normalised — see
+    /// [`DialContext::normalise`](crate::DialContext::normalise).
+    pub called: Option<Destination>,
     /// Which file, from which node, at which position produced this record.
     pub provenance: SourceRef,
 }
@@ -540,8 +611,86 @@ impl UsageRecord {
             partial: None,
             session: SessionContext::none(),
             correlation: CorrelationKeys::none(),
+            calling: None,
+            called: None,
             provenance,
         }
+    }
+
+    /// A call record: who is charged, when it was answered, and how long it was
+    /// charged for.
+    ///
+    /// The one-call way to bring a voice platform's row into the crate. The close
+    /// time is `answered + duration`, so the record splits at tariff boundaries
+    /// ([`split_session`](crate::split_session)) without a second field.
+    /// `answered` is the **answer** time: a platform that reports seizure time
+    /// must convert, or the split counts ringing as talking.
+    ///
+    /// ```rust
+    /// use mediation::{
+    ///     CallDirection, ChargedParty, Destination, RecordKey, SourceRef, Seconds,
+    ///     SubscriberRef, UsageRecord, CdrTimestamp, QuarterHourOffset,
+    /// };
+    /// use time::macros::datetime;
+    ///
+    /// let berlin = QuarterHourOffset::from_minutes(60).unwrap();
+    /// let party = ChargedParty::Subscriber(SubscriberRef::new("nai-line-4711@fibre.example".parse()?));
+    /// let call = UsageRecord::call(
+    ///     CallDirection::Originated,
+    ///     party,
+    ///     CdrTimestamp::new(datetime!(2026-07-28 18:00), berlin).unwrap(),
+    ///     Seconds::new(95),
+    ///     SourceRef::new("sbc-ber-1".parse()?, 0),
+    /// )
+    /// .with_calling("+49301234567".parse()?)
+    /// .with_called("+491511234567".parse::<Destination>()?)
+    /// .with_call_id("sbc-ber-1".parse()?, "a84b4c76e66710@sbc-ber-1".parse()?);
+    ///
+    /// assert!(RecordKey::of(&call).is_ok());
+    /// assert_eq!(call.wall_clock_span(), Some(Seconds::new(95)));
+    /// # Ok::<(), mediation::ParseError>(())
+    /// ```
+    #[must_use]
+    pub fn call(
+        direction: CallDirection,
+        party: ChargedParty,
+        answered: CdrTimestamp,
+        duration: Seconds,
+        provenance: SourceRef,
+    ) -> Self {
+        let closed = answered
+            .to_utc()
+            .checked_add(time::Duration::seconds(i64::from(duration.get())))
+            .and_then(|end| CdrTimestamp::from_utc(end, answered.offset()));
+        let mut record = Self::new(direction.record_type(), party, answered, provenance);
+        record.closed = closed;
+        record.duration = Some(duration);
+        record
+    }
+
+    /// The same record with the calling number (A-number).
+    #[must_use]
+    pub const fn with_calling(mut self, calling: Msisdn) -> Self {
+        self.calling = Some(calling);
+        self
+    }
+
+    /// The same record with the called destination (B-number).
+    #[must_use]
+    pub const fn with_called(mut self, called: Destination) -> Self {
+        self.called = Some(called);
+        self
+    }
+
+    /// The same record keyed by a SIP Call-ID and the entity that recorded it.
+    ///
+    /// Both, because a back-to-back user agent regenerates the Call-ID per leg —
+    /// see [`RecordKey::Call`](crate::RecordKey::Call).
+    #[must_use]
+    pub fn with_call_id(mut self, entity: NodeId, call_id: CallId) -> Self {
+        self.correlation.recording_entity = Some(entity);
+        self.correlation.call_id = Some(call_id);
+        self
     }
 
     /// The service domain, derived from the record type.
@@ -726,7 +875,7 @@ impl UsageRecord {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{NodeId, RecordType, ServiceDomain, SourceRef, UsageRecord};
+    use super::{CallDirection, NodeId, RecordType, ServiceDomain, SourceRef, UsageRecord};
     use serde::de::{self, Visitor};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::fmt;
@@ -760,6 +909,7 @@ mod serde_impl {
     string_serde!(ServiceDomain, "a service domain code such as \"DATA\"");
     string_serde!(RecordType, "a record type code such as \"PDU_SESSION\"");
     string_serde!(NodeId, "a node identifier such as \"pgw-fra-01\"");
+    string_serde!(CallDirection, "a call direction such as \"ORIGINATED\"");
 
     /// Field names are part of the public representation and covered by semver.
     #[derive(Serialize, Deserialize)]
@@ -836,6 +986,10 @@ mod serde_impl {
             skip_serializing_if = "crate::correlation::CorrelationKeys::is_empty"
         )]
         correlation: crate::correlation::CorrelationKeys,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        calling: Option<crate::identity::Msisdn>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        called: Option<crate::dialplan::Destination>,
         provenance: SourceRef,
     }
 
@@ -857,6 +1011,8 @@ mod serde_impl {
                 partial: self.partial,
                 session: self.session.clone(),
                 correlation: self.correlation.clone(),
+                calling: self.calling,
+                called: self.called,
                 provenance: self.provenance.clone(),
             }
             .serialize(serializer)
@@ -882,6 +1038,8 @@ mod serde_impl {
                 partial: r.partial,
                 session: r.session,
                 correlation: r.correlation,
+                calling: r.calling,
+                called: r.called,
                 provenance: r.provenance,
             })
         }
@@ -904,7 +1062,7 @@ mod tests {
 
     fn call() -> UsageRecord {
         UsageRecord::new(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             party(),
             "2026-07-28T10:00:00+02:00".parse().unwrap(),
             source(),
@@ -1063,7 +1221,7 @@ mod tests {
     #[test]
     fn sessions_and_events_are_distinguished() {
         assert!(RecordType::PduSession.is_session());
-        assert!(RecordType::MobileOriginatedCall.is_session());
+        assert!(RecordType::OriginatedCall.is_session());
         assert!(!RecordType::SmsOriginated.is_session());
         assert!(!RecordType::NetworkApiInvocation.is_session());
     }

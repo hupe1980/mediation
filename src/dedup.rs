@@ -25,8 +25,14 @@
 //! | Domain | Key |
 //! |---|---|
 //! | Packet data, 5G and LTE | Charging ID **and gateway address**, plus the partial-record sequence |
-//! | IMS | ICID, the recording entity, and the partial-record sequence |
+//! | IMS | ICID and the partial-record sequence |
+//! | SIP call | recording entity, **record type**, Call-ID and the partial-record sequence |
 //! | Anything with a recording-entity serial | the **recording entity** and its `localSequenceNumber` |
+//!
+//! The partial-record sequence is the record's own
+//! [`PartialInfo::sequence`](crate::PartialInfo) when it carries one, and its
+//! `recordSequenceNumber` correlator otherwise — the number reassembly reads is
+//! the number the key reads.
 //!
 //! 3GPP TS 32.251 is explicit that a Charging ID is unique only together with
 //! the P-GW address, which is why [`crate::CorrelationKeys::packet_session`]
@@ -85,8 +91,8 @@ use std::fmt;
 
 use time::{Duration, OffsetDateTime};
 
-use crate::correlation::{Icid, PacketSessionId};
-use crate::record::{NodeId, UsageRecord};
+use crate::correlation::{CallId, Icid, PacketSessionId};
+use crate::record::{NodeId, RecordType, UsageRecord};
 
 // ── RecordKey ────────────────────────────────────────────────────────────────
 
@@ -117,6 +123,28 @@ pub enum RecordKey {
         /// The partial-record sequence, absent on a record that is whole.
         sequence: Option<u32>,
     },
+    /// A call record keyed on its SIP Call-ID, scoped by the entity that
+    /// recorded it and the record type, and its partial sequence.
+    ///
+    /// The Call-ID is the CDR's *Session ID* (TS 32.260). A back-to-back user
+    /// agent regenerates it per leg, so it is unique only within the node that
+    /// wrote the record — two softswitches can report the same Call-ID for two
+    /// different calls, and keying on it alone would bill one of them never.
+    ///
+    /// The record type separates the originating and terminating records one
+    /// node writes for one on-net call: both carry the same Call-ID, and both
+    /// are usage.
+    Call {
+        /// The element that **created** the record.
+        entity: NodeId,
+        /// The record's type, so the originating and terminating records of
+        /// one call stay distinct.
+        record_type: RecordType,
+        /// The SIP Call-ID.
+        call_id: CallId,
+        /// The partial-record sequence, absent on a record that is whole.
+        sequence: Option<u32>,
+    },
     /// Any record carrying a serial number unique within its recording entity.
     RecordingEntity {
         /// The element that **created** the record and assigned the serial —
@@ -136,7 +164,12 @@ impl RecordKey {
     ///
     /// 1. packet session (Charging ID **and** gateway)
     /// 2. IMS session (the globally unique ICID)
-    /// 3. recording entity **and** its `localSequenceNumber`
+    /// 3. recording entity **and** its SIP Call-ID, with the record type
+    /// 4. recording entity **and** its `localSequenceNumber`
+    ///
+    /// The partial sequence of the first three is the record's
+    /// [`PartialInfo::sequence`](crate::PartialInfo) when present, else its
+    /// `recordSequenceNumber`.
     ///
     /// # Errors
     ///
@@ -145,6 +178,10 @@ impl RecordKey {
     /// documentation.
     pub fn of(record: &UsageRecord) -> Result<Self, NotKeyable> {
         let keys = &record.correlation;
+        let sequence = record
+            .partial
+            .map(|partial| partial.sequence)
+            .or(keys.record_sequence_number);
 
         // Every complete correlator is tried first, in preference order. A
         // *half* one is only a reason to refuse the record when nothing else
@@ -152,15 +189,20 @@ impl RecordKey {
         // without its gateway is still perfectly keyable on its ICID, and
         // rejecting it for the stray field would lose the usage.
         if let Some(session) = keys.packet_session() {
-            return Ok(Self::PacketSession {
-                session,
-                sequence: keys.record_sequence_number,
-            });
+            return Ok(Self::PacketSession { session, sequence });
         }
         if let Some(icid) = &keys.icid {
             return Ok(Self::Ims {
                 icid: icid.clone(),
-                sequence: keys.record_sequence_number,
+                sequence,
+            });
+        }
+        if let Some((entity, call_id)) = keys.entity_call() {
+            return Ok(Self::Call {
+                entity: entity.clone(),
+                record_type: record.record_type,
+                call_id: call_id.clone(),
+                sequence,
             });
         }
         if let Some((entity, local_sequence)) = keys.entity_serial() {
@@ -175,6 +217,9 @@ impl RecordKey {
         // type that never carries one — a different fix, in a different place.
         if keys.charging_id.is_some() != keys.gateway.is_some() {
             return Err(NotKeyable::IncompletePacketSessionId);
+        }
+        if keys.call_id.is_some() {
+            return Err(NotKeyable::IncompleteCallId);
         }
         if keys.local_sequence_number.is_some() || keys.recording_entity.is_some() {
             return Err(NotKeyable::IncompleteEntitySerial);
@@ -208,6 +253,17 @@ impl RecordKey {
                 icid: icid.clone(),
                 sequence: None,
             }),
+            Self::Call {
+                entity,
+                record_type,
+                call_id,
+                ..
+            } => Some(Self::Call {
+                entity: entity.clone(),
+                record_type: *record_type,
+                call_id: call_id.clone(),
+                sequence: None,
+            }),
             Self::RecordingEntity { .. } => None,
         }
     }
@@ -218,6 +274,7 @@ impl RecordKey {
         match self {
             Self::PacketSession { .. } => "PACKET_SESSION",
             Self::Ims { .. } => "IMS",
+            Self::Call { .. } => "CALL",
             Self::RecordingEntity { .. } => "RECORDING_ENTITY",
         }
     }
@@ -236,6 +293,18 @@ impl fmt::Display for RecordKey {
             }
             Self::Ims { icid, sequence } => {
                 write!(f, "IMS:{icid}")?;
+                if let Some(sequence) = sequence {
+                    write!(f, "/{sequence}")?;
+                }
+                Ok(())
+            }
+            Self::Call {
+                entity,
+                record_type,
+                call_id,
+                sequence,
+            } => {
+                write!(f, "CALL:{entity}/{record_type}/{call_id}")?;
                 if let Some(sequence) = sequence {
                     write!(f, "/{sequence}")?;
                 }
@@ -265,6 +334,11 @@ pub enum NotKeyable {
     /// The serial is unique only within the element that assigned it, so one
     /// half of the pair identifies nothing.
     IncompleteEntitySerial,
+    /// A SIP Call-ID with no recording entity to scope it.
+    ///
+    /// A back-to-back user agent regenerates the Call-ID per leg, so without the
+    /// node that recorded it the Call-ID identifies nothing.
+    IncompleteCallId,
 }
 
 impl NotKeyable {
@@ -273,6 +347,7 @@ impl NotKeyable {
         Self::NoCorrelatorPresent,
         Self::IncompletePacketSessionId,
         Self::IncompleteEntitySerial,
+        Self::IncompleteCallId,
     ];
 
     /// The canonical string form.
@@ -282,6 +357,7 @@ impl NotKeyable {
             Self::NoCorrelatorPresent => "NO_CORRELATOR_PRESENT",
             Self::IncompletePacketSessionId => "INCOMPLETE_PACKET_SESSION_ID",
             Self::IncompleteEntitySerial => "INCOMPLETE_ENTITY_SERIAL",
+            Self::IncompleteCallId => "INCOMPLETE_CALL_ID",
         }
     }
 }
@@ -308,11 +384,12 @@ pub struct DedupWindow(Duration);
 impl DedupWindow {
     /// A window from the longest retransmission delay a partner may exhibit.
     ///
-    /// `None` for a non-positive duration: a zero window catches nothing while
-    /// appearing to be deduplication.
+    /// `None` for a non-positive duration — a zero window catches nothing while
+    /// appearing to be deduplication — and for one that is not a whole number
+    /// of seconds, which the persisted form could not represent.
     #[must_use]
     pub const fn from_bound(bound: Duration) -> Option<Self> {
-        if bound.is_positive() {
+        if bound.is_positive() && bound.subsec_nanoseconds() == 0 {
             Some(Self(bound))
         } else {
             None
@@ -402,6 +479,11 @@ impl DedupStore {
 
     /// Record an observation of `key` at `at`.
     ///
+    /// `at` is the **arrival** instant — the `as_of` of the batch that saw the
+    /// key — not the record's event time. A record delivered late is still
+    /// remembered for the whole window after it arrived; stamping it with its
+    /// event time would evict it at once and bill its resend.
+    ///
     /// Idempotent: observing the same key repeatedly yields
     /// [`DedupDecision::First`] exactly once, then
     /// [`DedupDecision::Duplicate`] every time after — never twice, never zero
@@ -417,6 +499,32 @@ impl DedupStore {
                 DedupDecision::First
             }
         }
+    }
+
+    /// Stamp `key` at `at` without counting an observation.
+    ///
+    /// For a record that is still in flight — held by one batch and carried
+    /// into the next. Its key moves forward to `at` (never backward), and is
+    /// inserted again if eviction dropped it while the record waited, so a
+    /// resend arriving beside the carried copy is still a duplicate.
+    pub fn refresh(&mut self, key: RecordKey, at: OffsetDateTime) {
+        self.seen
+            .entry(key)
+            .and_modify(|stamp| {
+                if at > *stamp {
+                    *stamp = at;
+                }
+            })
+            .or_insert(at);
+    }
+
+    /// Forget one key, returning its stamp if it was remembered.
+    ///
+    /// For a record that was observed and then rejected: a rejected copy
+    /// billed nothing, so it must not turn a corrected resend into a
+    /// duplicate.
+    pub fn remove(&mut self, key: &RecordKey) -> Option<OffsetDateTime> {
+        self.seen.remove(key)
     }
 
     /// Drop keys first seen before the window's cutoff, returning how many.
@@ -587,6 +695,14 @@ mod serde_impl {
             #[serde(default, skip_serializing_if = "Option::is_none")]
             sequence: Option<u32>,
         },
+        #[serde(rename = "CALL")]
+        Call {
+            entity: crate::record::NodeId,
+            record_type: crate::record::RecordType,
+            call_id: crate::correlation::CallId,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            sequence: Option<u32>,
+        },
         #[serde(rename = "RECORDING_ENTITY")]
         RecordingEntity {
             entity: crate::record::NodeId,
@@ -603,6 +719,17 @@ mod serde_impl {
                 },
                 Self::Ims { icid, sequence } => RecordKeyRepr::Ims {
                     icid: icid.clone(),
+                    sequence: *sequence,
+                },
+                Self::Call {
+                    entity,
+                    record_type,
+                    call_id,
+                    sequence,
+                } => RecordKeyRepr::Call {
+                    entity: entity.clone(),
+                    record_type: *record_type,
+                    call_id: call_id.clone(),
                     sequence: *sequence,
                 },
                 Self::RecordingEntity {
@@ -624,6 +751,17 @@ mod serde_impl {
                     Self::PacketSession { session, sequence }
                 }
                 RecordKeyRepr::Ims { icid, sequence } => Self::Ims { icid, sequence },
+                RecordKeyRepr::Call {
+                    entity,
+                    record_type,
+                    call_id,
+                    sequence,
+                } => Self::Call {
+                    entity,
+                    record_type,
+                    call_id,
+                    sequence,
+                },
                 RecordKeyRepr::RecordingEntity {
                     entity,
                     local_sequence,

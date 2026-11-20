@@ -4,10 +4,10 @@
 //! mostly about what happens when that data does not answer.
 
 use mediation::{
-    CalledParty, ChargedParty, Mcc, Msisdn, NumberRange, NumberRangeSet, PlmnId, RecordType,
-    Seconds, Signal, SourceRef, SubscriberRef, TrafficShape, UniformTransit, UsageRecord,
-    ait_signature, bypass_signature, impossible_travel, is_ported, premium_destination,
-    terminating_plmn, wangiri_pattern,
+    ChargedParty, Mcc, Msisdn, NumberRange, NumberRangeSet, PlmnId, RecordType, Seconds, Signal,
+    SourceRef, SubscriberRef, TrafficShape, UniformTransit, UsageRecord, ait_signature,
+    bypass_signature, impossible_travel, is_ported, premium_destination, terminating_plmn,
+    wangiri_pattern,
 };
 use time::Duration;
 
@@ -17,6 +17,21 @@ fn range(digits: &str) -> NumberRange {
 
 fn number(digits: &str) -> Msisdn {
     digits.parse().expect("a valid number")
+}
+
+/// Gives each record the destination `called` resolves for it.
+fn resolve(
+    records: &[UsageRecord],
+    called: &impl Fn(usize, &UsageRecord) -> Option<Msisdn>,
+) -> Vec<UsageRecord> {
+    records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| match called(i, r) {
+            Some(n) => r.clone().with_called(n.into()),
+            None => r.clone(),
+        })
+        .collect()
 }
 
 fn record(kind: RecordType, opened: &str, serving: &str) -> UsageRecord {
@@ -136,17 +151,17 @@ fn the_same_structure_answers_allocation_and_risk() {
 
     let records = vec![
         record(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T10:00:00+02:00",
             "262-02",
         ),
         record(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T11:00:00+02:00",
             "262-02",
         ),
         record(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T12:00:00+02:00",
             "262-02",
         ),
@@ -159,7 +174,7 @@ fn the_same_structure_answers_allocation_and_risk() {
         }
     };
 
-    let found = premium_destination(&records, &high_risk, &called);
+    let found = premium_destination(&resolve(&records, &called), &high_risk);
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].signal, Signal::PremiumDestination);
     assert_eq!(found[0].records, vec![0]);
@@ -176,7 +191,7 @@ fn an_unresolved_destination_is_never_evidence() {
     let records: Vec<UsageRecord> = (0..5)
         .map(|i| {
             record(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 &format!("2026-07-28T1{i}:00:00+02:00"),
                 "262-02",
             )
@@ -184,30 +199,7 @@ fn an_unresolved_destination_is_never_evidence() {
         .collect();
     let nothing_resolves = |_: usize, _: &UsageRecord| None;
 
-    assert!(premium_destination(&records, &high_risk, &nothing_resolves).is_empty());
-}
-
-/// A resolver is a trait, so a caller's own type works as well as a closure.
-#[test]
-fn a_called_party_resolver_may_be_a_type() {
-    struct FromTable(Vec<Option<Msisdn>>);
-    impl CalledParty for FromTable {
-        fn called(&self, index: usize, _: &UsageRecord) -> Option<Msisdn> {
-            self.0.get(index).copied().flatten()
-        }
-    }
-
-    let mut high_risk: NumberRangeSet<&str> = NumberRangeSet::new();
-    high_risk.insert(range("88216"), "satellite");
-
-    let records = vec![record(
-        RecordType::MobileOriginatedCall,
-        "2026-07-28T10:00:00+02:00",
-        "262-02",
-    )];
-    let table = FromTable(vec![Some(number("882169999999"))]);
-
-    assert_eq!(premium_destination(&records, &high_risk, &table).len(), 1);
+    assert!(premium_destination(&resolve(&records, &nothing_resolves), &high_risk).is_empty());
 }
 
 /// A day of one-ring inbound calls, then the callbacks that pay for them.
@@ -216,7 +208,7 @@ fn a_wangiri_wave_shows_up_as_volume_not_as_any_single_call() {
     let wave: Vec<UsageRecord> = (0..30)
         .map(|i| {
             record(
-                RecordType::MobileTerminatedCall,
+                RecordType::TerminatedCall,
                 &format!("2026-07-28T10:{i:02}:00+02:00"),
                 "262-02",
             )
@@ -224,26 +216,28 @@ fn a_wangiri_wave_shows_up_as_volume_not_as_any_single_call() {
         })
         .collect();
 
-    let found = wangiri_pattern(&wave, Seconds::new(5), 20).expect("thirty one-ring calls");
+    let found = wangiri_pattern(&wave, Seconds::new(5), 20, Duration::hours(1));
+    assert_eq!(found.len(), 1, "thirty one-ring calls");
+    let found = &found[0];
     assert_eq!(found.signal, Signal::WangiriPattern);
     assert_eq!(found.records.len(), 30);
 
     // The same wave against a stricter volume floor says nothing.
-    assert!(wangiri_pattern(&wave, Seconds::new(5), 50).is_none());
+    assert!(wangiri_pattern(&wave, Seconds::new(5), 50, Duration::hours(1)).is_empty());
     // Nor does it if the calls were not short.
-    assert!(wangiri_pattern(&wave, Seconds::new(1), 20).is_none());
+    assert!(wangiri_pattern(&wave, Seconds::new(1), 20, Duration::hours(1)).is_empty());
 
     // A call with no recorded duration is not a short call.
     let unmetered: Vec<UsageRecord> = (0..30)
         .map(|i| {
             record(
-                RecordType::MobileTerminatedCall,
+                RecordType::TerminatedCall,
                 &format!("2026-07-28T11:{i:02}:00+02:00"),
                 "262-02",
             )
         })
         .collect();
-    assert!(wangiri_pattern(&unmetered, Seconds::new(5), 20).is_none());
+    assert!(wangiri_pattern(&unmetered, Seconds::new(5), 20, Duration::hours(1)).is_empty());
 }
 
 /// The unsophisticated bypass shape, and the honest limit of it.
@@ -252,7 +246,7 @@ fn bypass_triage_catches_the_naive_case_and_says_so() {
     let rack: Vec<UsageRecord> = (0..80)
         .map(|i| {
             record(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 &format!("2026-07-28T{:02}:{:02}:00+02:00", i / 4, (i % 4) * 15),
                 "262-02",
             )
@@ -274,9 +268,9 @@ fn bypass_triage_catches_the_naive_case_and_says_so() {
         .map(|i| {
             record(
                 if i % 3 == 0 {
-                    RecordType::MobileTerminatedCall
+                    RecordType::TerminatedCall
                 } else {
-                    RecordType::MobileOriginatedCall
+                    RecordType::OriginatedCall
                 },
                 &format!("2026-07-28T{:02}:{:02}:00+02:00", i / 4, (i % 4) * 15),
                 if i % 5 == 0 { "262-01" } else { "262-02" },
@@ -292,7 +286,7 @@ fn non_call_records_do_not_shape_voice_traffic() {
     let mut mixed: Vec<UsageRecord> = (0..10)
         .map(|i| {
             record(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 &format!("2026-07-28T1{i}:00:00+02:00"),
                 "262-02",
             )
@@ -341,8 +335,8 @@ fn inflated_message_traffic_is_measured_against_all_of_it() {
             Some(number("491701234567"))
         }
     };
-    let found =
-        ait_signature(&messages, &ranges, &concentrated, 50, 80).expect("eighty-five percent");
+    let found = ait_signature(&resolve(&messages, &concentrated), &ranges, 50, 80)
+        .expect("eighty-five percent");
     assert_eq!(found.signal, Signal::AitSignature);
     assert_eq!(found.records.len(), 85);
     assert!(found.detail.contains("85%"), "{}", found.detail);
@@ -356,7 +350,7 @@ fn inflated_message_traffic_is_measured_against_all_of_it() {
             Some(number("491701234567"))
         }
     };
-    assert!(ait_signature(&messages, &ranges, &diluted, 50, 80).is_none());
+    assert!(ait_signature(&resolve(&messages, &diluted), &ranges, 50, 80).is_none());
 }
 
 // ── Determinism ──────────────────────────────────────────────────────────────
@@ -367,17 +361,17 @@ fn inflated_message_traffic_is_measured_against_all_of_it() {
 fn detection_is_replayable() {
     let records = vec![
         record(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T10:00:00+02:00",
             "262-02",
         ),
         record(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T10:20:00+02:00",
             "310-260",
         ),
         record(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T10:40:00+02:00",
             "262-02",
         ),
@@ -459,12 +453,12 @@ fn a_range_longer_than_the_number_does_not_match() {
 fn an_unknown_country_pair_never_fires() {
     let records = vec![
         record(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T10:00:00+02:00",
             "262-02",
         ),
         record(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T10:20:00+02:00",
             "310-260",
         ),

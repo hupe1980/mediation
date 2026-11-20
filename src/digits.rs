@@ -114,23 +114,35 @@ impl DigitString {
         len: 0,
     };
 
-    /// Reads decimal digits from `s`, ignoring ASCII whitespace and `-`.
+    /// Reads decimal digits from `s`, skipping ASCII whitespace and `-`
+    /// **between** digits.
     ///
-    /// `None` for a non-digit character or for more than `max` digits.
+    /// Surrounding whitespace is ignored. `None` for a non-digit character,
+    /// for a separator before the first or after the last digit (`-4917…`
+    /// is not a digit string with a hyphen), or for more than `max` digits.
     #[must_use]
     pub fn parse(s: &str, max: usize) -> Option<Self> {
         let mut out = Self::EMPTY;
-        for byte in s.bytes() {
+        let mut separated = false;
+        for byte in s.trim_matches(|c: char| c.is_ascii_whitespace()).bytes() {
             if byte.is_ascii_whitespace() || byte == b'-' {
+                if out.is_empty() {
+                    return None;
+                }
+                separated = true;
                 continue;
             }
             if !byte.is_ascii_digit() {
                 return None;
             }
+            separated = false;
             out = out.checked_push(byte - b'0')?;
             if out.len() > max {
                 return None;
             }
+        }
+        if separated {
+            return None;
         }
         Some(out)
     }
@@ -424,7 +436,7 @@ impl FromStr for DigitString {
             ParseError::format(
                 "DigitString",
                 s,
-                "up to 20 decimal digits, optionally separated by spaces or hyphens",
+                "up to 20 decimal digits, optionally separated by spaces or hyphens between digits",
             )
         })
     }

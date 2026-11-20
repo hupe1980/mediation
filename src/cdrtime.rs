@@ -295,8 +295,7 @@ impl fmt::Display for QuarterHourOffset {
 }
 
 /// The shape [`QuarterHourOffset`] accepts, as rendered in a [`ParseError`].
-const OFFSET_FORMAT: &str =
-    "a UTC offset in 15-minute steps such as +02:00, +0545, -03:30 or Z (UTC-12:00 to UTC+14:00)";
+const OFFSET_FORMAT: &str = "a UTC offset in 15-minute steps such as +02:00, +0545 or -03:30 (at most ±19:45; UTC is +00:00)";
 
 /// Two ASCII digits read as a number, or `None` if either is not a digit.
 ///
@@ -324,14 +323,16 @@ const fn four_digits(bytes: &[u8], at: usize) -> Option<i32> {
     }
 }
 
-/// Parse `±HH:MM`, `±HHMM`, `±HH` or `Z` from ASCII bytes.
+/// Parse `±HH:MM`, `±HHMM` or `±HH` from ASCII bytes, over the whole
+/// encodable range (±79 quarter-hours).
 ///
 /// Shared by [`QuarterHourOffset`] and [`CdrTimestamp`], so the two cannot
 /// drift apart on which spellings they accept.
+///
+/// `Z` and a negative zero (`-00:00`, `-0000`, `-00`) are refused: they state
+/// that the local offset is unknown (RFC 3339 §4.3 as updated by RFC 9557
+/// §2.2), and a charging timestamp needs the local offset. UTC is `+00:00`.
 fn offset_from_ascii(bytes: &[u8]) -> Option<QuarterHourOffset> {
-    if bytes.len() == 1 && bytes[0].eq_ignore_ascii_case(&b'z') {
-        return Some(QuarterHourOffset::UTC);
-    }
     let sign: i16 = match bytes.first() {
         Some(b'+') => 1,
         Some(b'-') => -1,
@@ -347,17 +348,27 @@ fn offset_from_ascii(bytes: &[u8]) -> Option<QuarterHourOffset> {
     if minutes > 59 {
         return None;
     }
-    let total = sign * (i16::from(hours) * 60 + i16::from(minutes));
-    QuarterHourOffset::from_minutes(total)
+    let magnitude = i16::from(hours) * 60 + i16::from(minutes);
+    if sign < 0 && magnitude == 0 {
+        return None;
+    }
+    if magnitude % 15 != 0 {
+        return None;
+    }
+    let quarters = i8::try_from(magnitude / 15).ok()?;
+    QuarterHourOffset::from_encoded(if sign < 0 { -quarters } else { quarters })
 }
 
 impl FromStr for QuarterHourOffset {
     type Err = ParseError;
 
-    /// Parses `±HH:MM`, `±HHMM`, `±HH` and `Z`.
+    /// Parses `±HH:MM`, `±HHMM` and `±HH` over the encodable range, so every
+    /// rendered value parses back; [`is_assigned`](Self::is_assigned) tells
+    /// whether a real zone uses it.
     ///
-    /// Lenient on the way in, canonical on the way out: all four spellings of
-    /// UTC+02:00 render as `+02:00`.
+    /// Lenient on the way in, canonical on the way out: all three spellings of
+    /// UTC+02:00 render as `+02:00`. `Z` and `-00:00` are refused: they say the
+    /// local offset is unknown (RFC 3339 §4.3, RFC 9557 §2.2).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         offset_from_ascii(s.trim().as_bytes())
             .ok_or_else(|| ParseError::format("QuarterHourOffset", s, OFFSET_FORMAT))
@@ -620,10 +631,40 @@ pub struct CdrTimestamp {
 }
 
 impl CdrTimestamp {
-    /// A timestamp from a local wall-clock reading and its offset.
+    /// The first UTC year a timestamp may denote.
+    pub const MIN_YEAR: i32 = 1;
+
+    /// The last UTC year a timestamp may denote.
+    ///
+    /// Bounding the instant to years 1–9998 keeps every re-expression in any
+    /// encodable offset (±19:45) inside years 0–9999, so [`to_utc`],
+    /// [`to_offset`] and the four-digit rendering are total.
+    ///
+    /// [`to_utc`]: Self::to_utc
+    /// [`to_offset`]: Self::to_offset
+    pub const MAX_YEAR: i32 = 9998;
+
+    /// `true` when the instant `local` at `offset` lies in UTC years
+    /// [`MIN_YEAR`](Self::MIN_YEAR) … [`MAX_YEAR`](Self::MAX_YEAR).
+    const fn instant_in_range(local: PrimitiveDateTime, offset: QuarterHourOffset) -> bool {
+        match local
+            .assume_offset(offset.to_utc_offset())
+            .checked_to_offset(UtcOffset::UTC)
+        {
+            Some(utc) => utc.year() >= Self::MIN_YEAR && utc.year() <= Self::MAX_YEAR,
+            None => false,
+        }
+    }
+
+    /// A timestamp from a local wall-clock reading and its offset, or `None`
+    /// when the instant falls outside UTC years 1–9998.
     #[must_use]
-    pub const fn new(local: PrimitiveDateTime, offset: QuarterHourOffset) -> Self {
-        Self { local, offset }
+    pub const fn new(local: PrimitiveDateTime, offset: QuarterHourOffset) -> Option<Self> {
+        if Self::instant_in_range(local, offset) {
+            Some(Self { local, offset })
+        } else {
+            None
+        }
     }
 
     /// The local wall-clock reading, exactly as the record carried it.
@@ -652,33 +693,52 @@ impl CdrTimestamp {
     /// a value that denoted the right instant while still reporting the local
     /// date would reintroduce the bug this type exists to prevent, in the one
     /// accessor a caller reaches for to escape it.
+    ///
+    /// Never panics: the instant lies in UTC years 1–9998.
     #[must_use]
     pub const fn to_utc(self) -> OffsetDateTime {
-        self.local
-            .assume_offset(self.offset.to_utc_offset())
-            .to_offset(UtcOffset::UTC)
+        let instant = self.local.assume_offset(self.offset.to_utc_offset());
+        match instant.checked_to_offset(UtcOffset::UTC) {
+            Some(utc) => utc,
+            // Unreachable: every constructor checks the instant's year.
+            None => instant,
+        }
     }
 
     /// The same instant re-expressed in another offset.
     ///
     /// The instant is preserved and the wall-clock reading changes — the
-    /// opposite of [`new`](Self::new), which preserves the wall clock.
+    /// opposite of [`new`](Self::new), which preserves the wall clock. Never
+    /// panics: an instant in years 1–9998 is local years 0–9999 in any
+    /// encodable offset.
     #[must_use]
     pub const fn to_offset(self, offset: QuarterHourOffset) -> Self {
-        let shifted = self.to_utc().to_offset(offset.to_utc_offset());
-        Self {
-            local: PrimitiveDateTime::new(shifted.date(), shifted.time()),
-            offset,
+        let utc = self.to_utc();
+        match utc.checked_to_offset(offset.to_utc_offset()) {
+            Some(shifted) => Self {
+                local: PrimitiveDateTime::new(shifted.date(), shifted.time()),
+                offset,
+            },
+            // Unreachable: see above.
+            None => self,
         }
     }
 
-    /// A timestamp for an instant, expressed in a given offset.
+    /// A timestamp for an instant, expressed in a given offset, or `None` when
+    /// the instant falls outside UTC years 1–9998.
     #[must_use]
-    pub const fn from_utc(instant: OffsetDateTime, offset: QuarterHourOffset) -> Self {
-        let shifted = instant.to_offset(offset.to_utc_offset());
-        Self {
-            local: PrimitiveDateTime::new(shifted.date(), shifted.time()),
-            offset,
+    pub const fn from_utc(instant: OffsetDateTime, offset: QuarterHourOffset) -> Option<Self> {
+        match instant.checked_to_offset(UtcOffset::UTC) {
+            Some(utc) if utc.year() >= Self::MIN_YEAR && utc.year() <= Self::MAX_YEAR => {
+                match utc.checked_to_offset(offset.to_utc_offset()) {
+                    Some(shifted) => Some(Self {
+                        local: PrimitiveDateTime::new(shifted.date(), shifted.time()),
+                        offset,
+                    }),
+                    None => None,
+                }
+            }
+            _ => None,
         }
     }
 
@@ -707,20 +767,29 @@ impl Century {
     /// The 2000s — the century every record this crate will meet was written in.
     pub const TWENTY_FIRST: Self = Self(2000);
 
-    /// A century from its first year, which must be a multiple of 100.
+    /// The last first year a century may have.
+    pub const MAX_FIRST_YEAR: i32 = 9900;
+
+    /// A century from its first year, which must be a multiple of 100 in
+    /// `0..=9900` — the four-digit years a timestamp renders.
     #[must_use]
     pub const fn new(first_year: i32) -> Option<Self> {
-        if first_year % 100 == 0 {
+        if first_year % 100 == 0 && first_year >= 0 && first_year <= Self::MAX_FIRST_YEAR {
             Some(Self(first_year))
         } else {
             None
         }
     }
 
-    /// The four-digit year for a two-digit one.
+    /// The four-digit year for a two-digit one, or `None` when `two_digit`
+    /// exceeds 99.
     #[must_use]
-    pub const fn year(self, two_digit: u8) -> i32 {
-        self.0 + two_digit as i32
+    pub const fn year(self, two_digit: u8) -> Option<i32> {
+        if two_digit > 99 {
+            None
+        } else {
+            Some(self.0 + two_digit as i32)
+        }
     }
 
     /// The century's first year.
@@ -787,7 +856,10 @@ impl CdrTimestamp {
         let (offset_hours, offset_minutes) = (pair(offset_digits, 0), pair(offset_digits, 1));
 
         let month = Month::try_from(month).map_err(|_| DecodeError::new(1, "a month in 1..=12"))?;
-        let date = Date::from_calendar_date(century.year(year), month, day)
+        let year = century
+            .year(year)
+            .ok_or_else(|| DecodeError::new(0, "a two-digit year"))?;
+        let date = Date::from_calendar_date(year, month, day)
             .map_err(|_| DecodeError::new(0, "a date that exists"))?;
         let time = Time::from_hms(hour, minute, second)
             .map_err(|_| DecodeError::new(3, "a time that exists"))?;
@@ -796,7 +868,8 @@ impl CdrTimestamp {
         let offset = QuarterHourOffset::from_minutes(total)
             .ok_or_else(|| DecodeError::new(7, "an assigned offset in 15-minute steps"))?;
 
-        Ok(Self::new(PrimitiveDateTime::new(date, time), offset))
+        Self::new(PrimitiveDateTime::new(date, time), offset)
+            .ok_or_else(|| DecodeError::new(0, "an instant in UTC years 1..=9998"))
     }
 
     /// Encode to the nine-octet `TimeStamp` of 3GPP TS 32.298.
@@ -883,7 +956,8 @@ impl CdrTimestamp {
     /// # Errors
     ///
     /// [`DecodeError`] for the wrong field widths, a non-digit, an impossible
-    /// date or time, or an offset that is not a multiple of 15 minutes.
+    /// date or time, an offset that is not a multiple of 15 minutes, `-0000`
+    /// (offset unknown), or an instant outside UTC years 1–9998.
     pub fn from_tap(local: &str, offset: &str) -> Result<Self, DecodeError> {
         let local = local.trim().as_bytes();
         if local.len() != Self::TAP_LOCAL_CHARS {
@@ -913,9 +987,13 @@ impl CdrTimestamp {
             ));
         }
         let offset = offset_from_ascii(offset.as_bytes())
-            .ok_or_else(|| DecodeError::new(0, "an assigned offset in 15-minute steps"))?;
+            .filter(|o| o.is_assigned())
+            .ok_or_else(|| {
+                DecodeError::new(0, "an assigned offset in 15-minute steps, not -0000")
+            })?;
 
-        Ok(Self::new(PrimitiveDateTime::new(date, time), offset))
+        Self::new(PrimitiveDateTime::new(date, time), offset)
+            .ok_or_else(|| DecodeError::new(0, "an instant in UTC years 1..=9998"))
     }
 
     /// Write the two fields a GSMA TD.57 timestamp is split across.
@@ -979,7 +1057,9 @@ impl FromStr for CdrTimestamp {
     /// Parses `YYYY-MM-DDThh:mm:ss` followed by an offset.
     ///
     /// The date-time separator may be `T`, `t` or a space. The offset accepts
-    /// every spelling [`QuarterHourOffset`] does.
+    /// every spelling [`QuarterHourOffset`] does; `Z` and `-00:00` are refused
+    /// (RFC 9557 §2.2: local offset unknown). The instant must fall in UTC
+    /// years 1–9998.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let err = || ParseError::format("CdrTimestamp", s, TIMESTAMP_FORMAT);
         // Parsed over bytes at fixed offsets. The shape is entirely ASCII, and
@@ -1007,7 +1087,7 @@ impl FromStr for CdrTimestamp {
         let date = Date::from_calendar_date(year, month, day).map_err(|_| err())?;
         let time = Time::from_hms(hour, minute, second).map_err(|_| err())?;
         let offset = offset_from_ascii(&bytes[19..]).ok_or_else(err)?;
-        Ok(Self::new(PrimitiveDateTime::new(date, time), offset))
+        Self::new(PrimitiveDateTime::new(date, time), offset).ok_or_else(err)
     }
 }
 
@@ -1270,16 +1350,16 @@ mod tests {
                 "+02:00"
             );
         }
-        assert_eq!(
-            "Z".parse::<QuarterHourOffset>().unwrap(),
-            QuarterHourOffset::UTC
-        );
+        assert!("Z".parse::<QuarterHourOffset>().is_err());
+        assert!("-00:00".parse::<QuarterHourOffset>().is_err());
         assert_eq!(QuarterHourOffset::UTC.to_string(), "+00:00");
     }
 
     #[test]
     fn offset_rejects_malformed_and_unassigned_input() {
-        for s in ["", "02:00", "+2:00", "+02:60", "+99:00", "+00:20", "-13:00"] {
+        for s in [
+            "", "02:00", "+2:00", "+02:60", "+99:00", "+00:20", "-20:00", "Z",
+        ] {
             assert!(
                 s.parse::<QuarterHourOffset>().is_err(),
                 "{s:?} must not parse"
@@ -1471,7 +1551,7 @@ mod tests {
     fn from_utc_and_to_utc_are_inverse() {
         let offset = QuarterHourOffset::from_minutes(345).unwrap();
         let instant = datetime!(2026-03-29 01:30:00 UTC);
-        let ts = CdrTimestamp::from_utc(instant, offset);
+        let ts = CdrTimestamp::from_utc(instant, offset).unwrap();
         assert_eq!(ts.to_utc(), instant);
         assert_eq!(ts.offset(), offset);
     }

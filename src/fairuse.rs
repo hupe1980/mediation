@@ -19,6 +19,7 @@
 //!
 //! ```rust
 //! use mediation::{FairUseAssessment, Octets};
+//! use time::macros::date;
 //!
 //! // Abroad most of the window, but consuming mostly at home.
 //! let assessment = FairUseAssessment::from_counts(
@@ -27,6 +28,7 @@
 //!     /* domestic use */ Octets::new(9_000),
 //!     /* roaming use  */ Octets::new(1_000),
 //!     /* window days */ 120,
+//!     /* window start */ date!(2026 - 03 - 29),
 //! );
 //!
 //! assert!(!assessment.prevailing_domestic_presence());
@@ -168,48 +170,95 @@ impl PresenceDay {
 
 /// How long a fair use policy must observe before it may conclude anything.
 ///
-/// Implementing Regulation (EU) 2016/2286 requires presence and consumption to
-/// be observed cumulatively over **at least four months**. A shorter window
-/// cannot support a conclusion, and this type exists so a caller cannot supply
-/// one by accident.
+/// Article 4(4) of Implementing Regulation (EU) 2016/2286 observes presence and
+/// consumption "cumulatively and for a period of time of at least 4 months".
+/// The window is therefore counted in **calendar months**, not days: 120 days
+/// is short of four months whenever the window spans 31-day months (finding
+/// R2). A shorter window cannot support a conclusion, and this type exists so
+/// a caller cannot supply one by accident.
+///
+/// ```rust
+/// use mediation::ObservationWindow;
+/// use time::macros::date;
+///
+/// let window = ObservationWindow::months(4).unwrap();
+/// // Four months ending on 28 July begin on 29 March: 122 days, not 120.
+/// assert_eq!(window.start(date!(2026 - 07 - 28)), Some(date!(2026 - 03 - 29)));
+/// assert!(ObservationWindow::months(3).is_none());
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObservationWindow {
-    days: u32,
+    months: u32,
 }
 
 impl ObservationWindow {
-    /// The regulation's floor, in days: four months.
+    /// The regulation's floor, in calendar months.
+    pub const MINIMUM_MONTHS: u32 = 4;
+
+    /// The fewest days any four consecutive calendar months hold.
+    ///
+    /// The evidence floor [`FairUseAssessment::window_sufficient`] applies to
+    /// the days a presence series actually covers.
     pub const MINIMUM_DAYS: u32 = 120;
 
-    /// The shortest window the regulation permits.
+    /// The shortest window the regulation permits: four months.
     #[must_use]
     pub const fn minimum() -> Self {
         Self {
-            days: Self::MINIMUM_DAYS,
+            months: Self::MINIMUM_MONTHS,
         }
     }
 
-    /// A window of `days`, which must be at least the regulatory floor.
+    /// A window of `months` calendar months, which must be at least four.
     #[must_use]
-    pub const fn new(days: u32) -> Option<Self> {
-        if days >= Self::MINIMUM_DAYS {
-            Some(Self { days })
+    pub const fn months(months: u32) -> Option<Self> {
+        if months >= Self::MINIMUM_MONTHS {
+            Some(Self { months })
         } else {
             None
         }
     }
 
-    /// The window's length in days.
+    /// The window's length in calendar months.
     #[must_use]
-    pub const fn days(self) -> u32 {
-        self.days
+    pub const fn month_count(self) -> u32 {
+        self.months
     }
 
-    /// The earliest day the window covers, given the day it ends.
+    /// The earliest day the window covers, given the last day it covers.
+    ///
+    /// Month arithmetic as in BGB §§ 187(2), 188(2) and Regulation (EEC,
+    /// Euratom) No 1182/71 Art. 3: a window of `n` months starting on day `d`
+    /// ends the day before day `d` of the `n`-th month after, and a month
+    /// lacking that day clamps to its last day. Clamping can only lengthen the
+    /// window, never shorten it below `n` months.
+    ///
+    /// `None` when the start falls outside the calendar `time` supports
+    /// (finding R3: this never panics).
     #[must_use]
-    pub fn start(self, ending: Date) -> Date {
-        ending - time::Duration::days(i64::from(self.days) - 1)
+    pub fn start(self, ending: Date) -> Option<Date> {
+        let months = i64::from(self.months);
+        match ending.next_day() {
+            Some(after) => add_calendar_months(after, -months),
+            // The calendar's last day ends its month, so the window is whole
+            // months back from that month's first day.
+            None => add_calendar_months(ending.replace_day(1).ok()?, 1 - months),
+        }
     }
+}
+
+/// `date` moved by `months` calendar months, clamped to the target month's last
+/// day. `None` outside the supported calendar; never panics.
+pub(crate) fn add_calendar_months(date: Date, months: i64) -> Option<Date> {
+    let index = i64::from(date.year())
+        .checked_mul(12)?
+        .checked_add(i64::from(u8::from(date.month())) - 1)?
+        .checked_add(months)?;
+    let year = i32::try_from(index.div_euclid(12)).ok()?;
+    let month = time::Month::try_from(u8::try_from(index.rem_euclid(12) + 1).ok()?).ok()?;
+    (1..=date.day())
+        .rev()
+        .find_map(|day| Date::from_calendar_date(year, month, day).ok())
 }
 
 // ── Assessment ───────────────────────────────────────────────────────────────
@@ -222,13 +271,16 @@ pub struct FairUseAssessment {
     domestic_consumption: Octets,
     roaming_consumption: Octets,
     observed_days: u32,
+    window_start: Date,
 }
 
 impl FairUseAssessment {
     /// An assessment from counts a caller computed themselves.
     ///
     /// Present so the predicates can be applied to figures from an existing
-    /// system without re-deriving them from records.
+    /// system without re-deriving them from records. `window_start` is the
+    /// first day of the observation window the counts cover; an alert issued
+    /// before it does not rest on this assessment (finding R4).
     #[must_use]
     pub const fn from_counts(
         domestic_presence_days: u32,
@@ -236,6 +288,7 @@ impl FairUseAssessment {
         domestic_consumption: Octets,
         roaming_consumption: Octets,
         observed_days: u32,
+        window_start: Date,
     ) -> Self {
         Self {
             domestic_presence_days,
@@ -243,7 +296,14 @@ impl FairUseAssessment {
             domestic_consumption,
             roaming_consumption,
             observed_days,
+            window_start,
         }
+    }
+
+    /// The first day of the observation window.
+    #[must_use]
+    pub const fn window_start(&self) -> Date {
+        self.window_start
     }
 
     /// Days observed at home.
@@ -280,7 +340,7 @@ impl FairUseAssessment {
     /// Filling this with the window's length instead makes
     /// [`window_sufficient`](Self::window_sufficient) a restatement of the
     /// caller's own configuration — always true, since
-    /// [`ObservationWindow::new`] already refuses anything shorter — and the
+    /// [`ObservationWindow::months`] already refuses anything shorter — and the
     /// gate that is supposed to stop a provider concluding from thin data
     /// stops nothing.
     #[must_use]
@@ -347,6 +407,8 @@ impl FairUseAssessment {
     /// boolean cannot tell the two apart.
     ///
     /// `None` for the alert means none was issued, which is never a surcharge.
+    /// An alert issued before the [`window_start`](Self::window_start) does
+    /// not rest on this observation and is refused (finding R4).
     ///
     /// ```rust
     /// use mediation::{FairUseAlert, FairUseAssessment, Octets};
@@ -354,7 +416,7 @@ impl FairUseAssessment {
     ///
     /// // Roaming prevails on both indicators over a full window.
     /// let assessment = FairUseAssessment::from_counts(
-    ///     20, 100, Octets::new(1_000), Octets::new(9_000), 120,
+    ///     20, 100, Octets::new(1_000), Octets::new(9_000), 120, date!(2026 - 03 - 01),
     /// );
     /// assert!(assessment.may_warn());
     ///
@@ -366,10 +428,16 @@ impl FairUseAssessment {
     /// assert!(assessment.may_surcharge(Some(alert), date!(2026 - 07 - 15)));
     /// // No alert is never a surcharge, however long ago the window closed.
     /// assert!(!assessment.may_surcharge(None, date!(2027 - 01 - 01)));
+    /// // An alert older than the observation is not an alert about it.
+    /// let stale = FairUseAlert::new(date!(2020 - 01 - 01));
+    /// assert!(!assessment.may_surcharge(Some(stale), date!(2026 - 07 - 15)));
     /// ```
     #[must_use]
     pub fn may_surcharge(&self, alert: Option<FairUseAlert>, as_of: Date) -> bool {
-        self.may_warn() && alert.is_some_and(|alert| alert.has_elapsed(as_of))
+        self.may_warn()
+            && alert.is_some_and(|alert| {
+                alert.issued() >= self.window_start && alert.has_elapsed(as_of)
+            })
     }
 
     /// Why the assessment reached its verdict, for a notice a human reads.
@@ -463,7 +531,8 @@ pub fn assess(
     ending: Date,
     regions: &impl Regions,
 ) -> FairUseAssessment {
-    let start = window.start(ending);
+    // A start before the supported calendar covers every representable day.
+    let start = window.start(ending).unwrap_or(Date::MIN);
 
     // Distinct days, not entries: a series that reports a subscriber twice on
     // one day has still observed one day, and counting it twice would tilt a
@@ -488,6 +557,10 @@ pub fn assess(
             Region::RestOfWorld => {}
         }
     }
+    // Article 4(4): "any day when a roaming customer has logged on to the
+    // domestic network shall be counted as a day of domestic presence". A day
+    // seen both at home and abroad is a domestic day only (finding R1).
+    roaming.retain(|day| !domestic.contains(day));
     let (domestic_days, roaming_days) = (domestic.len() as u32, roaming.len() as u32);
 
     let (mut domestic_use, mut roaming_use) = (Octets::ZERO, Octets::ZERO);
@@ -528,6 +601,7 @@ pub fn assess(
         domestic_use,
         roaming_use,
         observed.len() as u32,
+        start,
     )
 }
 
@@ -745,6 +819,7 @@ mod serde_impl {
     use serde::de::{self, Visitor};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::fmt;
+    use time::Date;
 
     macro_rules! code_serde {
         ($ty:ty, $all:expr, $expecting:literal) => {
@@ -805,6 +880,42 @@ mod serde_impl {
         domestic_consumption: crate::volume::Octets,
         roaming_consumption: crate::volume::Octets,
         observed_days: u32,
+        /// The window's first day, `YYYY-MM-DD`.
+        window_start: DateRepr,
+    }
+
+    /// A calendar date as `YYYY-MM-DD`.
+    struct DateRepr(Date);
+
+    const DATE_FORMAT: &[time::format_description::FormatItem<'static>] =
+        time::macros::format_description!("[year]-[month]-[day]");
+
+    impl Serialize for DateRepr {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let text = self
+                .0
+                .format(DATE_FORMAT)
+                .map_err(serde::ser::Error::custom)?;
+            serializer.serialize_str(&text)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for DateRepr {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct V;
+            impl Visitor<'_> for V {
+                type Value = DateRepr;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a date such as \"2026-03-29\"")
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<DateRepr, E> {
+                    Date::parse(v, DATE_FORMAT)
+                        .map(DateRepr)
+                        .map_err(de::Error::custom)
+                }
+            }
+            deserializer.deserialize_str(V)
+        }
     }
 
     impl Serialize for FairUseAssessment {
@@ -815,6 +926,7 @@ mod serde_impl {
                 domestic_consumption: self.domestic_consumption(),
                 roaming_consumption: self.roaming_consumption(),
                 observed_days: self.observed_days(),
+                window_start: DateRepr(self.window_start()),
             }
             .serialize(serializer)
         }
@@ -829,6 +941,7 @@ mod serde_impl {
                 r.domestic_consumption,
                 r.roaming_consumption,
                 r.observed_days,
+                r.window_start.0,
             ))
         }
     }
@@ -841,6 +954,8 @@ mod tests {
     use crate::record::{RecordType, SourceRef};
     use crate::volume::VolumePair;
     use time::macros::date;
+
+    const START: Date = date!(2026 - 01 - 01);
 
     fn home() -> PlmnId {
         "262-02".parse().unwrap()
@@ -879,8 +994,14 @@ mod tests {
     #[test]
     fn either_indicator_alone_is_the_safe_harbour() {
         // Abroad most days, but consuming mostly at home.
-        let by_consumption =
-            FairUseAssessment::from_counts(40, 80, Octets::new(9_000), Octets::new(1_000), 120);
+        let by_consumption = FairUseAssessment::from_counts(
+            40,
+            80,
+            Octets::new(9_000),
+            Octets::new(1_000),
+            120,
+            START,
+        );
         assert!(!by_consumption.prevailing_domestic_presence());
         assert!(by_consumption.prevailing_domestic_consumption());
         assert!(by_consumption.prevailing_domestic());
@@ -891,8 +1012,14 @@ mod tests {
         );
 
         // Home most days, but consuming mostly abroad.
-        let by_presence =
-            FairUseAssessment::from_counts(80, 40, Octets::new(1_000), Octets::new(9_000), 120);
+        let by_presence = FairUseAssessment::from_counts(
+            80,
+            40,
+            Octets::new(1_000),
+            Octets::new(9_000),
+            120,
+            START,
+        );
         assert!(by_presence.prevailing_domestic());
         assert!(!by_presence.may_warn());
         assert_eq!(by_presence.safe_harbour(), Some(SafeHarbour::Presence));
@@ -901,8 +1028,14 @@ mod tests {
     /// Only when both indicators point abroad may the provider act.
     #[test]
     fn a_warning_needs_both_indicators_to_prevail_abroad() {
-        let permanent =
-            FairUseAssessment::from_counts(20, 100, Octets::new(500), Octets::new(9_500), 120);
+        let permanent = FairUseAssessment::from_counts(
+            20,
+            100,
+            Octets::new(500),
+            Octets::new(9_500),
+            120,
+            START,
+        );
         assert!(!permanent.prevailing_domestic());
         assert!(permanent.may_warn());
         assert_eq!(permanent.safe_harbour(), None);
@@ -912,8 +1045,14 @@ mod tests {
     /// none of the four steps is skippable.
     #[test]
     fn a_surcharge_requires_an_alert_that_has_run_its_course() {
-        let permanent =
-            FairUseAssessment::from_counts(20, 100, Octets::new(500), Octets::new(9_500), 120);
+        let permanent = FairUseAssessment::from_counts(
+            20,
+            100,
+            Octets::new(500),
+            Octets::new(9_500),
+            120,
+            START,
+        );
         assert!(permanent.may_warn());
 
         let day = date!(2026 - 07 - 01);
@@ -936,8 +1075,14 @@ mod tests {
 
         // And a customer inside the safe harbour cannot be surcharged however
         // long ago somebody alerted them.
-        let lawful =
-            FairUseAssessment::from_counts(80, 40, Octets::new(9_000), Octets::new(1_000), 120);
+        let lawful = FairUseAssessment::from_counts(
+            80,
+            40,
+            Octets::new(9_000),
+            Octets::new(1_000),
+            120,
+            START,
+        );
         assert!(!lawful.may_surcharge(Some(alert), date!(2027 - 01 - 01)));
     }
 
@@ -957,7 +1102,8 @@ mod tests {
     /// the abuse the provider would have to show.
     #[test]
     fn an_equal_split_is_not_prevailing_roaming() {
-        let tied = FairUseAssessment::from_counts(60, 60, Octets::new(500), Octets::new(500), 120);
+        let tied =
+            FairUseAssessment::from_counts(60, 60, Octets::new(500), Octets::new(500), 120, START);
         assert!(tied.prevailing_domestic_presence());
         assert!(tied.prevailing_domestic_consumption());
         assert!(!tied.may_warn());
@@ -968,7 +1114,7 @@ mod tests {
     #[test]
     fn a_short_window_blocks_every_conclusion() {
         let short =
-            FairUseAssessment::from_counts(10, 80, Octets::new(100), Octets::new(9_900), 90);
+            FairUseAssessment::from_counts(10, 80, Octets::new(100), Octets::new(9_900), 90, START);
         assert!(!short.window_sufficient());
         assert!(!short.may_warn());
         assert!(!short.may_surcharge(
@@ -977,9 +1123,9 @@ mod tests {
         ));
         assert_eq!(short.safe_harbour(), Some(SafeHarbour::WindowTooShort));
 
-        assert_eq!(ObservationWindow::new(90), None);
-        assert_eq!(ObservationWindow::minimum().days(), 120);
-        assert!(ObservationWindow::new(180).is_some());
+        assert_eq!(ObservationWindow::months(3), None);
+        assert_eq!(ObservationWindow::minimum().month_count(), 4);
+        assert!(ObservationWindow::months(6).is_some());
     }
 
     // ── Building an assessment from records ──────────────────────────────────
@@ -993,8 +1139,8 @@ mod tests {
 
         // Registered abroad for most of the window, but consuming at home.
         let mut presence = Vec::new();
-        let mut day = window.start(ending);
-        for index in 0..window.days() {
+        let mut day = window.start(ending).unwrap();
+        for index in 0..120 {
             presence.push(PresenceDay::new(
                 day,
                 if index < 30 {

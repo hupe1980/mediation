@@ -3,22 +3,16 @@
 
 //! Telecom usage mediation domain library.
 //!
-//! A **standalone**, **pure** library for the arithmetic and classification that
-//! sits between a mobile or fixed network and a billing system: normalising,
-//! validating, deduplicating and correlating usage records. Zero I/O, no async,
-//! no clock, exact integer quantities.
-//!
-//! It computes **usage**, not money: there is no currency, tariff, price or rate
-//! type here. What leaves this crate is octets, seconds and event counts,
-//! attributed to a charged party, a network and a service, which a rating layer
-//! then prices.
+//! A **pure** library for the arithmetic and classification between a mobile or
+//! fixed network and a billing system: normalising, validating, deduplicating
+//! and correlating usage records. Zero I/O, no async, no clock, exact integer
+//! quantities. It computes **usage**, not money: octets, seconds and event
+//! counts, attributed to a charged party, a network and a service.
 //!
 //! <div class="warning">
 //!
-//! **Long-form documentation lives at
-//! <https://hupe1980.github.io/mediation>.** This page is the API reference;
-//! the site explains the failure each piece exists to prevent, and every one of
-//! its examples is compiled by this crate's test suite.
+//! **Long-form documentation: <https://hupe1980.github.io/mediation>.** Every
+//! example there is compiled by this crate's test suite.
 //!
 //! </div>
 //!
@@ -32,12 +26,13 @@
 //! | [`cdrtime`] | `CdrTimestamp`, `QuarterHourOffset`, `DstAdjustment`, `MsTimeZone`, `Seconds` |
 //! | [`volume`] | `Octets`, `VolumePair`, `ByteScale` — integer data volumes |
 //! | [`plmn`] | `Mcc`, `Mnc`, `PlmnId`, `TadigCode` — network identity, and its three-octet wire form |
-//! | [`identity`] | `Imsi`, `Msisdn`, `Imei`, `Imeisv`, `Iccid`, `Supi`, `Gpsi`, `Pei`, `Suci`, `AddressString` |
+//! | [`dialplan`] | `DialContext`, `Destination`, `DestinationClass`, `NumberingPlan` — dial string to E.164 destination |
+//! | [`identity`] | `Imsi`, `Msisdn`, `Imei`, `Imeisv`, `Iccid`, `Supi`, `Gpsi`, `Pei`, `Suci`, `Nai`, `AddressString` |
 //! | [`jurisdiction`] | `usage_country()`, `customer_country_presumption()` — two questions, two countries |
 //! | [`location`] | `UserLocation`, `Uli`, `Cgi`, `Sai`, `Rai`, `Lai`, `Ecgi`, `Ncgi`, `Tai` — where a record was produced |
 //! | [`numbering`] | `NumberRange`, `NumberRangeSet`, `Porting`, `terminating_plmn` — who really terminates a number |
 //! | [`party`] | `ChargedParty`, `SubscriberRef`, `TenantRef` — who the usage is charged to |
-//! | [`correlation`] | `CorrelationKeys`, `ChargingId`, `Icid`, `correlate()`, `CorrelatedGroup`, `LegChain` |
+//! | [`correlation`] | `CorrelationKeys`, `ChargingId`, `Icid`, `CallId`, `correlate()`, `CorrelatedGroup`, `LegChain` |
 //! | [`container`] | `ServiceDataContainer`, `ContainerSet`, `RatingGroup`, `ChangeCondition` |
 //! | [`partial`] | `PartialInfo`, `PartialRun`, `Reassembly`, `RecordClosureCause` |
 //! | [`pipeline`] | `process()`, `Batch`, `ProcessState`, `ProcessOutcome` — the whole layer, in one pass |
@@ -56,90 +51,51 @@
 //! | [`fairuse`] | `assess()`, `FairUseAssessment`, `FairUseAlert`, `VolumeAllowance` — EU 2016/2286 |
 //! | [`retention`] | `RetentionPolicy`, `RetentionSchedule`, `Deletion` — how long a record may be kept |
 //! | [`fraud`] | `Signal`, `Indication`, `impossible_travel()` — evidence, never verdicts |
-//! | [`privacy`] | `Pseudonymiser`, `Reduction` — narrowing an identity to the question |
+//! | [`privacy`] | `Pseudonymiser`, `Reduction`, `itemise_called()` — narrowing an identity to the question |
 //!
 //! # Time is local, not UTC
 //!
-//! A charging record carries a **local** wall-clock time and a numeric offset
-//! (3GPP TS 32.298), and the offset counts **quarter-hours** because a great
-//! many zones are not on an hour boundary. Reading such a value as UTC books
-//! every evening event of a UTC+X network onto the wrong day, and unlike a
-//! fixed-zone mistake it cannot be corrected downstream by a constant, because
-//! the offset varies per record.
+//! A charging record carries a **local** wall-clock time and a quarter-hour
+//! offset (3GPP TS 32.298). Read as UTC, an evening event lands on the wrong
+//! day, and no constant corrects it because the offset varies per record.
 //!
 //! ```rust
 //! use mediation::CdrTimestamp;
 //!
 //! let ts: CdrTimestamp = "2026-07-28T00:30:00+05:45".parse().unwrap();
-//!
-//! // The subscriber's day …
-//! assert_eq!(ts.local_date().to_string(), "2026-07-28");
-//! // … is not the UTC day.
-//! assert_eq!(ts.to_utc().date().to_string(), "2026-07-27");
+//! assert_eq!(ts.local_date().to_string(), "2026-07-28");    // the subscriber's day
+//! assert_eq!(ts.to_utc().date().to_string(), "2026-07-27"); // is not the UTC day
 //! ```
 //!
-//! [`cdrtime`] documents the rest, including why [`CdrTimestamp`] implements no
-//! ordering at all.
+//! # Integer quantities
 //!
-//! # Numeric types
-//!
-//! Every chargeable quantity is an **integer**: [`Octets`] is a `u64` and
-//! [`Seconds`] a `u32`. A data volume is inherently a count, so a float is not
-//! merely imprecise but categorically wrong — above 2^53 octets (about 9.01 PB)
-//! consecutive integers are no longer representable, and a national monthly
-//! aggregate crosses that. No value here is ever routed through a float.
-//!
-//! Uplink and downlink are kept apart in [`VolumePair`], with no constructor
-//! that takes only a total: asymmetric tariffs and interconnect settlement need
-//! the split, and it cannot be recovered once summed.
+//! [`Octets`] is a `u64` and [`Seconds`] a `u32`; no quantity passes through a
+//! float, which stops representing consecutive integers above 2^53 octets.
+//! [`VolumePair`] keeps uplink and downlink apart. Rounding to chargeable units
+//! ([`Octets::units_ceil`], [`Seconds::units_ceil`]) is a rating decision, offered
+//! and applied by nothing.
 //!
 //! # Determinism
 //!
-//! **No function in this crate reads the system clock, the filesystem, the
-//! network or any other ambient state.** Every input is an argument, so equal
-//! inputs always produce equal outputs and any result can be replayed or
-//! cached. Where an evaluation instant is needed it is a parameter, which is
-//! what allows an archived batch to be reprocessed years later and yield the
-//! verdicts it originally did rather than the verdicts of today.
+//! No function reads the clock, the filesystem, the network or other ambient
+//! state. An evaluation instant is a parameter, so an archived batch replays to
+//! the verdicts it originally got.
 //!
 //! # Every record reaches exactly one outcome
-//!
-//! The crate's central invariant, and the difference between a mediation layer
-//! and a data pipeline: a pipeline moves records, while a mediation layer can
-//! **prove** it did not lose any.
 //!
 //! ```text
 //! carried_in + ingested == billable + suppressed + duplicate + rejected + held
 //! ```
 //!
-//! [`BatchReconciliation::balances`] is that equation. A batch that fails it has
-//! unknown completeness, and billing over unknown completeness invoices an
-//! amount nobody can prove is right. And because a held record comes back,
-//! [`PeriodLedger`] chains batches so the law telescopes across a whole period
-//! rather than holding only inside each one. See [`disposition`].
-//!
-//! # Rounding is a rating decision
-//!
-//! Rounding up to whole chargeable units — per minute, per kilobyte — is priced
-//! behaviour. It is offered here as a named primitive
-//! ([`Octets::units_ceil`], [`Seconds::units_ceil`]) and applied by nothing.
-//! What leaves this crate is the measured quantity.
+//! [`BatchReconciliation::balances`] is that equation, and [`PeriodLedger`]
+//! chains batches so it holds across a billing period. See [`disposition`].
 //!
 //! # Every input is untrusted
 //!
-//! A mediation layer reads records that arrived over a network from a partner's
-//! equipment, so **no input may panic a parser or a decoder**. Every
-//! [`FromStr`](std::str::FromStr) and every wire decoder here returns a
-//! `Result` for arbitrary input, and a property suite hammers all of them with
-//! generated strings and bytes on every build.
-//!
-//! Two consequences are visible in the API. Anything whose size is chosen by
-//! the input is **bounded**: [`SequenceTracker::observe`] caps the missing
-//! identities it lists, [`PartialRun::assess`] caps the holes it names while
-//! still counting them exactly, and [`BerReader`] bounds how deep indefinite
-//! lengths may nest. And nothing is silently skipped: a decoder that stepped
-//! over a field it could not read would produce a record missing exactly the
-//! fields it failed on, which is worse than no record.
+//! Every [`FromStr`](std::str::FromStr) and wire decoder returns a `Result` for
+//! arbitrary input and never panics. Anything sized by the input is bounded
+//! ([`SequenceTracker::observe`], [`PartialRun::assess`], [`BerReader`] nesting
+//! depth) while counts stay exact, and no field is silently skipped.
 
 /// The README's code blocks, compiled as doctests.
 ///
@@ -194,6 +150,10 @@ mod site_doctests {
     #[doc = include_str!("../site/content/docs/pipeline.md")]
     pub struct Pipeline;
 
+    /// The `fixed-voice` documentation page, compiled as doctests.
+    #[doc = include_str!("../site/content/docs/fixed-voice.md")]
+    pub struct FixedVoice;
+
     /// The `conservation` documentation page, compiled as doctests.
     #[doc = include_str!("../site/content/docs/conservation.md")]
     pub struct Conservation;
@@ -245,6 +205,7 @@ pub mod cdrtime;
 pub mod container;
 pub mod correlation;
 pub mod dedup;
+pub mod dialplan;
 pub mod digits;
 pub mod disposition;
 pub mod error;
@@ -279,10 +240,15 @@ pub use ber::{BerElement, BerLength, BerReader, BerTag, TagClass};
 pub use cdrtime::{CdrTimestamp, Century, DstAdjustment, MsTimeZone, QuarterHourOffset, Seconds};
 pub use container::{ChangeCondition, ContainerSet, Qos5qi, RatingGroup, ServiceDataContainer};
 pub use correlation::{
-    BrokenLeg, ChargingId, CorrelatedGroup, CorrelationConfig, CorrelationKey, CorrelationKeys,
-    CorrelationResult, Icid, LegChain, PacketSessionId, Unmatched, UnmatchedReason, correlate,
+    BrokenLeg, CallId, ChargingId, CorrelatedGroup, CorrelationConfig, CorrelationKey,
+    CorrelationKeys, CorrelationResult, Icid, LegChain, PacketSessionId, Unmatched,
+    UnmatchedReason, correlate,
 };
 pub use dedup::{DedupDecision, DedupStore, DedupWindow, NotKeyable, RecordKey};
+pub use dialplan::{
+    AreaCode, Destination, DestinationClass, DialContext, DialContextError, DialError,
+    GermanNumberingPlan, NumberingPlan, ShortCode, ShortCodePattern,
+};
 pub use digits::DigitString;
 pub use disposition::{
     BatchReconciliation, ChainBreak, Disposition, HoldReason, Outcome, PeriodLedger, PeriodTotals,
@@ -294,12 +260,12 @@ pub use fairuse::{
     Regions, SafeHarbour, VolumeAllowance,
 };
 pub use fraud::{
-    CalledParty, Indication, Signal, TrafficShape, TransitTimes, UniformTransit, ait_signature,
+    Indication, Signal, TrafficShape, TransitTimes, UniformTransit, ait_signature,
     bypass_signature, impossible_travel, premium_destination, wangiri_pattern,
 };
 pub use identity::{
     AddressString, Gpsi, Iccid, Imei, Imeisv, Imsi, Msin, Msisdn, Nai, NatureOfAddress,
-    NumberingPlan, Pei, RoutingIndicator, Suci, Supi, Tac,
+    NumberingPlanIndicator, Pei, RoutingIndicator, Suci, Supi, Tac,
 };
 pub use jurisdiction::{
     Ambiguity, Jurisdiction, customer_country_presumption, is_abroad, usage_country,
@@ -323,11 +289,14 @@ pub use pipeline::{
 };
 pub use plmn::{Mcc, Mnc, MncWidth, MncWidths, NorthAmericanRule, PlmnId, TadigCode};
 pub use privacy::{
-    NumberPrefix, Pseudonym, Pseudonymiser, ReducedSubscriber, Reduction, reduce_equipment,
-    reduce_to_country, reduce_to_network, software_version,
+    Itemisation, ItemisedDestination, NumberPrefix, ProtectedDestinations, Pseudonym,
+    Pseudonymiser, ReducedSubscriber, Reduction, ShortenedNumber, itemise_called, itemise_calling,
+    reduce_equipment, reduce_to_country, reduce_to_network, software_version,
 };
-pub use quality::{QualityGrade, QualityReport, ReleaseBlocker, score_batch};
-pub use record::{NodeId, PrimaryMeasure, RecordType, ServiceDomain, SourceRef, UsageRecord};
+pub use quality::{QualityGrade, QualityReport, ReleaseBlocker, score_batch, score_dispositions};
+pub use record::{
+    CallDirection, NodeId, PrimaryMeasure, RecordType, ServiceDomain, SourceRef, UsageRecord,
+};
 pub use restatement::{RestateReason, Restatement, RestatementLog, UsageDelta};
 pub use retention::{Deletion, RetentionBasis, RetentionPolicy, RetentionSchedule};
 pub use roaming::{BatchDiscrepancy, BatchTotals, RapReturn, ScaledAmount, TapBatch, TotalKind};

@@ -34,14 +34,9 @@
 //! use mediation::{RetentionBasis, RetentionPolicy};
 //! use time::{Duration, macros::datetime};
 //!
-//! // § 10 TDDDG: six months from invoice dispatch.
-//! let policy = RetentionPolicy::new(
-//!     RetentionBasis::BillingTdddg10 {
-//!         invoice_dispatched_at: datetime!(2026-08-05 00:00 UTC),
-//!     },
-//!     Duration::days(183),
-//! )
-//! .unwrap();
+//! // § 10 TDDDG: six calendar months from invoice dispatch.
+//! let policy = RetentionPolicy::billing_tdddg10(datetime!(2026-08-05 00:00 UTC)).unwrap();
+//! assert_eq!(policy.deadline(), Some(datetime!(2027-02-05 00:00 UTC)));
 //!
 //! // A call from 1 July is kept six months past the August invoice, not past
 //! // the call.
@@ -49,6 +44,12 @@
 //! assert!(policy.deadline().unwrap() > event + Duration::days(183));
 //! assert!(!policy.is_expired(datetime!(2027-01-01 00:00 UTC)));
 //! assert!(policy.is_expired(datetime!(2027-03-01 00:00 UTC)));
+//!
+//! // Longer than § 10 allows is not a § 10 policy.
+//! let dispatched = datetime!(2026-08-31 00:00 UTC);
+//! let basis = RetentionBasis::BillingTdddg10 { invoice_dispatched_at: dispatched };
+//! assert!(RetentionPolicy::new(basis, Duration::days(181)).is_some()); // 28 Feb
+//! assert!(RetentionPolicy::new(basis, Duration::days(182)).is_none()); // 1 Mar
 //! ```
 //!
 //! # A hold has no deadline, and that is not the same as no policy
@@ -189,29 +190,76 @@ pub struct RetentionPolicy {
 }
 
 impl RetentionPolicy {
+    /// § 10 Abs. 2 TDDDG at its longest: "bis zu sechs Monate nach Versendung
+    /// der Rechnung".
+    ///
+    /// Six **calendar** months: the period ends on the same day of the sixth
+    /// month after dispatch, or on that month's last day if it lacks that day
+    /// (BGB § 188(2), (3)), at the dispatch's time of day. Where the dispatch
+    /// offset and UTC disagree on that date, the earlier instant applies, so
+    /// the period never outlasts either reading.
+    ///
+    /// `None` for a sub-second dispatch instant or one whose period leaves the
+    /// supported calendar.
+    ///
+    /// ```rust
+    /// use mediation::RetentionPolicy;
+    /// use time::macros::datetime;
+    ///
+    /// let policy = RetentionPolicy::billing_tdddg10(datetime!(2026-08-31 09:00 UTC)).unwrap();
+    /// assert_eq!(policy.deadline(), Some(datetime!(2027-02-28 09:00 UTC)));
+    /// ```
+    #[must_use]
+    pub fn billing_tdddg10(invoice_dispatched_at: OffsetDateTime) -> Option<Self> {
+        let deadline = tdddg10_limit(invoice_dispatched_at)?;
+        Self::new(
+            RetentionBasis::BillingTdddg10 {
+                invoice_dispatched_at,
+            },
+            deadline - invoice_dispatched_at,
+        )
+    }
+
     /// A policy from a basis and a duration.
     ///
-    /// `None` for a non-positive duration: a zero period is not a retention
-    /// policy but an instruction to delete on arrival, which a caller should
-    /// say outright rather than encode as a degenerate window.
+    /// `None` when any of these holds (findings R5–R7):
+    ///
+    /// - the duration is not positive: a zero period is not a retention policy
+    ///   but an instruction to delete on arrival, which a caller should say
+    ///   outright rather than encode as a degenerate window;
+    /// - the duration or the anchor is not whole seconds, or the anchor lies
+    ///   outside the UTC years 1–9998, which the stored form cannot carry;
+    /// - the deadline leaves the supported calendar;
+    /// - the basis is § 10 TDDDG and the period ends after
+    ///   [`billing_tdddg10`](Self::billing_tdddg10)'s;
+    /// - the basis is a dispute hold: a hold ends when the dispute is resolved,
+    ///   not on a date, so it is built with
+    ///   [`until_released`](Self::until_released).
     #[must_use]
-    pub const fn new(basis: RetentionBasis, duration: Duration) -> Option<Self> {
-        if duration.is_positive() {
-            Some(Self {
-                basis,
-                duration: Some(duration),
-            })
-        } else {
-            None
+    pub fn new(basis: RetentionBasis, duration: Duration) -> Option<Self> {
+        if !duration.is_positive() || duration.subsec_nanoseconds() != 0 || basis.is_a_hold() {
+            return None;
         }
+        let anchor = whole_second_anchor(basis)?;
+        let deadline = anchor.checked_add(duration)?;
+        if let RetentionBasis::BillingTdddg10 { .. } = basis
+            && deadline > tdddg10_limit(anchor)?
+        {
+            return None;
+        }
+        Some(Self {
+            basis,
+            duration: Some(duration),
+        })
     }
 
     /// A hold that runs until it is released, with no computable deadline.
     ///
     /// `None` for a basis that is not a hold — see
-    /// [`RetentionBasis::is_a_hold`]. A statutory period without an end is not
-    /// a retention policy but an intention to keep personal data forever, and
-    /// making it expressible would let one slip in beside three lawful ones.
+    /// [`RetentionBasis::is_a_hold`] — and for an anchor `new` refuses. A
+    /// statutory period without an end is not a retention policy but an
+    /// intention to keep personal data forever, and making it expressible
+    /// would let one slip in beside three lawful ones.
     ///
     /// A schedule carrying one of these is never deletable. Releasing the hold
     /// is done by rebuilding the schedule without it, because a hold that could
@@ -221,10 +269,7 @@ impl RetentionPolicy {
     /// use mediation::{RetentionBasis, RetentionPolicy, RetentionSchedule};
     /// use time::{Duration, macros::datetime};
     ///
-    /// let billing = RetentionPolicy::new(
-    ///     RetentionBasis::BillingTdddg10 { invoice_dispatched_at: datetime!(2026-08-05 0:00 UTC) },
-    ///     Duration::days(183),
-    /// ).unwrap();
+    /// let billing = RetentionPolicy::billing_tdddg10(datetime!(2026-08-05 0:00 UTC)).unwrap();
     /// let dispute = RetentionPolicy::until_released(
     ///     RetentionBasis::DisputeHold { raised_at: datetime!(2026-08-10 0:00 UTC) },
     /// ).unwrap();
@@ -238,8 +283,8 @@ impl RetentionPolicy {
     /// assert!(!schedule.is_deletable(long_after), "a hold has no expiry");
     /// ```
     #[must_use]
-    pub const fn until_released(basis: RetentionBasis) -> Option<Self> {
-        if basis.is_a_hold() {
+    pub fn until_released(basis: RetentionBasis) -> Option<Self> {
+        if basis.is_a_hold() && whole_second_anchor(basis).is_some() {
             Some(Self {
                 basis,
                 duration: None,
@@ -271,9 +316,11 @@ impl RetentionPolicy {
     ///
     /// `None` for an open hold. That is not "no deadline, so delete freely" —
     /// it is the opposite, and [`is_expired`](Self::is_expired) says so.
+    /// Checked: construction refuses a deadline outside the calendar, so this
+    /// never panics (finding R5).
     #[must_use]
     pub fn deadline(self) -> Option<OffsetDateTime> {
-        Some(self.basis.anchor() + self.duration?)
+        self.basis.anchor().checked_add(self.duration?)
     }
 
     /// `true` when the record must already have been deleted at `as_of`.
@@ -296,6 +343,28 @@ impl RetentionPolicy {
     pub fn remaining(self, as_of: OffsetDateTime) -> Option<Duration> {
         Some(self.deadline()? - as_of)
     }
+}
+
+/// The basis's anchor, or `None` when it carries a fraction of a second or
+/// lies outside the UTC years 1–9998 a stored timestamp carries.
+fn whole_second_anchor(basis: RetentionBasis) -> Option<OffsetDateTime> {
+    let anchor = basis.anchor();
+    let storable =
+        crate::cdrtime::CdrTimestamp::from_utc(anchor, crate::cdrtime::QuarterHourOffset::UTC)
+            .is_some();
+    (anchor.nanosecond() == 0 && storable).then_some(anchor)
+}
+
+/// The last instant § 10 Abs. 2 TDDDG permits for an invoice dispatched at
+/// `dispatched`: six calendar months on, read in the dispatch offset and in
+/// UTC, whichever is earlier.
+fn tdddg10_limit(dispatched: OffsetDateTime) -> Option<OffsetDateTime> {
+    let six_months = |at: OffsetDateTime| {
+        crate::fairuse::add_calendar_months(at.date(), 6).map(|date| at.replace_date(date))
+    };
+    let local = six_months(dispatched)?;
+    let utc = six_months(dispatched.checked_to_offset(time::UtcOffset::UTC)?)?;
+    Some(local.min(utc))
 }
 
 impl fmt::Display for RetentionPolicy {
@@ -511,8 +580,11 @@ mod serde_impl {
         OperatorPolicy { from: crate::cdrtime::CdrTimestamp },
     }
 
-    fn to_stamp(at: OffsetDateTime) -> crate::cdrtime::CdrTimestamp {
+    fn to_stamp<E: serde::ser::Error>(
+        at: OffsetDateTime,
+    ) -> Result<crate::cdrtime::CdrTimestamp, E> {
         crate::cdrtime::CdrTimestamp::from_utc(at, crate::cdrtime::QuarterHourOffset::UTC)
+            .ok_or_else(|| E::custom("retention anchor outside UTC years 1-9998"))
     }
 
     impl Serialize for RetentionBasis {
@@ -521,16 +593,16 @@ mod serde_impl {
                 Self::BillingTdddg10 {
                     invoice_dispatched_at,
                 } => BasisRepr::BillingTdddg10 {
-                    invoice_dispatched_at: to_stamp(*invoice_dispatched_at),
+                    invoice_dispatched_at: to_stamp(*invoice_dispatched_at)?,
                 },
                 Self::LawfulAccess { recorded_at } => BasisRepr::LawfulAccess {
-                    recorded_at: to_stamp(*recorded_at),
+                    recorded_at: to_stamp(*recorded_at)?,
                 },
                 Self::DisputeHold { raised_at } => BasisRepr::DisputeHold {
-                    raised_at: to_stamp(*raised_at),
+                    raised_at: to_stamp(*raised_at)?,
                 },
                 Self::OperatorPolicy { from } => BasisRepr::OperatorPolicy {
-                    from: to_stamp(*from),
+                    from: to_stamp(*from)?,
                 },
             };
             repr.serialize(serializer)
@@ -584,7 +656,12 @@ mod serde_impl {
             let r = PolicyRepr::deserialize(deserializer)?;
             match r.duration_s {
                 Some(seconds) => RetentionPolicy::new(r.basis, Duration::seconds(seconds))
-                    .ok_or_else(|| serde::de::Error::custom("a retention period must be positive")),
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "a retention period must be positive whole seconds, inside the \
+                             calendar, within § 10 TDDDG for billing, and absent for a hold",
+                        )
+                    }),
                 None => RetentionPolicy::until_released(r.basis).ok_or_else(|| {
                     serde::de::Error::custom("only a hold may run without a duration")
                 }),
@@ -659,8 +736,8 @@ mod tests {
         )
         .unwrap();
         let dispute = RetentionPolicy::new(
-            RetentionBasis::DisputeHold {
-                raised_at: datetime!(2026-09-01 00:00 UTC),
+            RetentionBasis::LawfulAccess {
+                recorded_at: datetime!(2026-09-01 00:00 UTC),
             },
             Duration::days(365),
         )
@@ -671,7 +748,7 @@ mod tests {
         assert_eq!(schedule.len(), 3);
         assert_eq!(schedule.governing_policy(), Some(dispute));
         assert_eq!(schedule.governing_deadline(), dispute.deadline());
-        assert!(schedule.is_held());
+        assert!(!schedule.is_held());
 
         // The short policy expiring does not make the record deletable.
         let after_short = EVENT + Duration::days(60);

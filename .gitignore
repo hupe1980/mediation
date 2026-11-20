@@ -21,8 +21,22 @@ target
 #.idea/
 
 # Custom
-CONCEPT.md
 .DS_Store
 
 # Zola build output and its cached search index
 site/public/
+
+# Internal design notes (see concepts/). Working documents: the design rationale,
+# decisions and the standards they cite. `site/` is the public narrative and the
+# rustdoc the API contract; `concepts/` is neither, and nothing in the build
+# reads it.
+/concepts/
+
+# Spec Kit: the feature specifications under `specs/`, the scaffolding that
+# produces them (`/speckit-*` skills, the ThreatSpec extension, templates) and
+# the constitution under `.specify/memory/`. Same rule as `concepts/`: internal
+# working documents, and nothing published may cite a path its reader does not
+# have.
+/specs/
+/.specify/
+/.claude/

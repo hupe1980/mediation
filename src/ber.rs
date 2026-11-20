@@ -33,18 +33,19 @@
 //! assert_eq!(inner[0].offset(), 2);
 //! ```
 //!
-//! # Non-minimal encodings are rejected
+//! # What BER permits, and what it does not
 //!
-//! X.690 permits exactly one encoding of each tag number and length. A
-//! non-minimal one — a long-form length that would fit the short form, a
-//! high-tag-number form with a leading zero — is a **second** encoding of the
-//! same value.
+//! BER leaves the length form to the sender: a definite length may use the
+//! long form even when the short form would do, with any number of length
+//! octets (X.690 §8.1.3.5, NOTE 2). Such lengths are **accepted** — a
+//! conforming sender may produce them. DER (X.690 §10.1) is the stricter
+//! subset that forbids them; this module reads BER.
 //!
-//! This crate rejects them, for the same reason it insists one value has one
-//! string: two encodings of one record produce two hashes, two deduplication
-//! keys, and two "distinct" rows that mean the same thing. It is also the
-//! classic parser-differential vector — two decoders disagreeing about what a
-//! record says is how a validation step gets bypassed.
+//! The encodings X.690 forbids even in BER are **rejected**: a high-tag-number
+//! form with a leading `0x80` octet (§8.1.2.4.2 c), the high-tag form for a
+//! number below 31 (§8.1.2.2), the reserved length octet `0xFF` (§8.1.3.5 c),
+//! and an INTEGER with redundant leading octets (§8.3.2). A raw-byte hash of a
+//! BER record is therefore not a canonical key; hash decoded fields instead.
 //!
 //! # Depth is bounded
 //!
@@ -445,6 +446,15 @@ impl<'a> BerReader<'a> {
         if self.finished || self.position >= self.bytes.len() {
             return None;
         }
+        // Every reported offset is `base + i` with `i <= bytes.len()`; one
+        // check here keeps all of them from overflowing.
+        if self.base.checked_add(self.bytes.len()).is_none() {
+            self.finished = true;
+            return Some(Err(DecodeError::new(
+                self.base,
+                "a base offset that leaves room for the input",
+            )));
+        }
         let start = self.position;
         match self.read_element(start) {
             Ok(element) => {
@@ -592,29 +602,23 @@ impl<'a> BerReader<'a> {
         if count == 0x7F {
             return Err(DecodeError::new(absolute, "a length form X.690 defines"));
         }
-        if count > 8 {
-            return Err(DecodeError::new(absolute, "a length of at most 8 octets"));
-        }
         let end = start + 1 + count;
         if end > self.bytes.len() {
             return Err(DecodeError::new(absolute, "complete length octets"));
         }
+        // BER lets the sender choose the long form and pad it with leading
+        // zero octets (X.690 §8.1.3.5); only the value matters.
         let octets = &self.bytes[start + 1..end];
-        if octets[0] == 0 {
-            return Err(DecodeError::new(
-                absolute,
-                "a minimally encoded length, without leading zero octets",
-            ));
+        let significant = octets
+            .iter()
+            .position(|b| *b != 0)
+            .map_or(&octets[octets.len()..], |i| &octets[i..]);
+        if significant.len() > 8 {
+            return Err(DecodeError::new(absolute, "a length that fits in 64 bits"));
         }
-        let value = octets
+        let value = significant
             .iter()
             .fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
-        if value < 128 {
-            return Err(DecodeError::new(
-                absolute,
-                "the short length form for values below 128",
-            ));
-        }
         let value = usize::try_from(value)
             .map_err(|_| DecodeError::new(absolute, "a length this platform can address"))?;
         Ok((BerLength::Definite(value), end))
@@ -755,26 +759,18 @@ mod tests {
 
     // ── Minimality ───────────────────────────────────────────────────────────
 
-    /// The rule that keeps one value to one encoding: a long-form length that
-    /// would fit the short form is a second spelling of the same number.
+    /// BER leaves the length form to the sender (X.690 §8.1.3.5): a long
+    /// form that would fit the short form, or one with leading zero octets,
+    /// is a valid encoding of the same length.
     #[test]
-    fn a_non_minimal_length_is_rejected() {
-        // 0x81 0x05 says "one length octet, value 5" — the short form 0x05 must
-        // be used instead.
-        assert!(
-            BerReader::new(&[0x02, 0x81, 0x05, 1, 2, 3, 4, 5])
-                .next()
-                .unwrap()
-                .is_err()
-        );
-        // A leading zero octet in a long form is equally non-minimal.
-        assert!(
-            BerReader::new(&[0x02, 0x82, 0x00, 0x80])
-                .next()
-                .unwrap()
-                .is_err()
-        );
-        // …while a genuine long form is fine.
+    fn a_non_minimal_length_is_accepted() {
+        let element = one(&[0x04, 0x81, 0x05, 1, 2, 3, 4, 5]);
+        assert_eq!(element.content(), &[1, 2, 3, 4, 5]);
+        let element = one(&[0x04, 0x82, 0x00, 0x02, 9, 9]);
+        assert_eq!(element.content(), &[9, 9]);
+        // The reserved form 0xFF stays refused.
+        assert!(BerReader::new(&[0x04, 0xFF]).next().unwrap().is_err());
+        // A genuine long form is fine too.
         let long = [&[0x04u8, 0x81, 0x80][..], &[0xAA; 128][..]].concat();
         let element = one(&long);
         assert_eq!(element.content().len(), 128);

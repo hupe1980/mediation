@@ -33,9 +33,16 @@
 //!
 //! // A run whose first record is reduced cannot be completed from itself.
 //! let orphaned = PartialRun::from_parts(vec![
-//!     PartialInfo::new(2, PartialFormat::Reduced, RecordClosureCause::VolumeLimit),
+//!     PartialInfo::new(1, PartialFormat::Reduced, RecordClosureCause::VolumeLimit),
 //! ]);
 //! assert!(matches!(orphaned.assess(), Reassembly::Orphan { .. }));
+//!
+//! // A run whose first record has not arrived yet is waiting, not broken.
+//! let waiting = PartialRun::from_parts(vec![
+//!     PartialInfo::new(2, PartialFormat::Reduced, RecordClosureCause::VolumeLimit),
+//! ]);
+//! assert_eq!(waiting.assess().missing(), &[1]);
+//! assert!(waiting.assess().may_still_complete());
 //! ```
 //!
 //! # Why a partial exists tells you whether it is suspicious
@@ -303,7 +310,8 @@ pub enum Reassembly {
         /// How many records the run holds.
         count: usize,
     },
-    /// The run starts correctly but has holes, or has not ended.
+    /// The run has holes — its first record among them, possibly — or has
+    /// not ended.
     Incomplete {
         /// Sequence numbers present in the run, ascending.
         have: Vec<u32>,
@@ -326,10 +334,10 @@ pub enum Reassembly {
         /// still open, and more partials are expected.
         terminated: bool,
     },
-    /// The run cannot be completed from what arrived.
+    /// The run can never be completed, however long it waits.
     ///
-    /// Either it does not begin at sequence 1, or its first record is reduced
-    /// and therefore has no basis to be completed against.
+    /// Its first record is reduced and therefore has no basis to be completed
+    /// against, or a partial carries sequence 0, which no run contains.
     Orphan {
         /// Why the run cannot be reassembled.
         reason: OrphanReason,
@@ -349,8 +357,9 @@ impl Reassembly {
 
     /// `true` when more records may still arrive to finish the run.
     ///
-    /// An orphan cannot be finished by waiting: what is missing is the basis
-    /// the run needed to be readable at all.
+    /// An orphan cannot be finished by waiting. A run whose first record has
+    /// not arrived can: it is [`Incomplete`](Self::Incomplete), with `1` among
+    /// its missing sequence numbers.
     #[must_use]
     pub const fn may_still_complete(&self) -> bool {
         matches!(self, Self::Incomplete { .. } | Self::Empty)
@@ -411,30 +420,28 @@ impl fmt::Display for Reassembly {
 /// Why a run of partials cannot be reassembled at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OrphanReason {
-    /// The run does not begin at sequence 1.
-    ///
-    /// Its opening record was lost, and with it every field the reduced
-    /// records that followed were meant to be completed against.
-    FirstRecordMissing,
-    /// The run begins at sequence 1, but that record is reduced.
+    /// The run's sequence 1 is present only as a reduced record.
     ///
     /// The first partial must be fully qualified. A reduced one has no basis
     /// to complete itself from, and treating its absent fields as zero would
     /// invent the session's parameters.
     FirstRecordNotFullyQualified,
+    /// A partial carries sequence 0.
+    ///
+    /// 3GPP numbers partials from 1, so no run can place it.
+    InvalidSequence,
 }
 
 impl OrphanReason {
     /// Every variant, for exhaustive iteration in tests and mappings.
-    pub const ALL: &'static [Self] =
-        &[Self::FirstRecordMissing, Self::FirstRecordNotFullyQualified];
+    pub const ALL: &'static [Self] = &[Self::FirstRecordNotFullyQualified, Self::InvalidSequence];
 
     /// The canonical string form.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::FirstRecordMissing => "FIRST_RECORD_MISSING",
             Self::FirstRecordNotFullyQualified => "FIRST_RECORD_NOT_FULLY_QUALIFIED",
+            Self::InvalidSequence => "INVALID_SEQUENCE",
         }
     }
 }
@@ -543,6 +550,11 @@ impl PartialRun {
     /// Duplicated sequence numbers are collapsed: two copies of partial 3 are
     /// one partial 3, and recognising the retransmission is
     /// [`crate::dedup`]'s job rather than this one's.
+    ///
+    /// A run whose sequence 1 has not arrived is
+    /// [`Incomplete`](Reassembly::Incomplete) with `1` missing: the first
+    /// record may still come. Where two copies of sequence 1 differ in format,
+    /// the fully qualified one is the run's basis, whatever order they came in.
     #[must_use]
     pub fn assess(&self) -> Reassembly {
         if self.0.is_empty() {
@@ -553,21 +565,23 @@ impl PartialRun {
         have.sort_unstable();
         have.dedup();
 
-        let first = self.0.iter().min_by_key(|p| p.sequence).expect("non-empty");
-        if first.sequence != 1 {
+        if have.first() == Some(&0) {
             return Reassembly::Orphan {
-                reason: OrphanReason::FirstRecordMissing,
+                reason: OrphanReason::InvalidSequence,
                 have,
             };
         }
-        if !first.format.is_self_contained() {
+        let mut firsts = self.0.iter().filter(|p| p.is_first()).peekable();
+        if firsts.peek().is_some() && !firsts.any(|p| p.format.is_self_contained()) {
             return Reassembly::Orphan {
                 reason: OrphanReason::FirstRecordNotFullyQualified,
                 have,
             };
         }
 
-        let highest = *have.last().expect("non-empty");
+        let Some(&highest) = have.last() else {
+            return Reassembly::Empty;
+        };
         // The count is exact; the *list* is bounded. `have` is sorted and
         // deduplicated, so a hole is the distance between neighbours and no
         // scan of the whole range is needed — which matters because `highest`
@@ -757,21 +771,39 @@ mod tests {
         assert!(!run.assess().may_still_complete(), "waiting cannot fix it");
     }
 
-    /// A run that does not start at 1 lost its opening record, and with it the
-    /// basis every following reduced record needed.
+    /// A run that does not start at 1 is waiting for its opening record.
     #[test]
-    fn a_run_that_does_not_begin_at_one_is_an_orphan() {
+    fn a_run_that_does_not_begin_at_one_is_waiting_for_it() {
         let run = PartialRun::from_parts(vec![
             rpc(2, RecordClosureCause::VolumeLimit),
             rpc(3, RecordClosureCause::NormalRelease),
         ]);
         assert_eq!(
             run.assess(),
-            Reassembly::Orphan {
-                reason: OrphanReason::FirstRecordMissing,
+            Reassembly::Incomplete {
                 have: vec![2, 3],
+                missing: vec![1],
+                missing_count: 1,
+                terminated: true,
             }
         );
+        assert!(run.assess().may_still_complete());
+    }
+
+    /// Sequence 0 belongs to no run.
+    #[test]
+    fn a_partial_numbered_zero_is_an_orphan() {
+        let run = PartialRun::from_parts(vec![
+            rpc(0, RecordClosureCause::VolumeLimit),
+            fqpc(1, RecordClosureCause::NormalRelease),
+        ]);
+        assert!(matches!(
+            run.assess(),
+            Reassembly::Orphan {
+                reason: OrphanReason::InvalidSequence,
+                ..
+            }
+        ));
     }
 
     #[test]

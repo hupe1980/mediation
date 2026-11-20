@@ -37,7 +37,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::disposition::BatchReconciliation;
+use crate::disposition::{BatchReconciliation, Disposition};
 use crate::error::ParseError;
 use crate::validation::ValidationReport;
 
@@ -143,9 +143,13 @@ pub struct QualityReport {
     pub grade: QualityGrade,
     /// Every reason the batch may not be released, in a stable order.
     pub blockers: Vec<ReleaseBlocker>,
-    /// How many findings fired at blocking severity.
+    /// How many blocking findings stop the release.
+    ///
+    /// From [`score_dispositions`], a blocking finding on a record the batch
+    /// rejected or holds is not among them: that record is not released, so
+    /// the finding has already been acted on. It counts as a warning instead.
     pub blocking_findings: usize,
-    /// How many findings fired at warning severity.
+    /// How many findings are noise rather than a stop.
     pub warnings: usize,
     /// How many records are waiting for something that may still arrive.
     pub held: u64,
@@ -213,8 +217,53 @@ pub fn score_batch(
     findings: &ValidationReport,
     sources_complete: bool,
 ) -> QualityReport {
-    let blocking_findings = findings.blocking_count();
-    let warnings = findings.len() - blocking_findings;
+    gate(
+        counts,
+        findings.blocking_count(),
+        findings.len(),
+        sources_complete,
+    )
+}
+
+/// [`score_batch`] for a batch whose dispositions are known.
+///
+/// A blocking finding stops the release only when it belongs to the batch as a
+/// whole or to a record that is not [`Rejected`](Disposition::Rejected) or
+/// [`Held`](Disposition::Held). Those two outcomes already keep the record from
+/// being billed; letting their findings block the batch as well would stop
+/// every other record over one bad one. A finding whose record index has no
+/// disposition still blocks.
+#[must_use]
+pub fn score_dispositions(
+    counts: &BatchReconciliation,
+    dispositions: &[Disposition],
+    findings: &ValidationReport,
+    sources_complete: bool,
+) -> QualityReport {
+    let blocking_findings = findings
+        .findings()
+        .iter()
+        .filter(|finding| finding.blocks_billing())
+        .filter(|finding| {
+            !finding.record_index.is_some_and(|index| {
+                matches!(
+                    dispositions.get(index),
+                    Some(Disposition::Rejected(_) | Disposition::Held(_))
+                )
+            })
+        })
+        .count();
+    gate(counts, blocking_findings, findings.len(), sources_complete)
+}
+
+/// The gate itself, from the number of blocking findings that stop a release.
+fn gate(
+    counts: &BatchReconciliation,
+    blocking_findings: usize,
+    total_findings: usize,
+    sources_complete: bool,
+) -> QualityReport {
+    let warnings = total_findings - blocking_findings;
 
     let mut blockers = Vec::new();
     if !counts.balances() {

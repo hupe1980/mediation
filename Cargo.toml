@@ -1,19 +1,18 @@
 [package]
 name         = "mediation"
-description  = "Telecom usage mediation domain library — one-pass batch processing with a conservation law that proves no record was lost, 3GPP CDR local-time-plus-offset arithmetic (quarter-hour offsets, DST-adjusted), integer octet volumes, validated identifiers (IMSI/MSISDN/IMEI/ICCID/SUPI/GPSI/PEI/SUCI, PLMN, TADIG), natural-key deduplication, RFC 1982 wrap-aware sequence-gap detection, partial-record reassembly, cross-node correlation, signed restatement, a numbered validation catalogue, wire codecs for TBCD/BCD, ISDN-AddressString, the PLMN identity and the full User Location Information element, a zero-copy BER reader, usage aggregation, roaming-batch reconciliation, longest-prefix number ranges with portability, conserving tariff-band apportionment, two-question jurisdiction determination and an EU/German regulatory layer. Zero I/O, no async, no clock, exact integer quantities, and no input can panic a parser."
-version      = "0.2.0"
+description  = "Telecom usage mediation as a pure Rust library: normalise, deduplicate, correlate and reconcile CDRs from mobile and fixed-line networks, with a conservation law that proves no record was lost. Zero I/O, no clock, integer quantities."
+version      = "0.3.0"
 authors      = ["hupe1980"]
 edition      = "2024"
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/hupe1980/mediation"
+homepage     = "https://hupe1980.github.io/mediation"
+documentation = "https://docs.rs/mediation"
 rust-version = "1.94"
 readme       = "README.md"
 
-# The documentation site is a build input for `cargo test` — every page is
-# included as a doctest from `src/lib.rs` — but it is dead weight in the
-# published `.crate`, which nobody runs doctests from. `cfg(doctest)` is off
-# during a normal build, so the `include_str!`s are cfg-stripped before
-# expansion and the packaged crate compiles without these files.
+# Site pages are doctests (`src/lib.rs`, `cfg(doctest)`); the rest of the site is
+# not needed to build the published crate.
 exclude = [
     "site/templates/",
     "site/sass/",
@@ -21,7 +20,7 @@ exclude = [
     "site/config.toml",
     ".github/",
 ]
-keywords     = ["telecom", "cdr", "mediation", "charging", "roaming"]
+keywords     = ["telecom", "cdr", "mediation", "charging", "billing"]
 categories   = ["data-structures", "parser-implementations"]
 
 [dependencies]

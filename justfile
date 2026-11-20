@@ -21,7 +21,7 @@ default:
     @just --list
 
 # ✅ Everything CI runs, in CI order
-ci: fmt-check lint purity no-floats test doc site-check package
+ci: fmt-check lint purity no-floats test doc wasm site-check package
     @echo "✅ all checks passed"
 
 # 🧊 Enforce the "zero I/O, no clock" guarantee over non-comment source lines
@@ -88,6 +88,20 @@ features:
     cargo build --no-default-features
     cargo build --no-default-features --features serde
     cargo build --all-features
+
+# 🕸️ Build for wasm32-unknown-unknown — the crate promises to run in a browser
+#
+# Skipped with a note when the target is not installed, like `site-check`;
+# CI installs it and runs this for real.
+wasm:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! rustup target list --installed 2>/dev/null | grep -qx wasm32-unknown-unknown; then
+        echo "⏭️  wasm32-unknown-unknown not installed — skipping the wasm build"
+        echo "   install it with: rustup target add wasm32-unknown-unknown"
+        exit 0
+    fi
+    cargo build --target wasm32-unknown-unknown --all-features
 
 # 🦀 Compile on the pinned MSRV
 msrv:

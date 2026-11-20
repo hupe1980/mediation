@@ -1872,9 +1872,11 @@ impl Uli {
         self.lai.map(UserLocation::Lai)
     }
 
-    /// The country every identity in the element agrees on.
+    /// The country every identity in the element agrees on, eNodeB identities
+    /// included (audit L1), as the first identity's MCC.
     ///
-    /// `Ok(None)` when the element carried no identity at all, and
+    /// Two MCCs of one country agree ([`Mcc::same_country`]). `Ok(None)` when
+    /// the element carried no identity at all, and
     /// `Err(UliCountryConflict)` when two of them name different countries —
     /// which is a fault, not a tie to break, exactly as in
     /// [`crate::jurisdiction`]. The three answers are kept apart because they
@@ -1908,13 +1910,15 @@ impl Uli {
             self.tai.map(Tai::plmn),
             self.ecgi.map(Ecgi::plmn),
             self.lai.map(Lai::plmn),
+            self.macro_enb.map(MacroEnbId::plmn),
+            self.extended_macro_enb.map(ExtendedMacroEnbId::plmn),
         ]
         .into_iter()
         .flatten()
         {
             match found {
                 None => found = Some(plmn.mcc()),
-                Some(seen) if seen != plmn.mcc() => {
+                Some(seen) if !seen.same_country(plmn.mcc()) => {
                     return Err(UliCountryConflict {
                         first: seen,
                         second: plmn.mcc(),

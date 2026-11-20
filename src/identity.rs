@@ -249,6 +249,14 @@ const MSISDN_FORMAT: &str =
     "1 to 15 decimal digits in international form, such as 491701234567 or +491701234567";
 
 impl Msisdn {
+    /// The most digits an international number has (ITU-T E.164).
+    pub const MAX_DIGITS: usize = 15;
+
+    /// A number from digits already checked to be 1 to 15 long.
+    pub(crate) const fn from_digits(digits: DigitString) -> Self {
+        Self(digits)
+    }
+
     /// How many digits the number holds.
     #[must_use]
     pub fn len(self) -> usize {
@@ -383,6 +391,10 @@ pub enum NatureOfAddress {
     Abbreviated,
     /// A value TS 29.002 reserves. Carried rather than rejected, so a decoder
     /// can report it instead of silently reading the digits as something else.
+    ///
+    /// Decoder output: [`from_bits`](Self::from_bits) produces it only for an
+    /// unassigned code, and [`AddressString::new`] normalises a hand-built
+    /// `Reserved` holding an assigned code to that code's variant.
     Reserved(u8),
 }
 
@@ -439,7 +451,7 @@ impl fmt::Display for NatureOfAddress {
 /// Which plan an [`AddressString`]'s digits are numbered under (3GPP TS 29.002,
 /// bits 4–1 of the first octet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum NumberingPlan {
+pub enum NumberingPlanIndicator {
     /// `0000` — the element did not say.
     Unknown,
     /// `0001` — ITU-T E.164, the plan an [`Msisdn`] belongs to.
@@ -455,10 +467,14 @@ pub enum NumberingPlan {
     /// `1001` — a private plan.
     Private,
     /// A value TS 29.002 reserves.
+    ///
+    /// Decoder output: [`from_bits`](Self::from_bits) produces it only for an
+    /// unassigned code, and [`AddressString::new`] normalises a hand-built
+    /// `Reserved` holding an assigned code to that code's variant.
     Reserved(u8),
 }
 
-impl NumberingPlan {
+impl NumberingPlanIndicator {
     /// Decode the four-bit field.
     #[must_use]
     pub const fn from_bits(bits: u8) -> Self {
@@ -505,7 +521,7 @@ impl NumberingPlan {
     }
 }
 
-impl fmt::Display for NumberingPlan {
+impl fmt::Display for NumberingPlanIndicator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -519,7 +535,7 @@ impl fmt::Display for NumberingPlan {
 /// The number fields of a charging record — `servedMSISDN`, `calledNumber`,
 /// `callingNumber`, `recordingEntity` — are `ISDN-AddressString`s, and the
 /// first octet is **not** a digit pair. It carries an extension bit, a
-/// [`NatureOfAddress`] and a [`NumberingPlan`].
+/// [`NatureOfAddress`] and a [`NumberingPlanIndicator`].
 ///
 /// Handing those octets straight to [`Msisdn::from_tbcd`] reads that octet as
 /// two swapped digits and prepends them to the number. The result is a
@@ -529,14 +545,14 @@ impl fmt::Display for NumberingPlan {
 /// reference decode to compare against.
 ///
 /// ```rust
-/// use mediation::{AddressString, Msisdn, NatureOfAddress, NumberingPlan};
+/// use mediation::{AddressString, Msisdn, NatureOfAddress, NumberingPlanIndicator};
 ///
 /// // servedMSISDN as it arrives: 0x91 = international, E.164, then TBCD.
 /// let field = [0x91, 0x94, 0x71, 0x10, 0x32, 0x54, 0x76];
 ///
 /// let address = AddressString::from_bytes(&field).unwrap();
 /// assert_eq!(address.nature(), NatureOfAddress::International);
-/// assert_eq!(address.plan(), NumberingPlan::Isdn);
+/// assert_eq!(address.plan(), NumberingPlanIndicator::Isdn);
 /// assert_eq!(address.to_msisdn().unwrap().to_string(), "491701234567");
 ///
 /// // Reading the same octets as raw TBCD invents two leading digits, and the
@@ -546,17 +562,25 @@ impl fmt::Display for NumberingPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AddressString {
     nature: NatureOfAddress,
-    plan: NumberingPlan,
+    plan: NumberingPlanIndicator,
     digits: DigitString,
 }
 
 impl AddressString {
     /// An address from its parts.
+    ///
+    /// Both qualifiers are normalised through their bit form, so
+    /// `Reserved(1)` becomes [`International`](NatureOfAddress::International)
+    /// and one wire octet has one value.
     #[must_use]
-    pub const fn new(nature: NatureOfAddress, plan: NumberingPlan, digits: DigitString) -> Self {
+    pub const fn new(
+        nature: NatureOfAddress,
+        plan: NumberingPlanIndicator,
+        digits: DigitString,
+    ) -> Self {
         Self {
-            nature,
-            plan,
+            nature: NatureOfAddress::from_bits(nature.to_bits()),
+            plan: NumberingPlanIndicator::from_bits(plan.to_bits()),
             digits,
         }
     }
@@ -569,7 +593,7 @@ impl AddressString {
 
     /// The plan the digits are numbered under.
     #[must_use]
-    pub const fn plan(self) -> NumberingPlan {
+    pub const fn plan(self) -> NumberingPlanIndicator {
         self.plan
     }
 
@@ -600,7 +624,7 @@ impl AddressString {
             DigitString::from_tbcd(rest).map_err(|e| DecodeError::new(1 + e.at(), e.expected()))?;
         Ok(Self {
             nature: NatureOfAddress::from_bits((qualifier >> 4) & 0b111),
-            plan: NumberingPlan::from_bits(*qualifier),
+            plan: NumberingPlanIndicator::from_bits(*qualifier),
             digits,
         })
     }
@@ -623,14 +647,18 @@ impl AddressString {
     /// The address as an [`Msisdn`], when it is one.
     ///
     /// `None` unless the nature of address is
-    /// [`International`](NatureOfAddress::International) and the digits fit
-    /// E.164. A national or network-specific number is **not** converted:
+    /// [`International`](NatureOfAddress::International), the numbering plan
+    /// is [`Isdn`](NumberingPlanIndicator::Isdn) (E.164 — an international
+    /// E.212 number is an IMSI, not an MSISDN), and the digits fit E.164. A
+    /// national or network-specific number is **not** converted:
     /// turning one into an international number needs the operator's dialling
     /// plan, which this crate does not hold, and prefixing a country code by
     /// assumption is how a call is settled against the wrong partner.
     #[must_use]
     pub fn to_msisdn(self) -> Option<Msisdn> {
-        if self.nature != NatureOfAddress::International {
+        if self.nature != NatureOfAddress::International
+            || self.plan != NumberingPlanIndicator::Isdn
+        {
             return None;
         }
         if self.digits.is_empty() || self.digits.len() > 15 {
@@ -697,34 +725,59 @@ impl Imei {
 }
 
 impl Imei {
-    /// Decode from the Telephony BCD an `IMEI` field carries on the wire.
+    /// The wire length of an `IMEI` field, in octets (TS 29.002).
+    pub const TBCD_OCTETS: usize = 8;
+
+    /// Decode the eight-octet TBCD `IMEI` field of TS 29.002.
     ///
-    /// The Luhn check digit is verified, exactly as when parsing a string: a
-    /// checksum that only some code paths apply is a checksum nobody can rely
-    /// on.
+    /// The check digit is not transmitted: the 15th digit is a spare set to
+    /// `0` (TS 23.003 §6.2.1), followed by a filler — `IMEI ::= TBCD-STRING
+    /// (SIZE (8))`, "the last octet shall contain the digit 0 and a filler"
+    /// (TS 29.002). The Luhn check digit is computed over the 14 digits.
+    ///
+    /// A non-zero 15th digit cannot be a spare, so it is read as a transmitted
+    /// check digit and verified. A zero 15th digit is the spare; when the true
+    /// check digit is also 0 both readings agree.
     ///
     /// # Errors
     ///
-    /// [`DecodeError`] when the octets are not well-formed TBCD, do not hold
-    /// 15 digits, or fail the checksum.
+    /// [`DecodeError`] when the field is not eight octets of well-formed TBCD
+    /// holding 15 digits, or a non-zero 15th digit fails the checksum.
     pub fn from_tbcd(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() != Self::TBCD_OCTETS {
+            return Err(DecodeError::new(0, "exactly 8 octets"));
+        }
         let digits = DigitString::from_tbcd(bytes)?;
         if digits.len() != 15 {
-            return Err(DecodeError::new(0, "exactly 15 digits"));
+            return Err(DecodeError::new(0, "14 digits, a spare digit and a filler"));
         }
-        if !digits.luhn_valid() {
-            return Err(DecodeError::new(7, "a valid Luhn check digit"));
+        let body = digits.slice(0, 14);
+        let check = body.luhn_check_digit();
+        let last = digits.at(14);
+        if last != 0 && last != check {
+            return Err(DecodeError::new(
+                7,
+                "a spare digit 0 or a valid Luhn check digit",
+            ));
         }
-        Ok(Self(digits))
+        body.checked_push(check)
+            .map(Self)
+            .ok_or_else(|| DecodeError::new(0, "15 digits"))
     }
 
-    /// Encode to Telephony BCD, writing into `out`.
+    /// Encode to the eight-octet TBCD `IMEI` field of TS 29.002: 14 digits,
+    /// the spare digit `0` in place of the check digit, and a filler.
     ///
     /// # Errors
     ///
     /// [`DecodeError`] when `out` is shorter than eight octets.
     pub fn to_tbcd(self, out: &mut [u8]) -> Result<usize, DecodeError> {
-        self.0.to_tbcd(out)
+        let wire = self
+            .0
+            .slice(0, 14)
+            .checked_push(0)
+            .ok_or_else(|| DecodeError::new(0, "15 digits"))?;
+        wire.to_tbcd(out)
     }
 
     /// The identity's digits, for callers that need the raw run.
@@ -871,7 +924,12 @@ impl Iccid {
         false
     }
 
-    /// `true` when the identifier is long enough to carry a check digit.
+    /// `true` when the identifier has 20 digits.
+    ///
+    /// The length is a **hint** only: E.118 does not tie the check digit to a
+    /// length, and issuers ship 19-digit cards with a check digit and 20-digit
+    /// ones without. Use it to decide whether a failing
+    /// [`luhn_valid`](Self::luhn_valid) is worth a finding, never to reject.
     #[must_use]
     pub fn has_check_digit(self) -> bool {
         self.0.len() == 20
@@ -879,7 +937,8 @@ impl Iccid {
 
     /// Whether the final digit is a consistent Luhn check digit.
     ///
-    /// Meaningful only when [`has_check_digit`](Self::has_check_digit) is true.
+    /// Meaningful only when the issuer's card carries one; see
+    /// [`has_check_digit`](Self::has_check_digit).
     #[must_use]
     pub fn luhn_valid(self) -> bool {
         self.0.luhn_valid()
@@ -908,15 +967,27 @@ impl FromStr for Iccid {
 
 /// A 3GPP TS 23.003 Subscription Permanent Identifier.
 ///
-/// Either an [`Imsi`] or a network-specific identifier in NAI form. Both spell
-/// the same thing — a subscription — and both are stable, so both may key an
-/// aggregate.
+/// The four SUPI types of TS 23.003 §2.2A: an [`Imsi`], or a network-specific,
+/// Global Line or Global Cable identifier in NAI form (§28.7, §28.16, §28.15).
+/// All spell the same thing — a subscription — and all are stable, so all may
+/// key an aggregate.
+///
+/// The wireline forms are how a fixed-line subscription is identified without
+/// an IMSI: a fibre or DSL line by its GLI (Broadband Forum WT-470), a cable
+/// modem by its GCI (CableLabs). A platform that knows neither uses its own
+/// line identity as a network-specific identifier.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Supi {
     /// The IMSI form, used by every 3GPP access.
     Imsi(Imsi),
     /// A network-specific identifier in `user@realm` form.
     NetworkSpecific(Nai),
+    /// A Global Line Identifier — a wireline (fibre, DSL) access line — in NAI
+    /// form (TS 23.003 §28.16).
+    GlobalLine(Nai),
+    /// A Global Cable Identifier — a cable access line — in NAI form
+    /// (TS 23.003 §28.15).
+    GlobalCable(Nai),
 }
 
 impl Supi {
@@ -925,13 +996,21 @@ impl Supi {
     pub fn as_imsi(&self) -> Option<Imsi> {
         match self {
             Self::Imsi(i) => Some(*i),
-            Self::NetworkSpecific(_) => None,
+            Self::NetworkSpecific(_) | Self::GlobalLine(_) | Self::GlobalCable(_) => None,
         }
+    }
+
+    /// `true` for the wireline forms, [`GlobalLine`](Self::GlobalLine) and
+    /// [`GlobalCable`](Self::GlobalCable).
+    #[must_use]
+    pub const fn is_wireline(&self) -> bool {
+        matches!(self, Self::GlobalLine(_) | Self::GlobalCable(_))
     }
 }
 
 impl fmt::Display for Supi {
-    /// Writes the 3GPP prefixed form: `imsi-262021234567890` or `nai-user@realm`.
+    /// Writes the TS 29.571 prefixed form: `imsi-262021234567890`,
+    /// `nai-user@realm`, `gli-…@realm` or `gci-…@realm`.
     ///
     /// The prefix is part of the value, because the bare forms are not mutually
     /// exclusive and a stored identity must say which it is.
@@ -939,6 +1018,8 @@ impl fmt::Display for Supi {
         match self {
             Self::Imsi(i) => write!(f, "imsi-{i}"),
             Self::NetworkSpecific(n) => write!(f, "nai-{n}"),
+            Self::GlobalLine(n) => write!(f, "gli-{n}"),
+            Self::GlobalCable(n) => write!(f, "gci-{n}"),
         }
     }
 }
@@ -956,7 +1037,7 @@ impl From<Nai> for Supi {
 }
 
 /// The shape [`Supi`] accepts, as rendered in a [`ParseError`].
-const SUPI_FORMAT: &str = "imsi-<digits> or nai-<user@realm>";
+const SUPI_FORMAT: &str = "imsi-<digits>, nai-<user@realm>, gli-<user@realm> or gci-<user@realm>";
 
 impl FromStr for Supi {
     type Err = ParseError;
@@ -970,15 +1051,26 @@ impl FromStr for Supi {
         if let Some(rest) = t.strip_prefix("nai-") {
             return rest.parse().map(Self::NetworkSpecific).map_err(|_| err());
         }
+        if let Some(rest) = t.strip_prefix("gli-") {
+            return rest.parse().map(Self::GlobalLine).map_err(|_| err());
+        }
+        if let Some(rest) = t.strip_prefix("gci-") {
+            return rest.parse().map(Self::GlobalCable).map_err(|_| err());
+        }
         Err(err())
     }
 }
 
 /// A network access identifier in `user@realm` form (RFC 7542).
+///
+/// At most [`MAX_OCTETS`](Self::MAX_OCTETS) octets (RFC 7542 §2.2).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Nai(String);
 
 impl Nai {
+    /// The longest NAI, in octets: RFC 7542 §2.2 requires support for 253.
+    pub const MAX_OCTETS: usize = 253;
+
     /// The user part, before the **last** `@`.
     ///
     /// The last rather than the first: RFC 7542 admits a `@` inside a quoted
@@ -1008,8 +1100,17 @@ impl FromStr for Nai {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let err = || ParseError::format("Nai", s, "a network access identifier such as user@realm");
+        let err = || {
+            ParseError::format(
+                "Nai",
+                s,
+                "a network access identifier such as user@realm, at most 253 octets",
+            )
+        };
         let t = s.trim();
+        if t.len() > Self::MAX_OCTETS {
+            return Err(err());
+        }
         let (user, realm) = t.rsplit_once('@').ok_or_else(err)?;
         if user.is_empty() || realm.is_empty() || t.contains(char::is_whitespace) {
             return Err(err());
@@ -1228,34 +1329,27 @@ impl FromStr for RoutingIndicator {
 /// use mediation::Suci;
 ///
 /// let suci: Suci = "suci-0-262-02-0678-1-27-0072b7d4c1e8".parse().unwrap();
-/// assert_eq!(suci.home_network.to_string(), "262-02");
-/// assert_eq!(suci.routing_indicator.to_string(), "0678");
-/// assert_eq!(suci.protection_scheme, 1);
-/// assert_eq!(suci.public_key_id, 27);
+/// assert_eq!(suci.home_network().to_string(), "262-02");
+/// assert_eq!(suci.routing_indicator().to_string(), "0678");
+/// assert_eq!(suci.protection_scheme(), 1);
+/// assert_eq!(suci.public_key_id(), 27);
 /// assert_eq!(suci.to_string(), "suci-0-262-02-0678-1-27-0072b7d4c1e8");
 /// ```
+///
+/// The scheme identifier is **one hex digit** and the key identifier a
+/// decimal `1`…`255` without leading zeros; the null scheme carries key `0`
+/// (TS 29.503 `Suci` pattern). Each value has one spelling.
 ///
 /// Only the IMSI-based form (SUPI type 0) is modelled. The network-specific
 /// form is an NAI and belongs to [`Nai`]; giving one type both shapes would
 /// mean two thirds of its fields were absent for one of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Suci {
-    /// The home network the concealed identity belongs to.
-    pub home_network: PlmnId,
-    /// The routing indicator that steers signalling to the right AUSF and UDM.
-    pub routing_indicator: RoutingIndicator,
-    /// The protection scheme identifier: `0` is the null scheme, `1` profile A,
-    /// `2` profile B. Four bits, so `0`…`15`.
-    pub protection_scheme: u8,
-    /// The home network public key identifier used for concealment, `0`…`255`.
-    ///
-    /// Zero is reserved for the null scheme.
-    pub public_key_id: u8,
-    /// The concealed output, lower-case hex.
-    ///
-    /// Under the null scheme this is the MSIN in the clear, which is why a
-    /// null-scheme SUCI is no more anonymous than the IMSI it contains.
-    pub scheme_output: String,
+    home_network: PlmnId,
+    routing_indicator: RoutingIndicator,
+    protection_scheme: u8,
+    public_key_id: u8,
+    scheme_output: String,
 }
 
 impl Suci {
@@ -1267,10 +1361,12 @@ impl Suci {
 
     /// A concealed identity from its parts.
     ///
-    /// `None` for a protection scheme above 15 — the field is four bits — or a
-    /// scheme output that is not a non-empty run of hex digits. Both are
-    /// rejected rather than carried, because a SUCI that cannot be spelled
-    /// canonically cannot be handed back to a core network.
+    /// `None` for a protection scheme above 15 — the field is four bits — a
+    /// key identifier that is not `0` under the null scheme or is `0` under
+    /// any other (TS 29.503), or a scheme output that is not a non-empty run
+    /// of hex digits. All are rejected rather than carried, because a SUCI
+    /// that cannot be spelled canonically cannot be handed back to a core
+    /// network.
     #[must_use]
     pub fn new(
         home_network: PlmnId,
@@ -1280,6 +1376,9 @@ impl Suci {
         scheme_output: &str,
     ) -> Option<Self> {
         if protection_scheme > 0x0F {
+            return None;
+        }
+        if (protection_scheme == Self::NULL_SCHEME) != (public_key_id == 0) {
             return None;
         }
         let output = scheme_output.trim();
@@ -1304,6 +1403,41 @@ impl Suci {
     pub fn is_null_scheme(&self) -> bool {
         self.protection_scheme == Self::NULL_SCHEME
     }
+
+    /// The home network the concealed identity belongs to.
+    #[must_use]
+    pub const fn home_network(&self) -> PlmnId {
+        self.home_network
+    }
+
+    /// The routing indicator that steers signalling to the right AUSF and UDM.
+    #[must_use]
+    pub const fn routing_indicator(&self) -> RoutingIndicator {
+        self.routing_indicator
+    }
+
+    /// The protection scheme identifier: `0` is the null scheme, `1` profile
+    /// A, `2` profile B. Four bits, so `0`…`15`, written as one hex digit.
+    #[must_use]
+    pub const fn protection_scheme(&self) -> u8 {
+        self.protection_scheme
+    }
+
+    /// The home network public key identifier: `0` under the null scheme,
+    /// `1`…`255` otherwise.
+    #[must_use]
+    pub const fn public_key_id(&self) -> u8 {
+        self.public_key_id
+    }
+
+    /// The concealed output, lower-case hex.
+    ///
+    /// Under the null scheme this is the MSIN in the clear, which is why a
+    /// null-scheme SUCI is no more anonymous than the IMSI it contains.
+    #[must_use]
+    pub fn scheme_output(&self) -> &str {
+        &self.scheme_output
+    }
 }
 
 impl fmt::Display for Suci {
@@ -1312,7 +1446,7 @@ impl fmt::Display for Suci {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "suci-{}-{}-{}-{}-{}-{}-{}",
+            "suci-{}-{}-{}-{}-{:x}-{}-{}",
             Self::IMSI_SUPI_TYPE,
             self.home_network.mcc(),
             self.home_network.mnc(),
@@ -1334,10 +1468,10 @@ impl FromStr for Suci {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let err = || ParseError::format("Suci", s, SUCI_FORMAT);
         let rest = s.trim().strip_prefix("suci-").ok_or_else(err)?;
-        let fields: Vec<&str> = rest.split('-').collect();
-        let [supi_type, mcc, mnc, rid, scheme, key, output] = fields[..] else {
-            return Err(err());
-        };
+        let mut fields = rest.splitn(7, '-');
+        let mut field = || fields.next().ok_or_else(err);
+        let (supi_type, mcc, mnc, rid) = (field()?, field()?, field()?, field()?);
+        let (scheme, key, output) = (field()?, field()?, field()?);
         if supi_type != "0" {
             // Only the IMSI form has an MCC and MNC to read; the NAI form is a
             // different shape entirely and is not silently coerced into this one.
@@ -1347,11 +1481,25 @@ impl FromStr for Suci {
             mcc.parse().map_err(|_| err())?,
             mnc.parse().map_err(|_| err())?,
         );
+        // One hex digit (TS 29.503); `char::to_digit` refuses signs and
+        // multi-character spellings such as `01`.
+        let scheme = match scheme.as_bytes() {
+            [b] => char::from(*b).to_digit(16).ok_or_else(err)?,
+            _ => return Err(err()),
+        };
+        // Decimal without sign or leading zeros: `0`, or `1`…`255`.
+        if key.is_empty()
+            || !key.bytes().all(|b| b.is_ascii_digit())
+            || (key.len() > 1 && key.starts_with('0'))
+        {
+            return Err(err());
+        }
+        let key = key.parse::<u8>().map_err(|_| err())?;
         Self::new(
             plmn,
             rid.parse().map_err(|_| err())?,
-            scheme.parse::<u8>().map_err(|_| err())?,
-            key.parse::<u8>().map_err(|_| err())?,
+            u8::try_from(scheme).map_err(|_| err())?,
+            key,
             output,
         )
         .ok_or_else(err)
@@ -1364,7 +1512,7 @@ impl FromStr for Suci {
 mod serde_impl {
     use super::{
         AddressString, DigitString, Gpsi, Iccid, Imei, Imeisv, Imsi, Msisdn, Nai, NatureOfAddress,
-        NumberingPlan, Pei, RoutingIndicator, Suci, Supi, Tac,
+        NumberingPlanIndicator, Pei, RoutingIndicator, Suci, Supi, Tac,
     };
     use serde::de::{self, Visitor};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1439,6 +1587,11 @@ mod serde_impl {
                                 other => other
                                     .strip_prefix("RESERVED_")
                                     .and_then(|bits| bits.parse::<u8>().ok())
+                                    // Only an unassigned code in range is a
+                                    // reserved value; `RESERVED_1` is not.
+                                    .filter(|bits| {
+                                        <$ty>::from_bits(*bits) == <$ty>::$reserved(*bits)
+                                    })
                                     .map(<$ty>::$reserved)
                                     .ok_or_else(|| de::Error::custom(format!("unknown code {v:?}"))),
                             }
@@ -1463,7 +1616,7 @@ mod serde_impl {
     );
 
     qualifier_serde!(
-        NumberingPlan,
+        NumberingPlanIndicator,
         Reserved,
         "a numbering-plan code such as \"ISDN\"",
         "UNKNOWN" => Unknown,
@@ -1481,7 +1634,7 @@ mod serde_impl {
     #[serde(rename = "AddressString")]
     struct AddressRepr {
         nature: NatureOfAddress,
-        plan: NumberingPlan,
+        plan: NumberingPlanIndicator,
         digits: DigitString,
     }
 
@@ -1731,14 +1884,14 @@ mod tests {
         let canonical = "suci-0-262-02-0678-1-27-0072b7d4c1e8";
         let suci: Suci = canonical.parse().unwrap();
 
-        assert_eq!(suci.routing_indicator.to_string(), "0678");
-        assert_eq!(suci.protection_scheme, 1);
-        assert_eq!(suci.public_key_id, 27);
+        assert_eq!(suci.routing_indicator().to_string(), "0678");
+        assert_eq!(suci.protection_scheme(), 1);
+        assert_eq!(suci.public_key_id(), 27);
         assert_eq!(suci.to_string(), canonical);
 
         // Leading zeros in the routing indicator are part of the value.
         let short: Suci = "suci-0-262-02-678-1-27-00ab".parse().unwrap();
-        assert_ne!(short.routing_indicator, suci.routing_indicator);
+        assert_ne!(short.routing_indicator(), suci.routing_indicator());
     }
 
     #[test]
@@ -1748,7 +1901,7 @@ mod tests {
             "suci-0-262-02-0678-1-27",         // six fields, not seven
             "suci-1-262-02-0678-1-27-00ab",    // the NAI form is not this shape
             "suci-0-262-02-06789-1-27-00ab",   // five-digit routing indicator
-            "suci-0-262-02-0678-16-27-00ab",   // scheme identifier is four bits
+            "suci-0-262-02-0678-10-27-00ab",   // scheme identifier is one hex digit
             "suci-0-262-02-0678-1-27-",        // no scheme output
             "suci-0-262-02-0678-1-27-not-hex", // and it must be hex
             "suci-0-262-2-0678-1-27-00ab",     // an MNC keeps its leading zero

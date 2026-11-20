@@ -230,18 +230,27 @@ impl FromStr for Snssai {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let err = || ParseError::format("Snssai", s, SNSSAI_FORMAT);
         let t = s.trim();
-        match t.split_once('-') {
-            None => Ok(Self::new(SliceServiceType::new(
-                t.parse().map_err(|_| err())?,
-            ))),
-            Some((sst, sd)) => {
-                if sd.len() != 6 {
-                    return Err(err());
-                }
-                let sst = SliceServiceType::new(sst.parse().map_err(|_| err())?);
+        let (sst, sd) = match t.split_once('-') {
+            None => (t, None),
+            Some((sst, sd)) => (sst, Some(sd)),
+        };
+        // Canonical only: decimal SST without sign or leading zero, SD exactly
+        // six hex digits (audit S3).
+        let canonical_sst = !sst.is_empty()
+            && sst.len() <= 3
+            && sst.bytes().all(|b| b.is_ascii_digit())
+            && (sst == "0" || !sst.starts_with('0'));
+        if !canonical_sst {
+            return Err(err());
+        }
+        let sst = SliceServiceType::new(sst.parse().map_err(|_| err())?);
+        match sd {
+            None => Ok(Self::new(sst)),
+            Some(sd) if sd.len() == 6 && sd.bytes().all(|b| b.is_ascii_hexdigit()) => {
                 let sd = u32::from_str_radix(sd, 16).map_err(|_| err())?;
                 Self::with_sd(sst, sd).ok_or_else(err)
             }
+            Some(_) => Err(err()),
         }
     }
 }
@@ -251,7 +260,8 @@ impl FromStr for Snssai {
 /// A Data Network Name — the network a PDU session connects to.
 ///
 /// The 5G successor to the APN, and the same shape: dot-separated labels, up to
-/// 100 characters (3GPP TS 23.003). Stored lower-cased, because a DNN is
+/// 100 characters, each label at most 63 (3GPP TS 23.003 §9.1). Stored
+/// lower-cased, because a DNN is
 /// case-insensitive and a value spelled two ways produces two products.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Dnn(String);
@@ -273,15 +283,38 @@ impl Dnn {
         self.0.split('.')
     }
 
-    /// The first label, which is the network identifier an operator's tariffs
-    /// usually key on.
+    /// The network identifier: every label before a trailing operator
+    /// identifier `mnc<MNC>.mcc<MCC>.gprs` (3GPP TS 23.003 §9.1), or the whole
+    /// name when it has none (audit S2).
     ///
-    /// The remaining labels are the operator identifier, which repeats the
-    /// serving network and carries no product information.
+    /// The operator identifier repeats the serving network and carries no
+    /// product information; the network identifier may have several labels.
+    ///
+    /// ```rust
+    /// use mediation::Dnn;
+    ///
+    /// let dnn: Dnn = "corp.example.com.mnc002.mcc262.gprs".parse().unwrap();
+    /// assert_eq!(dnn.network_identifier(), "corp.example.com");
+    /// ```
     #[must_use]
     pub fn network_identifier(&self) -> &str {
-        // Total by construction: a DNN with no dot *is* its network identifier.
-        self.0.split_once('.').map_or(&self.0[..], |(head, _)| head)
+        let name = &self.0[..];
+        let operator = |rest: &str| {
+            let three = |label: &str, tag: &str| {
+                label
+                    .strip_prefix(tag)
+                    .is_some_and(|d| d.len() == 3 && d.bytes().all(|b| b.is_ascii_digit()))
+            };
+            let mut labels = rest.split('.');
+            matches!(
+                (labels.next(), labels.next(), labels.next(), labels.next()),
+                (Some(mnc), Some(mcc), Some("gprs"), None) if three(mnc, "mnc") && three(mcc, "mcc")
+            )
+        };
+        name.match_indices('.')
+            .map(|(i, _)| i)
+            .find(|&i| operator(&name[i + 1..]))
+            .map_or(name, |i| &name[..i])
     }
 }
 
@@ -301,7 +334,8 @@ impl FromStr for Dnn {
             && t.len() <= 100
             && !t.starts_with('.')
             && !t.ends_with('.')
-            && !t.contains("..")
+            && t.split('.')
+                .all(|label| !label.is_empty() && label.len() <= 63)
             && t.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
         if ok {
@@ -599,7 +633,11 @@ impl SessionContext {
     /// `true` when nothing about the session's context was recorded.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.dnn.is_none() && self.snssai.is_none() && self.rat.is_none() && self.location.is_none()
+        self.dnn.is_none()
+            && self.snssai.is_none()
+            && self.rat.is_none()
+            && self.location.is_none()
+            && self.charging_characteristics.is_none()
     }
 
     /// The same context with a data network.
@@ -669,6 +707,8 @@ impl fmt::Display for SessionContext {
             self.snssai.map(|s| format!("slice {s}")),
             self.rat.map(|r| r.to_string()),
             self.location.map(|l| l.to_string()),
+            self.charging_characteristics
+                .map(|c| format!("charging characteristics {c}")),
         ]
         .into_iter()
         .flatten()
@@ -904,7 +944,9 @@ mod tests {
             assert!(bad.parse::<Dnn>().is_err(), "{bad:?} must not parse");
         }
         assert!("x".repeat(101).parse::<Dnn>().is_err());
-        assert!("x".repeat(100).parse::<Dnn>().is_ok());
+        assert!("x".repeat(64).parse::<Dnn>().is_err());
+        let longest = format!("{}.{}", "x".repeat(63), "y".repeat(36));
+        assert!(longest.parse::<Dnn>().is_ok());
     }
 
     /// Satellite access is its own value because it makes jurisdiction a

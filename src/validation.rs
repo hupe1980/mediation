@@ -36,7 +36,7 @@
 //! # let source = SourceRef::new("msc-01".parse().unwrap(), 0);
 //! // A call billed for longer than it can possibly have lasted.
 //! let record = UsageRecord::new(
-//!     RecordType::MobileOriginatedCall,
+//!     RecordType::OriginatedCall,
 //!     party,
 //!     "2026-07-28T10:00:00+02:00".parse().unwrap(),
 //!     source,
@@ -64,7 +64,7 @@ use crate::dedup::{NotKeyable, RecordKey};
 use crate::jurisdiction::{Ambiguity, usage_country};
 use crate::lateness::{Lateness, LatenessPolicy};
 use crate::partial::{OrphanReason, Reassembly};
-use crate::record::{PrimaryMeasure, UsageRecord};
+use crate::record::{PrimaryMeasure, ServiceDomain, UsageRecord};
 
 // ── Rule ─────────────────────────────────────────────────────────────────────
 
@@ -98,7 +98,8 @@ pub enum Rule {
     BeyondDeadline,
     /// **V11** — the record is late but still billable.
     LateArrival,
-    /// **V12** — the record's serving network is absent.
+    /// **V12** — the record's serving network is absent (not raised for a
+    /// wireline voice, IMS or fixed-access record, which has no PLMN).
     ServingNetworkAbsent,
     /// **V13** — the record's quantity does not match what its service measures.
     QuantityDoesNotMatchService,
@@ -329,8 +330,16 @@ impl Finding {
     /// Offered so a stateful outcome joins the same catalogue as the stateless
     /// rules, and a report speaks one vocabulary.
     #[must_use]
+    ///
+    /// The detail names the key. A [`RecordKey::Call`] is named by its kind and
+    /// recording entity only: a SIP Call-ID often embeds the caller's number
+    /// (`+4915…@host`), and finding text is routinely logged (§ 9 TDDDG).
     pub fn duplicate(record_index: usize, key: &RecordKey) -> Self {
-        Self::new(Rule::DuplicateRecord, record_index, key.to_string())
+        let detail = match key {
+            RecordKey::Call { entity, .. } => format!("CALL:{entity}"),
+            other => other.to_string(),
+        };
+        Self::new(Rule::DuplicateRecord, record_index, detail)
     }
 
     /// The finding an unkeyable record produces.
@@ -358,6 +367,20 @@ impl Finding {
         )
     }
 
+    /// The finding a sequence regression produces: `value` arrived behind the
+    /// source's high-water mark and fills no known hole.
+    ///
+    /// A counter reset or a misrouted file. Reported under V18 because what it
+    /// threatens is the same: until the source's sequence is understood, holes
+    /// after it go unseen.
+    #[must_use]
+    pub fn sequence_regressed(source: &impl fmt::Display, value: u32, high_water: u32) -> Self {
+        Self::batch(
+            Rule::SequenceGap,
+            format!("{source} sequence regressed: {value} behind {high_water}"),
+        )
+    }
+
     /// The finding a [`Reassembly`] produces, if it produces one.
     ///
     /// `None` for a complete run, an empty one, and an open run with no holes —
@@ -369,11 +392,11 @@ impl Finding {
                 Rule::OrphanPartial,
                 record_index,
                 match reason {
-                    OrphanReason::FirstRecordMissing => {
-                        format!("run begins at {:?}, not 1", have.first())
-                    }
                     OrphanReason::FirstRecordNotFullyQualified => {
                         "first partial is reduced and has no basis to complete from".to_owned()
+                    }
+                    OrphanReason::InvalidSequence => {
+                        format!("partial numbered 0 among {} present", have.len())
                     }
                 },
             )),
@@ -617,12 +640,23 @@ pub fn validate_records(
     config: &ValidationConfig,
     as_of: OffsetDateTime,
 ) -> ValidationReport {
+    validate_records_ordered_from(records, 0, config, as_of)
+}
+
+/// [`validate_records`], with V16 evaluated over `records[ordered_from..]`
+/// only — the part of a batch that arrived in this batch's own order.
+pub(crate) fn validate_records_ordered_from(
+    records: &[UsageRecord],
+    ordered_from: usize,
+    config: &ValidationConfig,
+    as_of: OffsetDateTime,
+) -> ValidationReport {
     let mut report = ValidationReport::new();
 
     for (index, record) in records.iter().enumerate() {
         validate_one(record, index, config, as_of, &mut report);
     }
-    check_ordering(records, &mut report);
+    check_ordering(records.get(ordered_from..).unwrap_or(&[]), &mut report);
 
     // Apply escalation once, at the end, so every path through the engine is
     // covered rather than each rule remembering to consult the config.
@@ -708,8 +742,15 @@ fn validate_one(
         }
     }
 
-    // V15 — a record whose own directions cannot be summed.
-    if let Some(volume) = record.volume
+    // V15 — a record whose own volume cannot be summed: its containers, or
+    // its two directions.
+    if !record.containers.is_empty() && record.containers.checked_total().is_none() {
+        report.push(Finding::new(
+            Rule::VolumeOverflow,
+            index,
+            "container volumes overflow when summed",
+        ));
+    } else if let Some(volume) = record.billable_volume()
         && volume.checked_total().is_none()
     {
         report.push(Finding::new(
@@ -747,8 +788,20 @@ fn validate_one(
         report.push(Finding::not_keyable(index, reason));
     }
 
-    // V12 — where the usage happened is unknown.
-    if record.serving_plmn.is_none() && record.record_type.service_domain().is_subscriber_bound() {
+    // V12 — where the usage happened is unknown. A wireline access has no PLMN:
+    // a fixed-line call or broadband session is located by its line, not by a
+    // serving network, so the absence is not a finding there. The exemption is
+    // limited to the domains a wireline access actually carries, so a mobile-only
+    // record type mislabelled as wireline still raises it.
+    let wireline = record.session.rat == Some(crate::session::RatType::Wireline)
+        && matches!(
+            record.record_type.service_domain(),
+            ServiceDomain::Voice | ServiceDomain::Ims | ServiceDomain::FixedAccess
+        );
+    if record.serving_plmn.is_none()
+        && record.record_type.service_domain().is_subscriber_bound()
+        && !wireline
+    {
         report.push(Finding::new(
             Rule::ServingNetworkAbsent,
             index,
@@ -956,7 +1009,7 @@ mod tests {
 
     fn call() -> UsageRecord {
         UsageRecord::new(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             ChargedParty::Subscriber(SubscriberRef::new("imsi-262021234567890".parse().unwrap())),
             "2026-07-28T10:00:00+02:00".parse().unwrap(),
             SourceRef::new("msc-01".parse().unwrap(), 0),
@@ -1019,7 +1072,7 @@ mod tests {
         assert!(!run(&[call()]).has(Rule::BeyondDeadline));
 
         let old = UsageRecord::new(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             ChargedParty::Subscriber(SubscriberRef::new("imsi-262021234567890".parse().unwrap())),
             "2026-01-01T10:00:00+02:00".parse().unwrap(),
             SourceRef::new("msc-01".parse().unwrap(), 0),
@@ -1035,7 +1088,7 @@ mod tests {
         );
 
         let ahead = UsageRecord::new(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             ChargedParty::Subscriber(SubscriberRef::new("imsi-262021234567890".parse().unwrap())),
             "2026-08-01T10:00:00+02:00".parse().unwrap(),
             SourceRef::new("msc-01".parse().unwrap(), 0),
@@ -1077,7 +1130,7 @@ mod tests {
     #[test]
     fn an_unattributable_record_and_an_unkeyable_one_both_block() {
         let lost = UsageRecord::new(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             ChargedParty::Unattributable(UnattributableReason::IdentityAbsent),
             "2026-07-28T10:00:00+02:00".parse().unwrap(),
             SourceRef::new("msc-01".parse().unwrap(), 0),
@@ -1174,7 +1227,8 @@ mod tests {
         let odd = CdrTimestamp::new(
             call().opened.local(),
             crate::cdrtime::QuarterHourOffset::from_encoded(79).unwrap(),
-        );
+        )
+        .unwrap();
         let mut record = call();
         record.opened = odd;
         let report = run(&[record]);

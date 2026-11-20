@@ -179,11 +179,11 @@ fn a_suci_spells_its_seven_fields_in_the_order_the_spec_fixes() {
     let canonical = "suci-0-262-02-0678-1-27-0072b7d4c1e8";
     let suci: Suci = canonical.parse().unwrap();
 
-    assert_eq!(suci.home_network.to_string(), "262-02");
-    assert_eq!(suci.routing_indicator.to_string(), "0678");
-    assert_eq!(suci.protection_scheme, 1);
-    assert_eq!(suci.public_key_id, 27);
-    assert_eq!(suci.scheme_output, "0072b7d4c1e8");
+    assert_eq!(suci.home_network().to_string(), "262-02");
+    assert_eq!(suci.routing_indicator().to_string(), "0678");
+    assert_eq!(suci.protection_scheme(), 1);
+    assert_eq!(suci.public_key_id(), 27);
+    assert_eq!(suci.scheme_output(), "0072b7d4c1e8");
     assert_eq!(suci.to_string(), canonical);
     assert!(!suci.is_null_scheme());
 }
@@ -196,8 +196,8 @@ fn a_routing_indicator_keeps_its_leading_zeros() {
     let padded: Suci = "suci-0-262-02-0678-0-0-1234567890".parse().unwrap();
 
     assert_ne!(short, padded);
-    assert_eq!(short.routing_indicator.to_string(), "678");
-    assert_eq!(padded.routing_indicator.to_string(), "0678");
+    assert_eq!(short.routing_indicator().to_string(), "678");
+    assert_eq!(padded.routing_indicator().to_string(), "0678");
     assert!(short.is_null_scheme());
 }
 

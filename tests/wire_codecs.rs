@@ -10,7 +10,7 @@
 
 use mediation::{
     AddressString, CdrTimestamp, Century, ChargingCharacteristics, DigitString, Imei, Imsi, Msisdn,
-    NatureOfAddress, NumberingPlan, QuarterHourOffset, SliceServiceType, Snssai,
+    NatureOfAddress, NumberingPlanIndicator, QuarterHourOffset, SliceServiceType, Snssai,
 };
 use proptest::prelude::*;
 
@@ -309,7 +309,7 @@ fn a_served_msisdn_is_not_a_bare_tbcd_field() {
 
     let address = AddressString::from_bytes(&field).unwrap();
     assert_eq!(address.nature(), NatureOfAddress::International);
-    assert_eq!(address.plan(), NumberingPlan::Isdn);
+    assert_eq!(address.plan(), NumberingPlanIndicator::Isdn);
     assert_eq!(address.to_msisdn().unwrap().to_string(), "491701234567");
 
     // The wrong reading parses, validates and bills the wrong subscriber.

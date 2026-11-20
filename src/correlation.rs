@@ -206,6 +206,93 @@ impl FromStr for Icid {
     }
 }
 
+// ── CallId ───────────────────────────────────────────────────────────────────
+
+/// A SIP Call-ID, as a voice platform's CDR carries it.
+///
+/// TS 32.260 puts the Call-ID of RFC 3261 §8.1.1.4 into the mandatory *Session ID*
+/// field of every IMS CDR, and a fixed-line softswitch exports the same value. It
+/// is "globally unique over space and time" in theory — but a back-to-back user
+/// agent regenerates it per leg, so it identifies a call only **within the node
+/// that recorded it**. [`RecordKey::Call`](crate::RecordKey::Call) therefore pairs
+/// it with the recording entity, and there is no key on a Call-ID alone.
+///
+/// Accepts the RFC 3261 `callid` grammar — `word [ "@" word ]`, where `word` is
+/// alphanumerics and `-.!%*_+`'~()<>:\"/[]?{}` — up to [`MAX_LEN`](Self::MAX_LEN)
+/// characters. RFC 3261 sets no length limit; this bound is the crate's, so
+/// hostile input costs a constant.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CallId(String);
+
+/// The shape [`CallId`] accepts, as rendered in a [`ParseError`].
+const CALL_ID_FORMAT: &str = "1 to 256 RFC 3261 word characters with at most one '@', such as a84b4c76e66710@pc33.example.com";
+
+impl CallId {
+    /// The longest Call-ID accepted, in bytes.
+    pub const MAX_LEN: usize = 256;
+
+    /// The identifier as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// RFC 3261 §25.1 `word` characters.
+const fn is_word_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'.'
+                | b'!'
+                | b'%'
+                | b'*'
+                | b'_'
+                | b'+'
+                | b'`'
+                | b'\''
+                | b'~'
+                | b'('
+                | b')'
+                | b'<'
+                | b'>'
+                | b':'
+                | b'\\'
+                | b'"'
+                | b'/'
+                | b'['
+                | b']'
+                | b'?'
+                | b'{'
+                | b'}'
+        )
+}
+
+impl fmt::Display for CallId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for CallId {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let t = s.trim();
+        let mut parts = t.split('@');
+        let ok = !t.is_empty()
+            && t.len() <= Self::MAX_LEN
+            && parts.clone().count() <= 2
+            && parts.all(|w| !w.is_empty() && w.bytes().all(is_word_char));
+        if ok {
+            Ok(Self(t.to_owned()))
+        } else {
+            // Withheld: Call-IDs often embed the caller's number (`+4915…@host`).
+            Err(ParseError::withheld("CallId", CALL_ID_FORMAT))
+        }
+    }
+}
+
 // ── PacketSessionId ──────────────────────────────────────────────────────────
 
 /// The pair that actually identifies a packet session: Charging ID **and** the
@@ -303,6 +390,9 @@ pub struct CorrelationKeys {
     /// from many elements, so the two differ routinely and only this one scopes
     /// [`local_sequence_number`](Self::local_sequence_number).
     pub recording_entity: Option<NodeId>,
+    /// The SIP Call-ID — the CDR's *Session ID* (TS 32.260) — scoped by
+    /// [`recording_entity`](Self::recording_entity).
+    pub call_id: Option<CallId>,
 }
 
 impl CorrelationKeys {
@@ -317,6 +407,7 @@ impl CorrelationKeys {
             record_sequence_number: None,
             local_sequence_number: None,
             recording_entity: None,
+            call_id: None,
         }
     }
 
@@ -352,6 +443,7 @@ impl CorrelationKeys {
             && self.record_sequence_number.is_none()
             && self.local_sequence_number.is_none()
             && self.recording_entity.is_none()
+            && self.call_id.is_none()
     }
 
     /// The record's own serial number, scoped by the entity that assigned it.
@@ -364,6 +456,26 @@ impl CorrelationKeys {
             (Some(entity), Some(serial)) => Some((entity, serial)),
             _ => None,
         }
+    }
+
+    /// The record's Call-ID, scoped by the entity that recorded it.
+    ///
+    /// `None` unless **both** are present: a back-to-back user agent regenerates
+    /// the Call-ID per leg, so two nodes can report the same one for different
+    /// calls.
+    #[must_use]
+    pub const fn entity_call(&self) -> Option<(&NodeId, &CallId)> {
+        match (&self.recording_entity, &self.call_id) {
+            (Some(entity), Some(call_id)) => Some((entity, call_id)),
+            _ => None,
+        }
+    }
+
+    /// The same keys with a SIP Call-ID.
+    #[must_use]
+    pub fn with_call_id(mut self, call_id: CallId) -> Self {
+        self.call_id = Some(call_id);
+        self
     }
 
     /// The same keys with a charging identifier.
@@ -420,7 +532,7 @@ impl CorrelationKeys {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{ChargingId, CorrelationKeys, Icid, PacketSessionId};
+    use super::{CallId, ChargingId, CorrelationKeys, Icid, PacketSessionId};
     use serde::de::{self, Visitor};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::fmt;
@@ -453,6 +565,10 @@ mod serde_impl {
     }
 
     string_serde!(Icid, "an IMS charging identifier");
+    string_serde!(
+        CallId,
+        "a SIP Call-ID such as \"a84b4c76e66710@pc33.example.com\""
+    );
     string_serde!(
         PacketSessionId,
         "a charging identifier and gateway, such as \"1234@10.0.0.1\""
@@ -489,6 +605,8 @@ mod serde_impl {
         local_sequence_number: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recording_entity: Option<crate::record::NodeId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<CallId>,
     }
 
     impl Serialize for CorrelationKeys {
@@ -501,6 +619,7 @@ mod serde_impl {
                 record_sequence_number: self.record_sequence_number,
                 local_sequence_number: self.local_sequence_number,
                 recording_entity: self.recording_entity.clone(),
+                call_id: self.call_id.clone(),
             }
             .serialize(serializer)
         }
@@ -517,6 +636,7 @@ mod serde_impl {
                 record_sequence_number: r.record_sequence_number,
                 local_sequence_number: r.local_sequence_number,
                 recording_entity: r.recording_entity,
+                call_id: r.call_id,
             })
         }
     }

@@ -526,13 +526,16 @@ impl SequenceTracker {
             return SequenceObservation::Duplicate;
         }
 
+        // A known hole is filled wherever it sits. After the high-water mark
+        // has moved more than half the space on, an old hole reads as *ahead*
+        // under RFC 1982 — but it is still the file that was asked for.
+        if self.take_hole(self.offset_of(value)) {
+            return SequenceObservation::FilledGap;
+        }
+
         if previous.is_regression(arriving) {
-            // Behind the high-water mark: it either fills a hole or is stale.
-            return if self.take_hole(self.offset_of(value)) {
-                SequenceObservation::FilledGap
-            } else {
-                SequenceObservation::Unexpected
-            };
+            // Behind the high-water mark and filling nothing: stale, or a reset.
+            return SequenceObservation::Unexpected;
         }
 
         // Forward. Everything skipped over becomes a hole — all of it, however
@@ -563,6 +566,65 @@ impl SequenceTracker {
     /// [`DEFAULT_MAX_LISTED`](Self::DEFAULT_MAX_LISTED) missing identities.
     pub fn observe_default(&mut self, value: u32) -> SequenceObservation {
         self.observe(value, Self::DEFAULT_MAX_LISTED)
+    }
+
+    /// Record a set of arrivals whose order says nothing, in serial order.
+    ///
+    /// The files of one batch arrive in whatever order the collector listed
+    /// them, and observing `3` before `1` would read `1` as a regression and
+    /// lose the hole at `2`. So the values are deduplicated and observed in
+    /// RFC 1982 order: ahead of the high-water mark first, nearest first; with
+    /// no high-water mark yet, starting after the widest circular gap between
+    /// them. The result depends on the set, never on the order supplied.
+    ///
+    /// Returns each distinct value with its observation, in the order
+    /// observed. Values outside the space come last.
+    pub fn observe_all(
+        &mut self,
+        values: impl IntoIterator<Item = u32>,
+        max_listed: usize,
+    ) -> Vec<(u32, SequenceObservation)> {
+        let mut inside: Vec<u32> = Vec::new();
+        let mut outside: Vec<u32> = Vec::new();
+        for value in values {
+            if self.space.contains(value) {
+                inside.push(value);
+            } else {
+                outside.push(value);
+            }
+        }
+        inside.sort_unstable();
+        inside.dedup();
+        outside.sort_unstable();
+        outside.dedup();
+
+        match self.high_water {
+            Some(high) => {
+                inside.sort_by_key(|value| self.space.forward_distance(high, *value));
+            }
+            None => {
+                // Start after the widest gap between neighbours, wrap included:
+                // the one reading under which the set spans the least of the
+                // space. The first such gap wins a tie, so the start is fixed.
+                let mut start = 0;
+                let mut widest = 0;
+                for index in 0..inside.len() {
+                    let before = inside[(index + inside.len() - 1) % inside.len()];
+                    let gap = self.space.forward_distance(before, inside[index]);
+                    if gap > widest {
+                        widest = gap;
+                        start = index;
+                    }
+                }
+                inside.rotate_left(start);
+            }
+        }
+
+        inside
+            .into_iter()
+            .chain(outside)
+            .map(|value| (value, self.observe(value, max_listed)))
+            .collect()
     }
 
     /// Forget holes older than the resend window, accepting them as lost.
@@ -617,7 +679,9 @@ impl SequenceTracker {
     ///
     /// `None` when the snapshot does not describe a tracker this type could
     /// have produced: a high-water mark outside the space, a run that starts or
-    /// ends outside it, a zero-length run, or runs that overlap. Restoring a
+    /// ends outside it, a zero-length run, runs that overlap, or a hole that is
+    /// not behind the high-water mark — holes with no mark at all, or a hole
+    /// containing the mark itself. Restoring a
     /// contradictory snapshot would put the completeness control into a state
     /// its own invariants do not cover, which is worse than refusing.
     #[must_use]
@@ -649,12 +713,17 @@ impl SequenceTracker {
                 return None;
             }
         }
-        Some(Self {
+        let tracker = Self {
             space,
             high_water,
             holes: map,
             missing_count: count,
-        })
+        };
+        match high_water {
+            None if !tracker.holes.is_empty() => None,
+            Some(high) if tracker.is_missing(high) => None,
+            _ => Some(tracker),
+        }
     }
 
     // ── Run arithmetic ───────────────────────────────────────────────────────

@@ -81,11 +81,11 @@ impl Mcc {
     ///
     /// | Code | Meaning |
     /// |---|---|
-    /// | `001` | test networks |
-    /// | `901` | shared code for international operators — satellite, maritime, aeronautical |
-    /// | `902` | shared MNCs, not tied to a country |
-    /// | `991` | trial networks |
-    /// | `999` | internal use within an operator |
+    /// | `001` | test networks (a 3GPP test convention; E.212 reserves 0xx) |
+    /// | `901` | international shared code — satellite, maritime, aeronautical (E.212 §F.4) |
+    /// | `902` | regional and international organisations' networks (ITU OB 1214) |
+    /// | `991` | trials of new international services (E.212 Annex G.1) |
+    /// | `999` | internal use within a private network (E.212 Appendix III) |
     ///
     /// A record served by one of these has a well-formed MCC that answers no
     /// question about **where** the usage happened — and where the usage
@@ -97,6 +97,23 @@ impl Mcc {
         !matches!(self.0, 1 | 901 | 902 | 991 | 999)
     }
 
+    /// `true` when both codes belong to the same geographic area.
+    ///
+    /// An MCC is not a country: ITU-T E.212 gives some areas several codes — the
+    /// United States 310–316, India 404–406, the United Arab Emirates 424, 430
+    /// and 431, the United Kingdom 234–235, Japan 440–441, China 460–461 (List
+    /// of MCCs, annex to ITU Operational Bulletin 1117, position on
+    /// 1 February 2017). A US subscriber on an MCC 311 network is at home.
+    ///
+    /// Non-geographic codes are the same area only as themselves. The reverse
+    /// case — one code covering several territories, such as 340 (Guadeloupe and
+    /// Martinique) or the Crown Dependencies under 234 — needs the operator's
+    /// own data and is not resolved here.
+    #[must_use]
+    pub const fn same_country(self, other: Self) -> bool {
+        self.0 == other.0 || (self.is_geographic() && area_of(self.0) == area_of(other.0))
+    }
+
     /// `true` for the North American numbering region, MCC 3xx.
     ///
     /// The one MNC-width rule stable enough to encode. It is still a rule about
@@ -105,6 +122,19 @@ impl Mcc {
     #[must_use]
     pub const fn is_north_american(self) -> bool {
         self.0 >= 300 && self.0 <= 399
+    }
+}
+
+/// The lowest MCC of the geographic area `mcc` belongs to (ITU-T E.212).
+const fn area_of(mcc: u16) -> u16 {
+    match mcc {
+        235 => 234,
+        311..=316 => 310,
+        405 | 406 => 404,
+        430 | 431 => 424,
+        441 => 440,
+        461 => 460,
+        other => other,
     }
 }
 
@@ -307,10 +337,11 @@ impl PlmnId {
             && self.mnc.width() == other.mnc.width()
     }
 
-    /// `true` when the two identities are in the same country.
+    /// `true` when the two identities are in the same country — see
+    /// [`Mcc::same_country`].
     #[must_use]
     pub const fn is_same_country(self, other: Self) -> bool {
-        self.mcc.get() == other.mcc.get()
+        self.mcc.same_country(other.mcc)
     }
 
     // ── Wire form ────────────────────────────────────────────────────────────
@@ -564,6 +595,20 @@ mod serde_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn several_codes_can_be_one_country() {
+        let m = |v| Mcc::new(v).unwrap();
+        assert!(m(310).same_country(m(311)));
+        assert!(m(316).same_country(m(310)));
+        assert!(m(404).same_country(m(406)));
+        assert!(m(234).same_country(m(235)));
+        assert!(m(424).same_country(m(431)));
+        assert!(!m(262).same_country(m(232)));
+        assert!(!m(310).same_country(m(302)), "Canada is not the US");
+        assert!(m(901).same_country(m(901)));
+        assert!(!m(901).same_country(m(999)));
+    }
 
     /// The bug this module exists to prevent: an MNC held as a number loses its
     /// leading zero and merges two networks.

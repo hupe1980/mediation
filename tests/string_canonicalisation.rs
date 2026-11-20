@@ -14,9 +14,10 @@
 //! - **injectivity** — distinct values never share a string
 
 use mediation::{
-    ByteScale, CdrTimestamp, DigitString, DstAdjustment, Iccid, Imei, Imeisv, Imsi, Mcc, Mnc,
-    MsTimeZone, Msisdn, NodeId, Octets, PartyId, PlmnId, QuarterHourOffset, RecordType, Seconds,
-    ServiceDomain, TadigCode, UnattributableReason, VolumePair,
+    AreaCode, ByteScale, CallDirection, CallId, CdrTimestamp, Destination, DestinationClass,
+    DigitString, DstAdjustment, Iccid, Imei, Imeisv, Imsi, Itemisation, Mcc, Mnc, MsTimeZone,
+    Msisdn, NodeId, Octets, PartyId, PlmnId, QuarterHourOffset, RecordType, Seconds, ServiceDomain,
+    ShortenedNumber, Supi, TadigCode, UnattributableReason, VolumePair,
 };
 use proptest::prelude::*;
 use std::collections::HashSet;
@@ -60,6 +61,29 @@ fn every_enum_code_is_total_and_distinct() {
     assert_codes_total(DstAdjustment::ALL, DstAdjustment::CODES);
     assert_codes_total(UnattributableReason::ALL, UnattributableReason::CODES);
     assert_codes_total(ByteScale::ALL, ByteScale::CODES);
+    assert_codes_total(CallDirection::ALL, CallDirection::CODES);
+    assert_codes_total(DestinationClass::ALL, DestinationClass::CODES);
+    assert_codes_total(Itemisation::ALL, Itemisation::CODES);
+}
+
+/// Destinations, short codes, shortened numbers and Call-IDs have one string each.
+#[test]
+fn fixed_voice_values_round_trip() {
+    for d in ["+49301234567", "+1", "+123456789012345", "110", "116117"] {
+        assert_round_trips(&d.parse::<Destination>().unwrap());
+    }
+    assert_round_trips(&"a84b4c76e66710@pc33.example.com".parse::<CallId>().unwrap());
+    for s in ["+49301234xxx", "116xxx", "xxx"] {
+        assert_round_trips(&s.parse::<ShortenedNumber>().unwrap());
+    }
+    assert_round_trips(&"30".parse::<AreaCode>().unwrap());
+    assert_eq!("030".parse::<AreaCode>().unwrap().to_string(), "30");
+    for s in [
+        "gli-bGluZS00NzEx@5gc.mnc002.mcc262.3gppnetwork.org",
+        "gci-00-00-5E-00-53-00@cable.example",
+    ] {
+        assert_round_trips(&s.parse::<Supi>().unwrap());
+    }
 }
 
 #[test]
@@ -102,7 +126,7 @@ fn any_timestamp() -> impl Strategy<Value = CdrTimestamp> {
             let date = time::Date::from_calendar_date(y, time::Month::try_from(m).unwrap(), d)
                 .expect("valid date");
             let clock = time::Time::from_hms(hh, mm, ss).expect("valid time");
-            CdrTimestamp::new(time::PrimitiveDateTime::new(date, clock), offset)
+            CdrTimestamp::new(time::PrimitiveDateTime::new(date, clock), offset).expect("in range")
         })
 }
 
@@ -370,7 +394,6 @@ fn a_bit_spelling_is_refused_rather_than_helpfully_coerced() {
         ("B", ByteScale::Byte),
         ("bytes", ByteScale::Byte),
         ("kB", ByteScale::Kilo),
-        ("KB", ByteScale::Kilo),
         ("MB", ByteScale::Mega),
     ] {
         assert_eq!(text.parse::<ByteScale>().unwrap(), expected);

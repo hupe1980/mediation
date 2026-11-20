@@ -15,8 +15,9 @@
 #![cfg(feature = "serde")]
 
 use mediation::{
-    AddressString, BatchTotals, ChargingCharacteristics, Lai, NatureOfAddress, NumberingPlan,
-    Outcome, Rai, RoutingAreaCode, ScaledAmount, SequenceGap, Suci, Tai, TotalKind, Uli,
+    AddressString, BatchTotals, ChargingCharacteristics, Lai, NatureOfAddress,
+    NumberingPlanIndicator, Outcome, Rai, RoutingAreaCode, ScaledAmount, SequenceGap, Suci, Tai,
+    TotalKind, Uli,
 };
 use mediation::{Ambiguity, Jurisdiction};
 use mediation::{
@@ -26,6 +27,7 @@ use mediation::{
     TacWidth, TadigCode, TenantRef, TrackingAreaCode, UnattributableReason, UsageRecord,
     UserLocation, VolumePair,
 };
+use mediation::{CallDirection, CallId, Destination, DestinationClass, Itemisation};
 use serde_json::{Value, json, to_string, to_value};
 
 /// Serialises to exactly `expected`, and reads back to the same value.
@@ -104,6 +106,18 @@ fn subscriber_identities_serialise_as_strings() {
         "\"imsi-262021234567890\"",
     );
     assert_wire(
+        &"gli-bGluZS00NzEx@5gc.mnc002.mcc262.3gppnetwork.org"
+            .parse::<Supi>()
+            .unwrap(),
+        "\"gli-bGluZS00NzEx@5gc.mnc002.mcc262.3gppnetwork.org\"",
+    );
+    assert_wire(
+        &"gci-00-00-5E-00-53-00@cable.example"
+            .parse::<Supi>()
+            .unwrap(),
+        "\"gci-00-00-5E-00-53-00@cable.example\"",
+    );
+    assert_wire(
         &"msisdn-491701234567".parse::<Gpsi>().unwrap(),
         "\"msisdn-491701234567\"",
     );
@@ -118,7 +132,12 @@ fn vocabulary_codes_are_pinned() {
     assert_wire(&ServiceDomain::Data, "\"DATA\"");
     assert_wire(&ServiceDomain::NetworkApi, "\"NETWORK_API\"");
     assert_wire(&RecordType::PduSession, "\"PDU_SESSION\"");
-    assert_wire(&RecordType::MobileOriginatedCall, "\"MO_CALL\"");
+    assert_wire(&RecordType::OriginatedCall, "\"ORIGINATED_CALL\"");
+    assert_wire(&RecordType::FixedAccessSession, "\"FIXED_ACCESS_SESSION\"");
+    assert_wire(&ServiceDomain::FixedAccess, "\"FIXED_ACCESS\"");
+    assert_wire(&CallDirection::Terminated, "\"TERMINATED\"");
+    assert_wire(&DestinationClass::SharedCost, "\"SHARED_COST\"");
+    assert_wire(&Itemisation::Shortened, "\"SHORTENED\"");
     assert_wire(&ByteScale::Mebi, "\"MiB\"");
     assert_wire(&ByteScale::Mega, "\"MB\"");
     assert_wire(
@@ -176,12 +195,42 @@ fn every_vocabulary_variant_has_a_stable_tag() {
             TacWidth::ALL.iter().map(to_value).collect::<Vec<_>>(),
             TacWidth::CODES,
         ),
+        (
+            CallDirection::ALL.iter().map(to_value).collect::<Vec<_>>(),
+            CallDirection::CODES,
+        ),
+        (
+            DestinationClass::ALL
+                .iter()
+                .map(to_value)
+                .collect::<Vec<_>>(),
+            DestinationClass::CODES,
+        ),
+        (
+            Itemisation::ALL.iter().map(to_value).collect::<Vec<_>>(),
+            Itemisation::CODES,
+        ),
     ] {
         assert_eq!(values.len(), codes.len());
         for (value, code) in values.into_iter().zip(codes) {
             assert_eq!(value.unwrap(), Value::String((*code).to_owned()));
         }
     }
+}
+
+/// A destination is a string: `+` and digits for a number, bare digits for a
+/// short code — the two never collide.
+#[test]
+fn destinations_and_call_ids_serialise_as_strings() {
+    assert_wire(
+        &"+49301234567".parse::<Destination>().unwrap(),
+        "\"+49301234567\"",
+    );
+    assert_wire(&"116117".parse::<Destination>().unwrap(), "\"116117\"");
+    assert_wire(
+        &"a84b4c76e66710@pc33.example.com".parse::<CallId>().unwrap(),
+        "\"a84b4c76e66710@pc33.example.com\"",
+    );
 }
 
 // ── Composites ───────────────────────────────────────────────────────────────
@@ -449,7 +498,7 @@ fn an_address_string_keeps_its_qualifier() {
     // A reserved value keeps its number, because that is all that identifies it.
     let reserved = AddressString::new(
         NatureOfAddress::Reserved(5),
-        NumberingPlan::Reserved(2),
+        NumberingPlanIndicator::Reserved(2),
         "1234".parse().unwrap(),
     );
     assert_wire(
@@ -564,4 +613,20 @@ fn a_charging_characteristics_profile_is_four_hex_digits() {
     assert!("800".parse::<ChargingCharacteristics>().is_err());
     assert!("00800".parse::<ChargingCharacteristics>().is_err());
     assert!("08g0".parse::<ChargingCharacteristics>().is_err());
+}
+
+/// A record key is internally tagged by its kind; a call key names its node,
+/// record type and Call-ID.
+#[test]
+fn a_call_record_key_has_a_stable_shape() {
+    let key = mediation::RecordKey::Call {
+        entity: "sbc-ber-1".parse().unwrap(),
+        record_type: RecordType::OriginatedCall,
+        call_id: "a84b@sbc".parse().unwrap(),
+        sequence: None,
+    };
+    assert_wire(
+        &key,
+        r#"{"kind":"CALL","entity":"sbc-ber-1","record_type":"ORIGINATED_CALL","call_id":"a84b@sbc"}"#,
+    );
 }

@@ -25,6 +25,7 @@
 //! Operators bill in both powers of ten and powers of two, sometimes in the
 //! same tariff sheet, and "MB" is read as either. This module follows
 //! **IEC 80000-13** without exception: `kB` is 1 000 octets and `KiB` is 1 024.
+//! `KB`, which JEDEC defines as 1 024, is refused as ambiguous.
 //! Exactly one unit — the octet — reaches storage, and conversion happens only
 //! at the boundary, explicitly:
 //!
@@ -157,15 +158,17 @@ impl FromStr for ByteScale {
     /// tariff sheet that says "kb" and means kilobytes is ambiguous in the
     /// tariff sheet; resolve it there.
     ///
-    /// `KB` is accepted as `kB`, because that capitalisation is ubiquitous and
-    /// is not a bit spelling — the binary kilobyte is `KiB`, which differs by
-    /// more than case. The binary prefixes are matched case-insensitively for
-    /// the same reason: the `i` disambiguates them on its own.
+    /// # `KB` is refused
+    ///
+    /// `KB` is ambiguous: JEDEC (JESD100B.01) defines it as 1 024 octets while
+    /// readers of IEC 80000-13 take it for `kB`, 1 000. Write `kB` or `KiB`.
+    /// The binary prefixes are matched case-insensitively: the `i`
+    /// disambiguates them on its own.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let t = s.trim();
         match t {
             "B" | "octet" | "octets" | "byte" | "bytes" => return Ok(Self::Byte),
-            "kB" | "KB" => return Ok(Self::Kilo),
+            "kB" => return Ok(Self::Kilo),
             "MB" => return Ok(Self::Mega),
             "GB" => return Ok(Self::Giga),
             "TB" => return Ok(Self::Tera),
@@ -607,8 +610,8 @@ mod tests {
         for scale in ByteScale::ALL {
             assert_eq!(scale.as_str().parse::<ByteScale>().unwrap(), *scale);
         }
-        // The capitalised decimal kilobyte is unambiguous under IEC and accepted.
-        assert_eq!("KB".parse::<ByteScale>().unwrap(), ByteScale::Kilo);
+        // `KB` is 1 024 under JEDEC and 1 000 to an IEC reader: refused.
+        assert!("KB".parse::<ByteScale>().is_err());
         assert_eq!("KiB".parse::<ByteScale>().unwrap(), ByteScale::Kibi);
         assert!("MBps".parse::<ByteScale>().is_err());
     }

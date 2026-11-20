@@ -44,8 +44,13 @@
 //! assert_eq!(imei.tac().to_string(), "49015420");
 //! ```
 
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
+use std::str::FromStr;
 
+use crate::dialplan::Destination;
+use crate::digits::DigitString;
+use crate::error::ParseError;
 use crate::identity::{Imeisv, Imsi, Msisdn, Pei, Supi, Tac};
 use crate::plmn::{Mcc, MncWidths, PlmnId};
 
@@ -93,6 +98,35 @@ impl fmt::Display for Pseudonym {
     }
 }
 
+impl FromStr for Pseudonym {
+    type Err = ParseError;
+
+    /// Exactly 64 lower-case hex characters — the one form
+    /// [`Display`](fmt::Display) writes (finding R10).
+    ///
+    /// Bytes are checked before any slicing, so no input panics, and a sign,
+    /// whitespace or upper case is refused rather than read into a second
+    /// spelling of the same key. The input is withheld from the error: a
+    /// pseudonym is still personal data.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || ParseError::withheld("Pseudonym", "64 lower-case hex characters");
+        let bytes = s.as_bytes();
+        if bytes.len() != 64 {
+            return Err(err());
+        }
+        let nibble = |b: u8| match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            _ => None,
+        };
+        let mut digest = [0u8; 32];
+        for (slot, pair) in digest.iter_mut().zip(bytes.chunks_exact(2)) {
+            *slot = (nibble(pair[0]).ok_or_else(err)? << 4) | nibble(pair[1]).ok_or_else(err)?;
+        }
+        Ok(Self(digest))
+    }
+}
+
 /// Produces a keyed pseudonym from an identity's bytes.
 ///
 /// Implement this over the keyed primitive you already use — an HMAC, a keyed
@@ -127,9 +161,7 @@ pub trait Pseudonymiser {
 ///
 /// This enum **names** a policy; it does not perform one. The three reductions
 /// take different inputs and return different types — an [`Mcc`], a [`PlmnId`]
-/// and a [`Tac`] — so a single `apply` would have to return a sum type, or
-/// ignore the variant it was called on. It used to do the latter, which meant
-/// a model reduction applied to an IMSI cheerfully returned a country.
+/// and a [`Tac`] — so each has its own function.
 ///
 /// The reductions themselves are [`reduce_to_country`], [`reduce_to_network`]
 /// and [`reduce_equipment`], each named for what it yields.
@@ -236,6 +268,21 @@ impl NumberPrefix {
         })
     }
 
+    /// A number without its last `hide` digits.
+    ///
+    /// The reduction the German itemised bill uses with `hide = 3`
+    /// ([`itemise_called`] is the ready-made form). `None` when `hide` is 0 or
+    /// at least the whole number — no caller arithmetic, so no underflow on a
+    /// short number.
+    #[must_use]
+    pub fn without_last(msisdn: Msisdn, hide: usize) -> Option<Self> {
+        let keep = msisdn.len().checked_sub(hide)?;
+        if hide == 0 {
+            return None;
+        }
+        Self::of(msisdn, keep)
+    }
+
     /// How many digits were kept.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -253,6 +300,258 @@ impl fmt::Display for NumberPrefix {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.digits.fmt(f)
     }
+}
+
+impl FromStr for NumberPrefix {
+    type Err = ParseError;
+
+    /// The rendered form back: 1 to 14 decimal digits, nothing else — a prefix
+    /// is strictly shorter than the longest MSISDN (finding R11). The input
+    /// is withheld from the error, as for any traffic data.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || ParseError::withheld("NumberPrefix", "1 to 14 decimal digits");
+        if s.is_empty() || s.len() >= Msisdn::MAX_DIGITS || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(err());
+        }
+        let digits = DigitString::parse(s, Msisdn::MAX_DIGITS - 1).ok_or_else(err)?;
+        Ok(Self { digits })
+    }
+}
+
+// ── Itemised bill ────────────────────────────────────────────────────────────
+
+/// How the subscriber chose to see destinations on the itemised bill.
+///
+/// § 11 Abs. 1 S. 3 TDDDG: *„Dabei entscheidet der Endnutzer, ob ihm die von
+/// ihm gewählten Rufnummern ungekürzt oder unter Kürzung um die letzten drei
+/// Ziffern mitgeteilt werden."* No statute sets a default, so neither does
+/// this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Itemisation {
+    /// Destinations in full.
+    Full,
+    /// Destinations shortened by their last three digits.
+    Shortened,
+}
+
+impl Itemisation {
+    /// Every variant, for exhaustive iteration in tests and mappings.
+    pub const ALL: &'static [Self] = &[Self::Full, Self::Shortened];
+
+    /// The canonical codes, in the order of [`ALL`](Self::ALL).
+    pub const CODES: &'static [&'static str] = &["FULL", "SHORTENED"];
+
+    /// The canonical string form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "FULL",
+            Self::Shortened => "SHORTENED",
+        }
+    }
+}
+
+impl fmt::Display for Itemisation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Itemisation {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .find(|i| i.as_str().eq_ignore_ascii_case(s.trim()))
+            .copied()
+            .ok_or_else(|| ParseError::one_of("Itemisation", s, Self::CODES))
+    }
+}
+
+/// A number with its last three digits hidden: `+4930123xxx`, or `xxx` for a
+/// destination of three digits or fewer.
+///
+/// Irreversible — the hidden digits are not kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ShortenedNumber {
+    visible: DigitString,
+    international: bool,
+}
+
+impl ShortenedNumber {
+    /// How many trailing digits are hidden (§ 11 Abs. 1 S. 3 TDDDG).
+    pub const HIDDEN: usize = 3;
+
+    fn of(digits: DigitString, international: bool) -> Self {
+        let keep = digits.len().saturating_sub(Self::HIDDEN);
+        Self {
+            visible: digits.prefix(keep),
+            // Nothing visible, nothing to mark: `xxx` is one value, so the
+            // string form round-trips.
+            international: international && keep > 0,
+        }
+    }
+
+    /// The digits still shown.
+    #[must_use]
+    pub const fn visible(&self) -> DigitString {
+        self.visible
+    }
+}
+
+impl fmt::Display for ShortenedNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.international {
+            f.write_str("+")?;
+        }
+        write!(f, "{}xxx", self.visible)
+    }
+}
+
+impl FromStr for ShortenedNumber {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || {
+            ParseError::withheld(
+                "ShortenedNumber",
+                "digits followed by xxx, such as +4930123xxx",
+            )
+        };
+        let t = s.trim();
+        let body = t.strip_suffix("xxx").ok_or_else(err)?;
+        let (international, body) = match body.strip_prefix('+') {
+            Some(rest) if !rest.is_empty() => (true, rest),
+            Some(_) => return Err(err()),
+            None => (false, body),
+        };
+        if body.starts_with(['-', ' ']) {
+            return Err(err());
+        }
+        let visible = DigitString::parse(body, Msisdn::MAX_DIGITS).ok_or_else(err)?;
+        if body.len() != visible.len() {
+            return Err(err());
+        }
+        Ok(Self {
+            visible,
+            international,
+        })
+    }
+}
+
+/// How one destination appears on the itemised bill.
+///
+/// A presentation value: it takes no [`UsageRecord`](crate::UsageRecord) and
+/// produces no disposition, so itemising a batch can never change what it
+/// bills or how it reconciles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ItemisedDestination {
+    /// Shown in full.
+    Full(Destination),
+    /// Shown without its last three digits.
+    Shortened(ShortenedNumber),
+    /// Not shown: the connection must not be recognisable (§ 11 Abs. 5 TDDDG).
+    ///
+    /// The call is still billed; only its line on the itemisation is left out.
+    Omitted,
+}
+
+/// Destinations that must never be recognisable on an itemised bill.
+///
+/// § 11 Abs. 5 TDDDG: the itemisation *„darf nicht Verbindungen zu Anschlüssen
+/// erkennen lassen"* of counselling services — Telefonseelsorge, health advice,
+/// the groups of § 203 Abs. 1 Nr. 4 and 5 StGB — that the Federal Network Agency
+/// has put on its list. Operators retrieve the list and must re-query it every
+/// quarter (§ 11 Abs. 6 TDDDG); it arrives here as data, like every other list
+/// that changes.
+///
+/// Matching is on the normalised [`Destination`], so `0800 111 0 111`,
+/// `+49 800 1110111` and `0049800-1110111` are one entry — normalise the list
+/// with the same [`DialContext`](crate::DialContext) as the calls.
+pub trait ProtectedDestinations {
+    /// `true` when calls to `destination` must not appear on the itemisation.
+    fn is_protected(&self, destination: &Destination) -> bool;
+}
+
+impl ProtectedDestinations for [Destination] {
+    fn is_protected(&self, destination: &Destination) -> bool {
+        self.contains(destination)
+    }
+}
+
+impl<const N: usize> ProtectedDestinations for [Destination; N] {
+    fn is_protected(&self, destination: &Destination) -> bool {
+        self.contains(destination)
+    }
+}
+
+impl ProtectedDestinations for Vec<Destination> {
+    fn is_protected(&self, destination: &Destination) -> bool {
+        self.contains(destination)
+    }
+}
+
+impl ProtectedDestinations for BTreeSet<Destination> {
+    fn is_protected(&self, destination: &Destination) -> bool {
+        self.contains(destination)
+    }
+}
+
+impl<S: std::hash::BuildHasher> ProtectedDestinations for HashSet<Destination, S> {
+    fn is_protected(&self, destination: &Destination) -> bool {
+        self.contains(destination)
+    }
+}
+
+/// How a called destination appears on the itemised bill.
+///
+/// Omitted when `protected` lists it, whatever the subscriber chose; otherwise
+/// in full or without its last three digits, as the subscriber chose. A
+/// destination of three digits or fewer is hidden entirely when shortened.
+///
+/// ```rust
+/// use mediation::{Destination, Itemisation, ItemisedDestination, itemise_called};
+///
+/// let protected: [Destination; 1] = ["+498001110111".parse()?];
+/// let call: Destination = "+49301234567".parse()?;
+///
+/// let shown = itemise_called(&call, Itemisation::Shortened, &protected);
+/// let ItemisedDestination::Shortened(number) = shown else { unreachable!() };
+/// assert_eq!(number.to_string(), "+49301234xxx");
+///
+/// let seelsorge: Destination = "+498001110111".parse()?;
+/// assert_eq!(itemise_called(&seelsorge, Itemisation::Full, &protected), ItemisedDestination::Omitted);
+/// # Ok::<(), mediation::ParseError>(())
+/// ```
+#[must_use]
+pub fn itemise_called(
+    destination: &Destination,
+    choice: Itemisation,
+    protected: &(impl ProtectedDestinations + ?Sized),
+) -> ItemisedDestination {
+    if protected.is_protected(destination) {
+        return ItemisedDestination::Omitted;
+    }
+    match choice {
+        Itemisation::Full => ItemisedDestination::Full(*destination),
+        Itemisation::Shortened => ItemisedDestination::Shortened(ShortenedNumber::of(
+            destination.digits(),
+            destination.as_number().is_some(),
+        )),
+    }
+}
+
+/// How a caller's number appears on the itemised bill of the line that received
+/// and paid for the call: **always** shortened.
+///
+/// § 11 Abs. 4 TDDDG: where the holder pays for incoming calls, the calling
+/// numbers may be shown *„nur unter Kürzung um die letzten drei Ziffern"*. The
+/// subscriber's [`Itemisation`] choice does not apply, so this function does not
+/// take one.
+#[must_use]
+pub fn itemise_calling(calling: Msisdn) -> ShortenedNumber {
+    ShortenedNumber::of(calling.digits(), true)
 }
 
 // ── Reduced subscriber ───────────────────────────────────────────────────────
@@ -353,7 +652,9 @@ pub fn software_version(pei: Pei) -> Option<crate::identity::SoftwareVersion> {
 
 #[cfg(feature = "serde")]
 mod serde_impl {
-    use super::{NumberPrefix, Pseudonym, ReducedSubscriber, Reduction};
+    use super::{
+        Itemisation, NumberPrefix, Pseudonym, ReducedSubscriber, Reduction, ShortenedNumber,
+    };
     use serde::de::{self, Visitor};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::fmt;
@@ -374,15 +675,7 @@ mod serde_impl {
                     f.write_str("64 lower-case hex characters")
                 }
                 fn visit_str<E: de::Error>(self, v: &str) -> Result<Pseudonym, E> {
-                    if v.len() != 64 {
-                        return Err(de::Error::custom("a pseudonym is 32 octets of hex"));
-                    }
-                    let mut digest = [0u8; 32];
-                    for (index, slot) in digest.iter_mut().enumerate() {
-                        *slot = u8::from_str_radix(&v[index * 2..index * 2 + 2], 16)
-                            .map_err(de::Error::custom)?;
-                    }
-                    Ok(Pseudonym::from_digest(digest))
+                    v.parse().map_err(de::Error::custom)
                 }
             }
             deserializer.deserialize_str(V)
@@ -415,9 +708,69 @@ mod serde_impl {
         }
     }
 
+    impl Serialize for Itemisation {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str(self.as_str())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Itemisation {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct V;
+            impl Visitor<'_> for V {
+                type Value = Itemisation;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("an itemisation code such as \"SHORTENED\"")
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<Itemisation, E> {
+                    v.parse().map_err(de::Error::custom)
+                }
+            }
+            deserializer.deserialize_str(V)
+        }
+    }
+
+    impl Serialize for ShortenedNumber {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_str(self)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for ShortenedNumber {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct V;
+            impl Visitor<'_> for V {
+                type Value = ShortenedNumber;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a shortened number such as \"+4930123xxx\"")
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<ShortenedNumber, E> {
+                    v.parse().map_err(de::Error::custom)
+                }
+            }
+            deserializer.deserialize_str(V)
+        }
+    }
+
     impl Serialize for NumberPrefix {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             serializer.collect_str(self)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for NumberPrefix {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct V;
+            impl Visitor<'_> for V {
+                type Value = NumberPrefix;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a number prefix such as \"49170\"")
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> Result<NumberPrefix, E> {
+                    v.parse().map_err(de::Error::custom)
+                }
+            }
+            deserializer.deserialize_str(V)
         }
     }
 

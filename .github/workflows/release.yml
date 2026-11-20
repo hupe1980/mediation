@@ -1,5 +1,18 @@
 name: Release
 
+# Publishes to crates.io by Trusted Publishing (GitHub OIDC): no crates.io token is
+# stored anywhere. The publish job exchanges a short-lived GitHub OIDC token for a
+# crates.io token that rust-lang/crates-io-auth-action revokes when the job ends.
+#
+# crates.io → mediation → Settings → Trusted Publishing: GitHub publisher,
+# repository `hupe1980/mediation`, workflow `release.yml`, environment `crates-io`
+# (configured 2026-11-20). Recommended on GitHub: a required reviewer on the
+# `crates-io` environment and a ruleset restricting who may create `v*` tags. Once a
+# release published this way shows `trustpub_data` in
+# https://crates.io/api/v1/crates/mediation/<version>, enable "trusted publishing
+# only" on crates.io and delete any CARGO_REGISTRY_TOKEN secret.
+#
+# Never add a `pull_request_target` or `workflow_run` trigger to this workflow.
 on:
   push:
     tags:
@@ -13,7 +26,7 @@ on:
         default: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -62,19 +75,29 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v') && inputs.dry_run != true
     environment: crates-io
+    permissions:
+      contents: read
+      id-token: write # OIDC: trusted publishing
+    # The only job that can mint a token: no cache, nothing but the publish.
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --dry-run --locked --all-features
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
       - name: cargo publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --all-features
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked --all-features
 
   github-release:
     name: 🏷️ GitHub release
     needs: [verify, publish]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:

@@ -24,7 +24,15 @@ macro_rules! every_parser {
 }
 
 every_parser!(
+    AreaCode,
     ByteScale,
+    CallDirection,
+    CallId,
+    Destination,
+    DestinationClass,
+    Itemisation,
+    ShortCode,
+    ShortenedNumber,
     CdrTimestamp,
     ChangeCondition,
     ChargingId,
@@ -172,6 +180,59 @@ proptest! {
     ) {
         decode_everything(&bytes);
     }
+}
+
+/// Dial strings, Call-IDs and itemisation (fixed-line-voice/SR-003, SC-003): up to
+/// 64 KiB, ten thousand cases, a value or a typed refusal — never a panic.
+fn dial_everything(s: &str) {
+    for context in [
+        DialContext::germany(),
+        DialContext::germany().with_area_code("30").unwrap(),
+        DialContext::nanp(),
+        DialContext::italy(),
+        DialContext::new(999, "9").unwrap(),
+    ] {
+        if let Ok(destination) = context.normalise(s) {
+            let _ = destination.class(&GermanNumberingPlan);
+            for choice in Itemisation::ALL {
+                let _ = itemise_called(&destination, *choice, &[destination]);
+                let _ = itemise_called(&destination, *choice, &[] as &[Destination]);
+            }
+            if let Some(number) = destination.as_number() {
+                let _ = itemise_calling(number);
+                for hide in 0..20 {
+                    let _ = NumberPrefix::without_last(number, hide);
+                }
+            }
+        }
+    }
+    let _ = s.parse::<CallId>();
+    let _ = s.parse::<Destination>();
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10_000))]
+
+    #[test]
+    fn no_dial_string_panics(s in "[-+0-9 ()/.*#a-z\u{ff10}-\u{ff19}]{0,80}") {
+        dial_everything(&s);
+    }
+
+    #[test]
+    fn no_arbitrary_text_panics_the_dial_plan(s in "\\PC{0,80}") {
+        dial_everything(&s);
+    }
+}
+
+#[test]
+fn huge_input_is_refused_in_constant_work() {
+    let huge = "9".repeat(64 * 1024);
+    assert_eq!(
+        DialContext::germany().normalise(&huge),
+        Err(DialError::TooLong)
+    );
+    assert!(huge.parse::<CallId>().is_err());
+    assert!(huge.parse::<Destination>().is_err());
 }
 
 /// The three panics these tests were written for, kept as named regressions so

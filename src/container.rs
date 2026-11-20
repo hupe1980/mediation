@@ -92,9 +92,10 @@ impl FromStr for RatingGroup {
 
 /// A 5G QoS Identifier — the quality class a container's traffic ran under.
 ///
-/// Standardised values occupy 1…127 (3GPP TS 23.501); the rest are operator
-/// specific. Both are accepted, and the distinction is exposed rather than
-/// enforced, because an operator-specific class is perfectly valid usage.
+/// 3GPP TS 23.501 and the 5QI coding of TS 24.501 divide the range: 1…127 standardised, 128…254
+/// operator specific, 255 reserved. All are accepted, and the distinction is
+/// exposed rather than enforced, because an operator-specific class is
+/// perfectly valid usage and a reserved one is for a caller to judge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Qos5qi(u8);
 
@@ -115,6 +116,20 @@ impl Qos5qi {
     #[must_use]
     pub const fn is_standardised(self) -> bool {
         self.0 <= 127
+    }
+
+    /// `true` for the operator-specific range 128…254.
+    ///
+    /// 255 is reserved (TS 24.501 5QI coding), not operator specific.
+    #[must_use]
+    pub const fn is_operator_specific(self) -> bool {
+        self.0 >= 128 && self.0 <= 254
+    }
+
+    /// `true` for 255, which the TS 24.501 5QI coding reserves.
+    #[must_use]
+    pub const fn is_reserved(self) -> bool {
+        self.0 == 255
     }
 }
 

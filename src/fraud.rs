@@ -39,7 +39,7 @@
 //! # use time::Duration;
 //! # fn at(opened: &str, serving: &str) -> UsageRecord {
 //! #     UsageRecord::new(
-//! #         RecordType::MobileOriginatedCall,
+//! #         RecordType::OriginatedCall,
 //! #         ChargedParty::Subscriber(SubscriberRef::new("imsi-262021234567890".parse().unwrap())),
 //! #         opened.parse().unwrap(),
 //! #         SourceRef::new("msc-01".parse().unwrap(), 0),
@@ -62,7 +62,6 @@ use std::fmt;
 use time::Duration;
 
 use crate::cdrtime::{CdrTimestamp, Seconds};
-use crate::identity::Msisdn;
 use crate::numbering::NumberRange;
 use crate::numbering::NumberRangeSet;
 use crate::party::ChargedParty;
@@ -239,7 +238,11 @@ impl TransitTimes for UniformTransit {
     fn minimum_transit(&self, from: Mcc, to: Mcc) -> Option<Duration> {
         // Same country is not a journey; the detector never asks, but a caller
         // reading this trait directly might.
-        if from == to { None } else { Some(self.0) }
+        if from.same_country(to) {
+            None
+        } else {
+            Some(self.0)
+        }
     }
 }
 
@@ -267,7 +270,9 @@ struct Sighting {
 /// Compares **countries**, not cells: a country change is a lower bound on the
 /// distance travelled that needs no geography, no coordinates and no table.
 /// Two records from adjacent cells minutes apart are ordinary; two from
-/// Germany and the United States twenty minutes apart are not.
+/// Germany and the United States twenty minutes apart are not. Countries are
+/// compared with [`Mcc::same_country`], so a move between two MCCs of one
+/// country (US 310 and 311) is no journey (finding R14).
 ///
 /// The minimum comes from a caller-supplied [`TransitTimes`], per country pair
 /// — see that trait for why one global number is the wrong shape. Pass
@@ -278,9 +283,11 @@ struct Sighting {
 /// so a whole batch can be passed without every subscriber's country change
 /// being read against every other's.
 ///
-/// Only adjacent records in time are compared, which loses nothing: if two
-/// records are impossibly far apart, some adjacent pair between them changes
-/// country in no more time, and that pair fires.
+/// Only adjacent records in time are compared. That finds every impossible
+/// pair only when the transit table answers every pair and obeys the triangle
+/// inequality, as [`UniformTransit`] does. With unknown pairs or a table where
+/// a detour is faster than the direct route, a non-adjacent impossible pair can
+/// go unreported (finding R16).
 ///
 /// # Travel time runs from the first record's **close**
 ///
@@ -297,7 +304,7 @@ struct Sighting {
 /// # use mediation::{ChargedParty, RecordType, SourceRef, SubscriberRef, UsageRecord};
 /// # fn at(opened: &str, serving: &str) -> UsageRecord {
 /// #     UsageRecord::new(
-/// #         RecordType::MobileOriginatedCall,
+/// #         RecordType::OriginatedCall,
 /// #         ChargedParty::Subscriber(SubscriberRef::new("imsi-262021234567890".parse().unwrap())),
 /// #         opened.parse().unwrap(),
 /// #         SourceRef::new("msc-01".parse().unwrap(), 0),
@@ -339,7 +346,7 @@ pub fn impossible_travel(records: &[UsageRecord], transit: &impl TransitTimes) -
             let (first, second) = (&pair[0], &pair[1]);
             let (first_index, first_country) = (first.index, first.country);
             let (second_index, second_country) = (second.index, second.country);
-            if first_country == second_country {
+            if first_country.same_country(second_country) {
                 continue;
             }
             // An unmodelled pair is not evidence of anything.
@@ -373,35 +380,6 @@ pub fn impossible_travel(records: &[UsageRecord], transit: &impl TransitTimes) -
     found
 }
 
-// ── Called party ─────────────────────────────────────────────────────────────
-
-/// Resolves the number a record reached.
-///
-/// A charging record's called party lives in a field this crate does not model,
-/// because which field it is depends on the record type and the decoder: a
-/// called-party address, an SMS destination, a SIP request URI. Rather than
-/// guess, the destination detectors ask.
-///
-/// `None` means *not determinable for this record* — a detector then skips it
-/// rather than treating it as a miss, since an unresolved destination is not
-/// evidence of anything.
-///
-/// Implemented for any `Fn(usize, &UsageRecord) -> Option<Msisdn>`, so a closure
-/// over a caller's own decoded fields is enough.
-pub trait CalledParty {
-    /// The number the record at `index` reached, if it can be determined.
-    fn called(&self, index: usize, record: &UsageRecord) -> Option<Msisdn>;
-}
-
-impl<F> CalledParty for F
-where
-    F: Fn(usize, &UsageRecord) -> Option<Msisdn>,
-{
-    fn called(&self, index: usize, record: &UsageRecord) -> Option<Msisdn> {
-        self(index, record)
-    }
-}
-
 // ── Premium destination ──────────────────────────────────────────────────────
 
 /// Traffic to destination ranges the caller flagged as high risk.
@@ -409,17 +387,20 @@ where
 /// The list is supplied because it is commercial data that changes weekly —
 /// International Premium Rate Number ranges are advertised to fraudsters and
 /// withdrawn continuously, and a vendored list would be stale on arrival.
+///
+/// Reads each record's own [`called`](UsageRecord::called) destination. A record
+/// without one — or with a short code, which no international range contains —
+/// is skipped: an unresolved destination is not evidence of anything.
 #[must_use]
 pub fn premium_destination<T>(
     records: &[UsageRecord],
     high_risk: &NumberRangeSet<T>,
-    destinations: &impl CalledParty,
 ) -> Vec<Indication> {
     records
         .iter()
         .enumerate()
         .filter_map(|(index, record)| {
-            let called = destinations.called(index, record)?;
+            let called = record.called?.as_number()?;
             let (range, _) = high_risk.longest_match(called)?;
             Some(Indication::new(
                 Signal::PremiumDestination,
@@ -432,16 +413,23 @@ pub fn premium_destination<T>(
 
 // ── Wangiri ──────────────────────────────────────────────────────────────────
 
-/// Many short inbound calls, of the kind meant to provoke a callback.
+/// Many short inbound calls to one subscriber, of the kind meant to provoke a
+/// callback.
 ///
 /// The Wangiri pattern: one ring and cut, so the victim calls back to a premium
 /// number. What identifies it is not any single call — a genuine caller who
 /// hangs up looks identical — but the **volume of them**, so this fires only
-/// when `min_calls` short inbound calls appear together.
+/// when `min_calls` short inbound calls reach **one charged party within
+/// `within`** of each other (finding R15). Calls to different subscribers, or
+/// spread over months, are not a wave.
 ///
 /// `ring_ceiling` is how short counts as short, supplied by the caller: a
 /// network with slow setup legitimately produces more brief calls than one
-/// without.
+/// without. `within` is measured from the first call's open instant to the
+/// last's, inclusive; a non-positive `within` finds nothing.
+///
+/// One indication per charged party that fires, naming the busiest window —
+/// the first one reached on a tie — in instant order.
 ///
 /// A record with **no** duration is not counted. An unrecorded duration is not
 /// a short one, and reading it as zero would make every unmetered record part
@@ -451,28 +439,51 @@ pub fn wangiri_pattern(
     records: &[UsageRecord],
     ring_ceiling: Seconds,
     min_calls: usize,
-) -> Option<Indication> {
-    let short_inbound: Vec<usize> = records
-        .iter()
-        .enumerate()
-        .filter(|(_, record)| record.record_type == RecordType::MobileTerminatedCall)
-        .filter(|(_, record)| {
-            record
+    within: Duration,
+) -> Vec<Indication> {
+    if min_calls == 0 || within.is_negative() || within.is_zero() {
+        return Vec::new();
+    }
+    let mut by_party: BTreeMap<&ChargedParty, Vec<(CdrTimestamp, usize)>> = BTreeMap::new();
+    for (index, record) in records.iter().enumerate() {
+        if record.record_type == RecordType::TerminatedCall
+            && record
                 .duration
                 .is_some_and(|duration| duration <= ring_ceiling)
-        })
-        .map(|(index, _)| index)
-        .collect();
-
-    if short_inbound.len() < min_calls || min_calls == 0 {
-        return None;
+        {
+            by_party
+                .entry(&record.party)
+                .or_default()
+                .push((record.opened, index));
+        }
     }
-    let count = short_inbound.len();
-    Some(Indication::new(
-        Signal::WangiriPattern,
-        short_inbound,
-        format!("{count} inbound call(s) of at most {ring_ceiling} s"),
-    ))
+
+    let mut found = Vec::new();
+    for calls in by_party.values_mut() {
+        calls.sort_by(|a, b| CdrTimestamp::cmp_instant(&a.0, &b.0).then(a.1.cmp(&b.1)));
+        // The widest run of calls whose first and last lie within `within`.
+        let (mut best_start, mut best_len, mut first) = (0usize, 0usize, 0usize);
+        for last in 0..calls.len() {
+            while calls[last].0.to_utc() - calls[first].0.to_utc() > within {
+                first += 1;
+            }
+            if last + 1 - first > best_len {
+                (best_start, best_len) = (first, last + 1 - first);
+            }
+        }
+        if best_len < min_calls {
+            continue;
+        }
+        let window = &calls[best_start..best_start + best_len];
+        let mut involved: Vec<usize> = window.iter().map(|(_, index)| *index).collect();
+        involved.sort_unstable();
+        found.push(Indication::new(
+            Signal::WangiriPattern,
+            involved,
+            format!("{best_len} inbound call(s) of at most {ring_ceiling} s within {within}"),
+        ));
+    }
+    found
 }
 
 // ── Bypass ───────────────────────────────────────────────────────────────────
@@ -502,8 +513,8 @@ impl TrafficShape {
         let mut networks = BTreeSet::new();
         for record in records {
             match record.record_type {
-                RecordType::MobileOriginatedCall => shape.outbound_calls += 1,
-                RecordType::MobileTerminatedCall => shape.inbound_calls += 1,
+                RecordType::OriginatedCall => shape.outbound_calls += 1,
+                RecordType::TerminatedCall => shape.inbound_calls += 1,
                 _ => continue,
             }
             if let Some(plmn) = record.serving_plmn {
@@ -577,7 +588,7 @@ pub fn bypass_signature(
         .filter(|(_, record)| {
             matches!(
                 record.record_type,
-                RecordType::MobileOriginatedCall | RecordType::MobileTerminatedCall
+                RecordType::OriginatedCall | RecordType::TerminatedCall
             )
         })
         .map(|(index, _)| index)
@@ -609,11 +620,13 @@ pub fn bypass_signature(
 /// The denominator is **every** message, including those whose destination
 /// resolved to no range at all — a sender whose traffic is half unmatched is not
 /// concentrated, and dividing only by the matched ones would say it was.
+///
+/// Counts only [`RecordType::SmsOriginated`] records (finding R17) and reads
+/// each message's own [`called`](UsageRecord::called) destination.
 #[must_use]
 pub fn ait_signature<T>(
     records: &[UsageRecord],
     ranges: &NumberRangeSet<T>,
-    destinations: &impl CalledParty,
     min_messages: usize,
     concentration_percent: u64,
 ) -> Option<Indication> {
@@ -621,14 +634,14 @@ pub fn ait_signature<T>(
     let mut messages = 0usize;
 
     for (index, record) in records.iter().enumerate() {
-        if !matches!(
-            record.record_type,
-            RecordType::SmsOriginated | RecordType::SmsTerminated
-        ) {
+        // Inflated traffic is what a sender originates. A terminated message
+        // is somebody else's traffic, and counting it would dilute or inflate
+        // the sender's share (finding R17).
+        if record.record_type != RecordType::SmsOriginated {
             continue;
         }
         messages += 1;
-        if let Some(called) = destinations.called(index, record)
+        if let Some(called) = record.called.and_then(|d| d.as_number())
             && let Some((range, _)) = ranges.longest_match(called)
         {
             by_range.entry(range).or_default().push(index);
@@ -751,9 +764,25 @@ mod serde_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::Msisdn;
     use crate::numbering::NumberRange;
     use crate::party::SubscriberRef;
     use crate::record::SourceRef;
+
+    /// Gives each record the destination `called` resolves for it.
+    fn resolve(
+        records: &[UsageRecord],
+        called: &impl Fn(usize, &UsageRecord) -> Option<Msisdn>,
+    ) -> Vec<UsageRecord> {
+        records
+            .iter()
+            .enumerate()
+            .map(|(i, r)| match called(i, r) {
+                Some(n) => r.clone().with_called(n.into()),
+                None => r.clone(),
+            })
+            .collect()
+    }
 
     fn call(kind: RecordType, opened: &str, serving: &str) -> UsageRecord {
         UsageRecord::new(
@@ -783,12 +812,12 @@ mod tests {
     fn two_countries_too_close_together_is_arithmetically_impossible() {
         let records = vec![
             call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 "2026-07-28T10:00:00+02:00",
                 "262-02",
             ),
             call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 "2026-07-28T10:20:00+02:00",
                 "310-260",
             ),
@@ -805,12 +834,12 @@ mod tests {
     fn a_plausible_journey_does_not_fire() {
         let records = vec![
             call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 "2026-07-28T02:00:00+02:00",
                 "262-02",
             ),
             call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 "2026-07-28T14:00:00+02:00",
                 "310-260",
             ),
@@ -824,12 +853,12 @@ mod tests {
     fn staying_in_one_country_never_fires() {
         let records = vec![
             call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 "2026-07-28T10:00:00+02:00",
                 "262-02",
             ),
             call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 "2026-07-28T10:01:00+02:00",
                 "262-01",
             ),
@@ -842,13 +871,13 @@ mod tests {
     #[test]
     fn two_subscribers_are_not_one_journey() {
         let mut here = call(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T10:00:00+02:00",
             "262-02",
         );
         here.party = subscriber("imsi-262021111111111");
         let mut there = call(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T10:20:00+02:00",
             "310-260",
         );
@@ -876,7 +905,7 @@ mod tests {
         let mut records = Vec::new();
         for minute in 0..6 {
             let mut other = call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 &format!("2026-07-28T10:0{minute}:00+02:00"),
                 "440-10",
             );
@@ -886,13 +915,13 @@ mod tests {
         records.insert(
             0,
             call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 "2026-07-28T10:00:00+02:00",
                 "262-02",
             ),
         );
         records.push(call(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T10:20:00+02:00",
             "310-260",
         ));
@@ -907,12 +936,12 @@ mod tests {
     #[test]
     fn detection_is_order_independent() {
         let a = call(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T10:00:00+02:00",
             "262-02",
         );
         let b = call(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T10:20:00+02:00",
             "310-260",
         );
@@ -932,7 +961,7 @@ mod tests {
     #[test]
     fn records_without_a_serving_network_are_skipped() {
         let mut unplaced = call(
-            RecordType::MobileOriginatedCall,
+            RecordType::OriginatedCall,
             "2026-07-28T10:10:00+02:00",
             "310-260",
         );
@@ -940,13 +969,13 @@ mod tests {
 
         let records = vec![
             call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 "2026-07-28T10:00:00+02:00",
                 "262-02",
             ),
             unplaced,
             call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 "2026-07-28T18:00:00+02:00",
                 "262-02",
             ),
@@ -960,12 +989,12 @@ mod tests {
     fn traffic_to_a_flagged_range_is_reported() {
         let records = vec![
             call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 "2026-07-28T10:00:00+02:00",
                 "262-02",
             ),
             call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 "2026-07-28T11:00:00+02:00",
                 "262-02",
             ),
@@ -978,7 +1007,7 @@ mod tests {
             }
         };
 
-        let found = premium_destination(&records, &high_risk(), &called);
+        let found = premium_destination(&resolve(&records, &called), &high_risk());
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].records, vec![0]);
         assert!(found[0].detail.contains("88216"), "{}", found[0].detail);
@@ -993,25 +1022,27 @@ mod tests {
     fn one_short_call_is_not_a_pattern() {
         let one = vec![
             call(
-                RecordType::MobileTerminatedCall,
+                RecordType::TerminatedCall,
                 "2026-07-28T10:00:00+02:00",
                 "262-02",
             )
             .with_duration(Seconds::new(2)),
         ];
-        assert!(wangiri_pattern(&one, Seconds::new(5), 10).is_none());
+        assert!(wangiri_pattern(&one, Seconds::new(5), 10, Duration::hours(1)).is_empty());
 
         let many: Vec<UsageRecord> = (0..12)
             .map(|i| {
                 call(
-                    RecordType::MobileTerminatedCall,
+                    RecordType::TerminatedCall,
                     &format!("2026-07-28T10:{i:02}:00+02:00"),
                     "262-02",
                 )
                 .with_duration(Seconds::new(2))
             })
             .collect();
-        let found = wangiri_pattern(&many, Seconds::new(5), 10).expect("twelve short inbound");
+        let found = wangiri_pattern(&many, Seconds::new(5), 10, Duration::hours(1));
+        assert_eq!(found.len(), 1, "twelve short inbound");
+        let found = &found[0];
         assert_eq!(found.signal, Signal::WangiriPattern);
         assert_eq!(found.records.len(), 12);
     }
@@ -1022,14 +1053,14 @@ mod tests {
         let outbound: Vec<UsageRecord> = (0..20)
             .map(|i| {
                 call(
-                    RecordType::MobileOriginatedCall,
+                    RecordType::OriginatedCall,
                     &format!("2026-07-28T10:{i:02}:00+02:00"),
                     "262-02",
                 )
                 .with_duration(Seconds::new(1))
             })
             .collect();
-        assert!(wangiri_pattern(&outbound, Seconds::new(5), 10).is_none());
+        assert!(wangiri_pattern(&outbound, Seconds::new(5), 10, Duration::hours(1)).is_empty());
     }
 
     // ── Bypass ───────────────────────────────────────────────────────────────
@@ -1040,7 +1071,7 @@ mod tests {
         let records: Vec<UsageRecord> = (0..50)
             .map(|i| {
                 call(
-                    RecordType::MobileOriginatedCall,
+                    RecordType::OriginatedCall,
                     &format!("2026-07-28T{:02}:00:00+02:00", i % 24),
                     "262-02",
                 )
@@ -1068,9 +1099,9 @@ mod tests {
             .map(|i| {
                 call(
                     if i % 2 == 0 {
-                        RecordType::MobileOriginatedCall
+                        RecordType::OriginatedCall
                     } else {
-                        RecordType::MobileTerminatedCall
+                        RecordType::TerminatedCall
                     },
                     &format!("2026-07-28T{:02}:00:00+02:00", i % 24),
                     "262-02",
@@ -1084,7 +1115,7 @@ mod tests {
         let mobile: Vec<UsageRecord> = (0..50)
             .map(|i| {
                 call(
-                    RecordType::MobileOriginatedCall,
+                    RecordType::OriginatedCall,
                     &format!("2026-07-28T{:02}:00:00+02:00", i % 24),
                     if i % 2 == 0 { "262-02" } else { "262-01" },
                 )
@@ -1101,7 +1132,7 @@ mod tests {
         let few: Vec<UsageRecord> = (0..3)
             .map(|i| {
                 call(
-                    RecordType::MobileOriginatedCall,
+                    RecordType::OriginatedCall,
                     &format!("2026-07-28T1{i}:00:00+02:00"),
                     "262-02",
                 )
@@ -1116,17 +1147,17 @@ mod tests {
     fn the_outbound_ratio_is_computed_in_the_right_order() {
         let mixed = vec![
             call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 "2026-07-28T10:00:00+02:00",
                 "262-02",
             ),
             call(
-                RecordType::MobileOriginatedCall,
+                RecordType::OriginatedCall,
                 "2026-07-28T11:00:00+02:00",
                 "262-02",
             ),
             call(
-                RecordType::MobileTerminatedCall,
+                RecordType::TerminatedCall,
                 "2026-07-28T12:00:00+02:00",
                 "262-02",
             ),
@@ -1160,13 +1191,13 @@ mod tests {
             }
         };
 
-        let found = ait_signature(&records, &high_risk(), &called, 10, 80).unwrap();
+        let found = ait_signature(&resolve(&records, &called), &high_risk(), 10, 80).unwrap();
         assert_eq!(found.signal, Signal::AitSignature);
         assert_eq!(found.records.len(), 18);
         assert!(found.detail.contains("90%"), "{}", found.detail);
 
         // A stricter concentration threshold does not fire.
-        assert!(ait_signature(&records, &high_risk(), &called, 10, 95).is_none());
+        assert!(ait_signature(&resolve(&records, &called), &high_risk(), 10, 95).is_none());
     }
 
     /// A legitimate sender messaging one country looks concentrated too, which
@@ -1183,7 +1214,7 @@ mod tests {
             })
             .collect();
         let called = |_: usize, _: &UsageRecord| "882161234567".parse::<Msisdn>().ok();
-        assert!(ait_signature(&records, &high_risk(), &called, 10, 50).is_none());
+        assert!(ait_signature(&resolve(&records, &called), &high_risk(), 10, 50).is_none());
     }
 
     #[test]

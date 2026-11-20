@@ -50,6 +50,7 @@ pub struct ParseError {
     type_name: &'static str,
     input: String,
     expected: Expected,
+    withheld: bool,
 }
 
 impl ParseError {
@@ -72,6 +73,7 @@ impl ParseError {
             type_name,
             input: Self::clip(input),
             expected: Expected::OneOf(codes),
+            withheld: false,
         }
     }
 
@@ -81,7 +83,30 @@ impl ParseError {
             type_name,
             input: Self::clip(input),
             expected: Expected::Format(shape),
+            withheld: false,
         }
+    }
+
+    /// A value rejected against a format description, **without keeping it**.
+    ///
+    /// For types whose input is traffic data — a called number, a short code —
+    /// so the error can be logged without putting the digits in the log
+    /// (§ 9 TDDDG). [`input`](Self::input) is empty and
+    /// [`is_withheld`](Self::is_withheld) is `true`.
+    pub(crate) fn withheld(type_name: &'static str, shape: &'static str) -> Self {
+        Self {
+            type_name,
+            input: String::new(),
+            expected: Expected::Format(shape),
+            withheld: true,
+        }
+    }
+
+    /// `true` when the rejected input was deliberately not kept, because it is
+    /// traffic data (a called number or short code).
+    #[must_use]
+    pub const fn is_withheld(&self) -> bool {
+        self.withheld
     }
 
     /// Keep at most [`MAX_INPUT`](Self::MAX_INPUT) bytes, cut on a character
@@ -138,7 +163,11 @@ impl ParseError {
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid {} {:?}: expected ", self.type_name, self.input)?;
+        if self.withheld {
+            write!(f, "invalid {} (input withheld): expected ", self.type_name)?;
+        } else {
+            write!(f, "invalid {} {:?}: expected ", self.type_name, self.input)?;
+        }
         match self.expected {
             Expected::OneOf(codes) => write!(f, "one of {}", codes.join(", ")),
             Expected::Format(shape) => f.write_str(shape),

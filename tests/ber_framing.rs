@@ -281,17 +281,12 @@ fn a_length_beyond_the_input_is_rejected() {
     assert!(BerReader::new(&bytes).next().unwrap().is_err());
 }
 
-/// Two encodings of one value would give one record two hashes and two
-/// deduplication keys.
+/// X.690 forbids these even in BER (§8.1.2.2, §8.3.2); a long-form length
+/// that fits the short form is the sender's option (§8.1.3.5) and is read.
 #[test]
-fn non_minimal_encodings_are_refused() {
-    // A long-form length that fits the short form.
-    assert!(
-        BerReader::new(&[0x04, 0x81, 0x02, 0xAA, 0xBB])
-            .next()
-            .unwrap()
-            .is_err()
-    );
+fn encodings_ber_forbids_are_refused_and_long_form_lengths_are_read() {
+    let long = only(&[0x04, 0x81, 0x02, 0xAA, 0xBB]);
+    assert_eq!(long.content(), &[0xAA, 0xBB]);
     // A high-tag form encoding a number the short form covers.
     assert!(BerReader::new(&[0xBF, 0x0A, 0x00]).next().unwrap().is_err());
     // A padded integer.

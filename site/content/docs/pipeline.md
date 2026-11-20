@@ -1,54 +1,37 @@
 +++
 title = "One pass, and the order it runs in"
-description = "The assembly of every other piece, in a fixed order — because the order is itself a decision that is easy to get wrong quietly."
+description = "How `process` assembles the pieces, and why the order matters."
 weight = 60
 +++
-
-Every piece of this crate works on its own. `process` is the assembly, and it
-exists because the **order** of the pieces is itself a decision that is easy to
-get wrong — and wrong quietly.
 
 Each record reaches the first outcome that applies:
 
 | # | Test | Outcome |
 |---|---|---|
-| 1 | no natural key | rejected — `NotKeyable` |
-| 2 | key already seen inside the window | duplicate |
-| 3 | no charged party | rejected — `Unattributable` |
-| 4 | timestamped ahead of `as_of` | rejected — `FutureTimestamp` |
-| 5 | past the inclusion deadline | rejected — `BeyondDeadline` |
-| 6 | a blocking rule fired | rejected — `Malformed` |
-| 7 | its run of partials cannot be reassembled | rejected — `Malformed` |
-| 8 | its run of partials is not finished | **held** — `AwaitingPartial` |
+| 1 | no natural key | rejected, `NotKeyable` |
+| 2 | key already billed, held or suppressed inside the window | duplicate |
+| 3 | no charged party | rejected, `Unattributable` |
+| 4 | opens after `as_of` | rejected, `FutureTimestamp` |
+| 5 | past the inclusion deadline | rejected, `BeyondDeadline` |
+| 6 | a blocking rule fired | rejected, `Malformed` |
+| 7 | its partial run can never be reassembled (V19) | rejected, `Malformed` |
+| 8 | its partial run is not finished, first record included (V20) | held, `AwaitingPartial` |
 | 9 | the suppression policy says so | suppressed |
-| 10 | its source has an unfilled sequence hole | **held** — `SequenceGap` |
-| 11 | otherwise | **billable** |
+| 10 | its source has an unfilled sequence hole | held, `SequenceGap` |
+| 11 | otherwise | billable |
 
-Three placements are load-bearing.
-
-**Keyability before everything.** A record with no natural key cannot be
-deduplicated, so billing it risks charging for it twice — the more expensive of
-the two errors — and it is rejected before any test that might have let it
-through.
-
-**Deduplication before judgement.** A retransmission of a malformed record is a
-retransmission. Rejecting it a second time as malformed would report two faults
-where there was one, and would leave the sender's resend invisible in the counts.
-
-**Completeness is per source, and it is the last test.** A gateway with a lost
-file cannot prove what it is missing, so its records are held — but only *its*
-records, and only the ones that were going to be billed. Blocking the whole
-batch instead stops an operator's entire billing run on one node's hole; holding
-a record the suppression policy had already ruled out re-presents a foregone
-conclusion in every batch until the file arrives. Because nothing from an
-incomplete source is ever *released*, what a batch does release is complete by
-construction.
+- Keyability first: an unkeyed record could be billed twice.
+- Deduplication before judgement: a malformed retransmission is one fault.
+- Steps 4 and 5 use the `LatenessPolicy` in `ProcessConfig::validation`.
+- Completeness last, per source: only the source with the hole is held, and
+  only records that would otherwise be billed.
 
 ```rust
 use mediation::{Batch, DedupWindow, Disposition, ProcessConfig, ProcessState, RejectReason, process};
-use time::{Duration, macros::datetime};
 use mediation::{ChargedParty, RecordType, SourceRef, SubscriberRef, UsageRecord};
-// A record carrying no correlator at all cannot be deduplicated.
+use time::{Duration, macros::datetime};
+
+// No correlator, so no natural key.
 let bare = UsageRecord::new(
     RecordType::PduSession,
     ChargedParty::Subscriber(SubscriberRef::new("imsi-262021234567890".parse().unwrap())),
@@ -71,39 +54,22 @@ assert!(matches!(
 assert!(outcome.reconciliation().balances());
 ```
 
-## Suppression is policy, and the crate holds none of it
+## Suppression
 
-A test SIM, a zero-rated emergency call, traffic netted off between an
-operator's own networks — which records those are is a commercial fact, so
-`process_with` takes a `Suppression` of yours. A crate that guessed which
-identities were test SIMs would suppress real revenue.
+`process_with` takes your `Suppression` policy; `process` suppresses nothing.
 
-## A held record comes back
+## Held records come back
 
-`Batch::with_carry` marks the records an earlier batch held and this one
-re-presents. They are counted through `observe_carried` rather than as new
-arrivals — and they **skip deduplication**, because asking the store again would
-recognise your own hold coming back as a duplicate of itself and the usage would
-never be billed at all. A genuine retransmission arriving while the record is
-held is still caught, because the key stayed in the store.
+`Batch::with_carry` marks the leading records as carried in. They are counted
+through `observe_carried` and refresh their dedup key instead of being checked
+against it. Chain reconciliations through a `PeriodLedger`.
 
-Chain the reconciliations through a `PeriodLedger` and the conservation law
-telescopes across the whole period.
+## The state is yours
 
-## The state is yours, and it round-trips
-
-Deduplication and gap detection are inherently stateful — you cannot recognise a
-retransmission without remembering, and you cannot see a hole without knowing
-what came before. So `ProcessState` is caller-owned and passed in, which keeps
-`process` a pure mapping from `(batch, config, as_of, state)` to
-`(outcome, state′)`.
-
-These two are the crate's load-bearing correctness controls, and a restart that
-forgot them would re-bill a window of retransmissions and declare every source
-complete. So the whole of the state is reachable and rebuildable —
-`DedupStore::iter` / `restore`, `SequenceTracker::snapshot` / `restore`,
-`ProcessState::trackers` / `with_tracker` — and with the `serde` feature the
-whole thing serialises in one call:
+`ProcessState` holds the dedup store and sequence trackers. `process` reads no
+clock, so the same inputs give the same answer. Persist the state across
+restarts (`DedupStore::iter` / `restore`, `SequenceTracker::snapshot` /
+`restore`, or `serde`):
 
 ```rust
 #[cfg(feature = "serde")] {
@@ -118,12 +84,5 @@ assert_eq!(restored.dedup().len(), state.dedup().len());
 }
 ```
 
-## What it does not do
-
-`process` does not **correlate**, because correlation changes the cardinality of
-the batch: two records describing one bearer become one usage, and the
-conservation law counts records. Joining legs is `correlation::correlate`, run
-before or after this pass depending on whether your feed carries both sides in
-one file.
-
-It does not **rate**, **aggregate by tariff** or **round**.
+`process` does not correlate (that changes record cardinality; see
+[correlation](@/docs/reassembly.md)), rate or round.

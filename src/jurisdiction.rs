@@ -53,8 +53,10 @@
 
 use std::fmt;
 
+use crate::party::ChargedParty;
 use crate::plmn::Mcc;
 use crate::record::UsageRecord;
+use crate::session::RatType;
 
 // ── Ambiguity ────────────────────────────────────────────────────────────────
 
@@ -199,9 +201,10 @@ impl fmt::Display for Jurisdiction {
 /// **where the subscriber was**, not where their subscription is.
 ///
 /// Read from the serving network, cross-checked against the reported location.
-/// The two must agree — they both carry an MCC, and a record where they differ
-/// has a decoding fault or a mislabelled element, which
-/// [`Ambiguity::Conflicting`] reports rather than resolving by precedence.
+/// The two must name one country — [`Mcc::same_country`], so `310` and `311`
+/// agree (ITU-T E.212; audit J1) — and a record where they do not has a
+/// decoding fault or a mislabelled element, which [`Ambiguity::Conflicting`]
+/// reports rather than resolving by precedence.
 ///
 /// Satellite access yields [`Ambiguity::ExtraTerritorialAccess`] whatever the
 /// serving network says, because a beam crossing borders makes that MCC a
@@ -235,7 +238,7 @@ pub fn usage_country(record: &UsageRecord) -> Jurisdiction {
     let reported = record.session.serving_country();
 
     let country = match (serving, reported) {
-        (Some(serving), Some(reported)) if serving != reported => {
+        (Some(serving), Some(reported)) if !serving.same_country(reported) => {
             return Jurisdiction::Unresolved(Ambiguity::Conflicting { serving, reported });
         }
         (Some(country), _) | (None, Some(country)) => country,
@@ -253,9 +256,16 @@ pub fn usage_country(record: &UsageRecord) -> Jurisdiction {
 /// The customer's country under the EU VAT presumption.
 ///
 /// Council Implementing Regulation (EU) 282/2011 Art. 24b(b): a customer
-/// supplied over a mobile network is **presumed** to be located in the country
-/// of the mobile country code of the IMSI on the SIM card. Art. 24f lists that
-/// MCC among the items of evidence.
+/// supplied "through mobile networks" is **presumed** to be located in the
+/// country of the mobile country code of the IMSI on the SIM card. Art. 24f
+/// lists that MCC among the items of evidence.
+///
+/// The presumption is about the subscriber, over 3GPP radio. It applies only
+/// to [`ChargedParty::Subscriber`], and not when the record's access is
+/// [`RatType::Wireline`] or [`RatType::Wlan`]; both yield
+/// [`Ambiguity::NoEvidence`] (audit J2, J3). A record that names no access
+/// technology keeps the presumption: the IMSI is a SIM's, and an unrecorded
+/// technology is not evidence of a fixed line.
 ///
 /// So this reads the **subscriber's IMSI**, not the serving network and not the
 /// home PLMN field. The three normally agree for a domestic record and diverge
@@ -294,12 +304,15 @@ pub fn usage_country(record: &UsageRecord) -> Jurisdiction {
 /// ```
 #[must_use]
 pub fn customer_country_presumption(record: &UsageRecord) -> Jurisdiction {
-    let Some(imsi) = record
-        .party
-        .subscriber()
-        .and_then(|subscriber| subscriber.supi.as_imsi())
-    else {
-        return Jurisdiction::Unresolved(Ambiguity::NoEvidence);
+    let no_evidence = Jurisdiction::Unresolved(Ambiguity::NoEvidence);
+    let ChargedParty::Subscriber(subscriber) = &record.party else {
+        return no_evidence;
+    };
+    if matches!(record.session.rat, Some(RatType::Wireline | RatType::Wlan)) {
+        return no_evidence;
+    }
+    let Some(imsi) = subscriber.supi.as_imsi() else {
+        return no_evidence;
     };
     let mcc = imsi.mcc();
     if !mcc.is_geographic() {
@@ -317,6 +330,9 @@ pub fn customer_country_presumption(record: &UsageRecord) -> Jurisdiction {
 /// the regulations that turn on being abroad — Roam Like At Home, the fair-use
 /// window — mean abroad.
 ///
+/// Countries are compared with [`Mcc::same_country`]: a `310` SIM on a `311`
+/// network is at home (ITU-T E.212; audit J1).
+///
 /// `None` when either country is unresolved, which is an answer: a record that
 /// cannot establish this is not a domestic record, and defaulting it to `false`
 /// understates roaming in exactly the direction that costs money.
@@ -324,7 +340,7 @@ pub fn customer_country_presumption(record: &UsageRecord) -> Jurisdiction {
 pub fn is_abroad(record: &UsageRecord) -> Option<bool> {
     let here = usage_country(record).country()?;
     let home = customer_country_presumption(record).country()?;
-    Some(here != home)
+    Some(!here.same_country(home))
 }
 
 // ── Serde ────────────────────────────────────────────────────────────────────

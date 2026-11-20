@@ -83,10 +83,12 @@ use crate::disposition::{
 };
 use crate::lateness::Lateness;
 use crate::partial::{PartialRun, Reassembly};
-use crate::quality::{QualityReport, score_batch};
+use crate::quality::{QualityReport, score_dispositions};
 use crate::record::{NodeId, UsageRecord};
 use crate::sequence::{SequenceObservation, SequenceSpace, SequenceTracker};
-use crate::validation::{Finding, Rule, ValidationConfig, ValidationReport, validate_records};
+use crate::validation::{
+    Finding, Rule, ValidationConfig, ValidationReport, validate_records_ordered_from,
+};
 
 // ── Suppression ──────────────────────────────────────────────────────────────
 
@@ -165,11 +167,11 @@ impl ProcessConfig {
 /// The carried records come **first** in the slice, so there is one index space
 /// over the whole batch and a [`Finding::record_index`] means one thing.
 ///
-/// A carried record also **skips deduplication**. Its key entered the store
-/// when it first arrived and was held; asking again would recognise the hold
-/// coming back as a duplicate of itself, and the usage would never be billed at
-/// all. A genuine retransmission arriving while the record is held is still
-/// caught, because the key stayed in the store.
+/// A carried record is not **observed** by deduplication — that would
+/// recognise the hold coming back as a duplicate of itself — but its key is
+/// **refreshed** to this batch's `as_of`, and put back if eviction dropped it
+/// while the record waited. A genuine retransmission arriving while the record
+/// is held, however long it is held, is still caught.
 #[derive(Debug, Clone, Copy)]
 pub struct Batch<'a> {
     records: &'a [UsageRecord],
@@ -477,13 +479,13 @@ impl ProcessOutcome {
 /// | # | Test | Outcome |
 /// |---|---|---|
 /// | 1 | no natural key | [`Rejected`](RejectReason::NotKeyable) |
-/// | 2 | key already seen inside the window | [`Duplicate`](Disposition::Duplicate) |
+/// | 2 | key already billed, held or suppressed inside the window | [`Duplicate`](Disposition::Duplicate) |
 /// | 3 | no charged party | [`Rejected`](RejectReason::Unattributable) |
 /// | 4 | timestamped ahead of `as_of` | [`Rejected`](RejectReason::FutureTimestamp) |
 /// | 5 | past the inclusion deadline | [`Rejected`](RejectReason::BeyondDeadline) |
 /// | 6 | a blocking rule fired | [`Rejected`](RejectReason::Malformed) |
-/// | 7 | its run of partials cannot be reassembled | [`Rejected`](RejectReason::Malformed) |
-/// | 8 | its run of partials is not finished | [`Held`](HoldReason::AwaitingPartial) |
+/// | 7 | its run of partials can never be reassembled (V19) | [`Rejected`](RejectReason::Malformed) |
+/// | 8 | its run of partials is not finished, first record included (V20) | [`Held`](HoldReason::AwaitingPartial) |
 /// | 9 | the suppression policy says so | [`Suppressed`](Disposition::Suppressed) |
 /// | 10 | its source has an unfilled sequence hole | [`Held`](HoldReason::SequenceGap) |
 /// | 11 | otherwise | [`Billable`](Disposition::Billable) |
@@ -495,10 +497,12 @@ impl ProcessOutcome {
 /// of the two errors — and it is rejected before any test that might have let
 /// it through.
 ///
-/// **Deduplication before judgement.** A retransmission of a malformed record
-/// is a retransmission. Rejecting it a second time as malformed would report
-/// two faults where there was one, and would leave the sender's resend
-/// invisible in the counts.
+/// **Deduplication before judgement.** A malformed retransmission of a record
+/// already billed or held is a retransmission, not a second fault. Keys are
+/// stamped with `as_of` — the arrival — so a late record is remembered for the
+/// whole window after it arrived. A record **rejected** in this batch leaves no
+/// key behind: it billed nothing, so a corrected resend, in this batch or a
+/// later one, is judged on its own merits rather than discarded as a duplicate.
 ///
 /// **Completeness is per source, not per batch — and it is the last test.** A
 /// gateway with a lost file cannot prove what it is missing, so its records are
@@ -509,6 +513,10 @@ impl ProcessOutcome {
 /// re-present a foregone conclusion in every batch until the file arrived.
 /// Because nothing from an incomplete source is ever *released*, what the batch
 /// does release is complete by construction, and the release gate says so.
+///
+/// Each source's file sequences are observed in serial order, not in the order
+/// the batch lists them, so shuffling a batch changes neither its holes nor its
+/// dispositions. A sequence that moves backwards raises V18 as a regression.
 ///
 /// Steps 7 and 8 apply only where the record's key names a **session** —
 /// see [`RecordKey::session_scope`]. A partial keyed on a recording entity and
@@ -547,15 +555,19 @@ pub fn process_with(
     let records = batch.records();
 
     // Stateless rules first, over the whole batch: the blocking findings decide
-    // step 6, and they must be computed from the batch as supplied rather than
-    // record by record — V16, the ordering rule, is a property of the series.
-    let mut findings = validate_records(records, &config.validation, as_of);
+    // step 6. V16, the ordering rule, is a property of the series as it
+    // arrived, so it reads only the ingested records — carried ones come first
+    // by construction and say nothing about the sender's order.
+    let mut findings =
+        validate_records_ordered_from(records, batch.carried_in(), &config.validation, as_of);
     let stateless = findings.clone();
 
     // Completeness, per source. A file sequence is scoped to the node that
     // produced the file, and sharing one tracker across nodes manufactures gaps
-    // that do not exist.
-    let gaps = observe_sequences(records, state, &mut findings);
+    // that do not exist. Only the ingested records: a carried record's file
+    // was observed in the batch that first saw it.
+    let (gaps, regressions) =
+        observe_sequences(&records[batch.carried_in()..], state, &mut findings);
 
     // Which of this batch's own sources cannot yet prove they are complete.
     // Computed after `observe_sequences`, so a hole this batch opened counts.
@@ -592,6 +604,23 @@ pub fn process_with(
         dispositions.push(disposition);
     }
 
+    // A file behind the high-water mark is a regression only if it brought
+    // something new. A file whose every record is a duplicate is a resend.
+    for (node, value, high_water) in regressions {
+        let brought_something = records
+            .iter()
+            .zip(&dispositions)
+            .skip(batch.carried_in())
+            .any(|(record, disposition)| {
+                record.provenance.node_id == node
+                    && record.provenance.file_sequence == Some(value)
+                    && !matches!(disposition, Disposition::Duplicate(_))
+            });
+        if brought_something {
+            findings.push(Finding::sequence_regressed(&node, value, high_water));
+        }
+    }
+
     // Escalation applies to every finding the pass produced, not only to the
     // ones `validate_records` raised. A caller who escalates `DuplicateRecord`
     // means it whichever stage found the duplicate, and a report where half the
@@ -599,8 +628,9 @@ pub fn process_with(
     findings.apply(&config.validation);
 
     // Nothing released came from a source with an unfilled hole — every such
-    // record is held above — so the batch's own completeness is provable.
-    let quality = score_batch(&reconciliation, &findings, true);
+    // record is held above — so the batch's own completeness is provable. A
+    // blocking finding on a record rejected or held here has been acted on.
+    let quality = score_dispositions(&reconciliation, &dispositions, &findings, true);
     let totals = aggregate_released_with_carry(records, &dispositions, batch.carried_in());
 
     ProcessOutcome {
@@ -629,31 +659,60 @@ fn disposition_for(
     suppression: &impl Suppression,
     findings: &mut ValidationReport,
 ) -> Disposition {
-    // 1 — a record that cannot be deduplicated must not be billed.
+    // 1 — a record that cannot be deduplicated must not be billed. Its V09
+    // is already among the stateless findings.
     let key = match RecordKey::of(record) {
         Ok(key) => key,
-        Err(reason) => {
-            findings.push(Finding::not_keyable(index, reason));
-            return Disposition::Rejected(RejectReason::NotKeyable(reason));
-        }
+        Err(reason) => return Disposition::Rejected(RejectReason::NotKeyable(reason)),
     };
 
     // 2 — a retransmission is a retransmission, whatever else is wrong with it.
     //
-    // A **carried** record is exempt, and that exemption is the whole reason
-    // `Batch` distinguishes them. Its key went into the store when it was first
-    // ingested and held; asking again would recognise this batch's own hold
-    // coming back as a duplicate of itself, and the usage would never be
-    // billed at all. A genuine retransmission arriving while the record is held
-    // is still caught, because the key stayed in the store.
-    if !carried
-        && let DedupDecision::Duplicate { .. } =
-            state.dedup.observe(key.clone(), record.opened.to_utc())
-    {
+    // Stamped with `as_of`, the arrival, so a late record is remembered for
+    // the whole window. A **carried** record is not observed — that would find
+    // its own hold — but refreshed, so its key outlives the wait.
+    if carried {
+        state.dedup.refresh(key.clone(), as_of);
+    } else if let DedupDecision::Duplicate { .. } = state.dedup.observe(key.clone(), as_of) {
         findings.push(Finding::duplicate(index, &key));
         return Disposition::Duplicate(key);
     }
 
+    let disposition = judge(
+        index,
+        record,
+        &key,
+        config,
+        as_of,
+        stateless,
+        runs,
+        incomplete,
+        suppression,
+        findings,
+    );
+
+    // A rejected record billed nothing, so its key must not turn a corrected
+    // resend into a duplicate.
+    if matches!(disposition, Disposition::Rejected(_)) {
+        state.dedup.remove(&key);
+    }
+    disposition
+}
+
+/// Steps 3 to 11 for a record that is keyed and not a duplicate.
+#[allow(clippy::too_many_arguments)]
+fn judge(
+    index: usize,
+    record: &UsageRecord,
+    key: &RecordKey,
+    config: &ProcessConfig,
+    as_of: OffsetDateTime,
+    stateless: &ValidationReport,
+    runs: &BTreeMap<RecordKey, Reassembly>,
+    incomplete: &BTreeSet<NodeId>,
+    suppression: &impl Suppression,
+    findings: &mut ValidationReport,
+) -> Disposition {
     // 3 — nobody to charge.
     if let Some(reason) = record.party.unattributable_reason() {
         return Disposition::Rejected(RejectReason::Unattributable(reason));
@@ -687,11 +746,20 @@ fn disposition_for(
         && let Some(scope) = key.session_scope()
         && let Some(assessment) = runs.get(&scope)
     {
+        // V19 for a run no wait can complete, V20 for one with holes — its
+        // first record included, which may still arrive. An open run with no
+        // holes is held without a finding: nothing is wrong with it yet.
         match assessment {
             Reassembly::Orphan { .. } => {
+                if let Some(finding) = Finding::reassembly(index, assessment) {
+                    findings.push(finding);
+                }
                 return Disposition::Rejected(RejectReason::Malformed);
             }
             Reassembly::Incomplete { .. } => {
+                if let Some(finding) = Finding::reassembly(index, assessment) {
+                    findings.push(finding);
+                }
                 return Disposition::Held(HoldReason::AwaitingPartial);
             }
             Reassembly::Complete { .. } | Reassembly::Empty => {}
@@ -727,44 +795,64 @@ fn disposition_for(
     Disposition::Billable
 }
 
-/// Feed each source's file sequence to its tracker, and report what is missing.
+/// A file that arrived behind its source's high-water mark and filled no hole:
+/// the source, the file sequence and the mark.
+type Regression = (NodeId, u32, u32);
+
+/// Feed each source's file sequence to its tracker, report what is missing, and
+/// return the files that arrived behind the high-water mark.
 fn observe_sequences(
     records: &[UsageRecord],
     state: &mut ProcessState,
     findings: &mut ValidationReport,
-) -> Vec<SequenceGap> {
+) -> (Vec<SequenceGap>, Vec<Regression>) {
     // One observation per (node, file), not per record: a file's sequence
     // number is a property of the file, and observing it once per record it
     // holds would report every record after the first as a duplicate arrival.
-    let mut seen: BTreeSet<(&NodeId, u32)> = BTreeSet::new();
-    let mut gaps: Vec<SequenceGap> = Vec::new();
-
+    // And in serial order, not batch order: listing file 3 before file 1 must
+    // not hide the hole at 2.
+    let mut by_node: BTreeMap<&NodeId, Vec<u32>> = BTreeMap::new();
     for record in records {
-        let Some(sequence) = record.provenance.file_sequence else {
-            continue;
-        };
-        let node = &record.provenance.node_id;
-        if !seen.insert((node, sequence)) {
-            continue;
+        if let Some(sequence) = record.provenance.file_sequence {
+            by_node
+                .entry(&record.provenance.node_id)
+                .or_default()
+                .push(sequence);
         }
+    }
+
+    let mut gaps: Vec<SequenceGap> = Vec::new();
+    let mut regressions: Vec<Regression> = Vec::new();
+    for (node, sequences) in by_node {
         let tracker = state
             .sequences
             .entry(node.clone())
             .or_insert_with(|| SequenceTracker::new(state.space));
-        if let SequenceObservation::Gap {
-            missing,
-            missing_count,
-        } = tracker.observe_default(sequence)
-        {
-            findings.push(Finding::sequence_gap(node, &missing, missing_count));
-            gaps.push(SequenceGap {
-                node: node.clone(),
-                missing,
-                missing_count,
-            });
+        let observed = tracker.observe_all(sequences, SequenceTracker::DEFAULT_MAX_LISTED);
+        let high_water = tracker.high_water();
+        for (value, observation) in observed {
+            match observation {
+                SequenceObservation::Gap {
+                    missing,
+                    missing_count,
+                } => {
+                    findings.push(Finding::sequence_gap(node, &missing, missing_count));
+                    gaps.push(SequenceGap {
+                        node: node.clone(),
+                        missing,
+                        missing_count,
+                    });
+                }
+                SequenceObservation::Unexpected => {
+                    if let Some(high) = high_water {
+                        regressions.push((node.clone(), value, high));
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    gaps
+    (gaps, regressions)
 }
 
 /// The sources this batch drew records from that still have an unfilled hole.
@@ -975,25 +1063,36 @@ mod tests {
         assert_eq!(outcome.totals().unwrap().total().records(), 5);
     }
 
-    /// A retransmission of a malformed record is a retransmission. Rejecting it
-    /// twice would report two faults where there was one, and would leave the
-    /// sender's resend invisible in the counts.
+    /// A malformed retransmission of a billed record is a retransmission, not
+    /// a second fault. A rejected copy leaves no key, so its resend is judged.
     #[test]
     fn deduplication_runs_before_judgement() {
+        let good = session(1);
         let mut broken = session(1);
         broken.closed = Some("2026-07-28T09:00:00+02:00".parse().unwrap()); // closed before it opened
-        let records = vec![broken.clone(), broken];
 
         let mut state = ProcessState::new(window());
+        let records = vec![good, broken.clone()];
         let outcome = process(
             &Batch::new(&records),
             &ProcessConfig::default(),
             NOW,
             &mut state,
         );
-
-        assert_eq!(outcome.reconciliation().rejected(), 1);
+        assert_eq!(outcome.reconciliation().released(), 1);
         assert_eq!(outcome.reconciliation().duplicate(), 1);
+        assert!(outcome.reconciliation().balances());
+
+        let mut state = ProcessState::new(window());
+        let records = vec![broken.clone(), broken];
+        let outcome = process(
+            &Batch::new(&records),
+            &ProcessConfig::default(),
+            NOW,
+            &mut state,
+        );
+        assert_eq!(outcome.reconciliation().rejected(), 2);
+        assert!(state.dedup().is_empty(), "a rejected record leaves no key");
         assert!(outcome.reconciliation().balances());
     }
 

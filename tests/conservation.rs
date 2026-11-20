@@ -270,7 +270,8 @@ fn any_record() -> impl Strategy<Value = UsageRecord> {
                 };
                 let opened = datetime!(2026-07-28 10:00:00 UTC) - time::Duration::days(age);
                 let opened =
-                    mediation::CdrTimestamp::from_utc(opened, mediation::QuarterHourOffset::UTC);
+                    mediation::CdrTimestamp::from_utc(opened, mediation::QuarterHourOffset::UTC)
+                        .unwrap();
                 let mut source = SourceRef::new("pgw-01".parse().unwrap(), 0);
                 if let Some(file) = file {
                     source = source.with_file_sequence(file);
@@ -367,6 +368,23 @@ proptest! {
             (outcome.dispositions().to_vec(), *outcome.reconciliation())
         };
         prop_assert_eq!(run(), run());
+    }
+
+    /// Shuffling a batch changes neither what is billed nor which files are
+    /// missing (audit C3, C6, C7).
+    ///
+    /// audit-hardening/SR-002
+    #[test]
+    fn shuffling_a_batch_changes_neither_billing_nor_gaps(
+        (records, shuffled) in proptest::collection::vec(any_record(), 0..16)
+            .prop_flat_map(|records| (Just(records.clone()), Just(records).prop_shuffle())),
+    ) {
+        let run = |records: &[UsageRecord]| {
+            let mut state = ProcessState::new(DedupWindow::from_bound(Duration::days(7)).unwrap());
+            let outcome = process(&Batch::new(records), &ProcessConfig::default(), NOW, &mut state);
+            (outcome.reconciliation().released(), outcome.sequence_gaps().to_vec())
+        };
+        prop_assert_eq!(run(&records), run(&shuffled));
     }
 }
 

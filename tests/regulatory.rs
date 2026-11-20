@@ -36,6 +36,12 @@ fn regions() -> impl Regions {
     }
 }
 
+/// How many days a window ending on `ending` covers.
+fn window_days(window: fairuse::ObservationWindow, ending: time::Date) -> u32 {
+    let start = window.start(ending).unwrap();
+    u32::try_from((ending - start).whole_days() + 1).unwrap()
+}
+
 fn record(day: &str, serving: &str, octets: u64) -> UsageRecord {
     UsageRecord::new(
         RecordType::PduSession,
@@ -58,8 +64,8 @@ fn the_regulation_sequence_is_observe_warn_surcharge() {
 
     // A subscriber abroad the whole window, consuming almost entirely there.
     let mut presence = Vec::new();
-    let mut day = window.start(ending);
-    for _ in 0..window.days() {
+    let mut day = window.start(ending).unwrap();
+    for _ in 0..window_days(window, ending) {
         presence.push(PresenceDay::new(day, Region::Eea));
         day += Duration::days(1);
     }
@@ -90,8 +96,8 @@ fn a_subscriber_abroad_but_consuming_at_home_keeps_the_safe_harbour() {
     let ending = date!(2026 - 07 - 28);
 
     let mut presence = Vec::new();
-    let mut day = window.start(ending);
-    for _ in 0..window.days() {
+    let mut day = window.start(ending).unwrap();
+    for _ in 0..window_days(window, ending) {
         presence.push(PresenceDay::new(day, Region::Eea));
         day += Duration::days(1);
     }
@@ -168,6 +174,7 @@ proptest! {
             Octets::new(domestic_use),
             Octets::new(roaming_use),
             120,
+            date!(2026 - 01 - 01),
         );
 
         if assessment.prevailing_domestic_presence()
@@ -197,6 +204,7 @@ proptest! {
             Octets::ZERO,
             Octets::new(1),
             120,
+            date!(2026 - 01 - 01),
         );
         prop_assert!(!assessment.may_surcharge(None, date!(2026 - 12 - 31)));
     }
@@ -254,24 +262,18 @@ fn a_billing_period_outlives_the_call_it_covers() {
 /// A record commonly sits under several bases, and the longest governs:
 /// deleting while any of them still requires the data cannot be undone.
 #[test]
-fn a_dispute_hold_outlives_the_billing_period() {
-    let billing = RetentionPolicy::new(
-        RetentionBasis::BillingTdddg10 {
-            invoice_dispatched_at: INVOICED,
-        },
-        Duration::days(183),
-    )
-    .unwrap();
+fn a_longer_basis_outlives_the_billing_period() {
+    let billing = RetentionPolicy::billing_tdddg10(INVOICED).unwrap();
     let dispute = RetentionPolicy::new(
-        RetentionBasis::DisputeHold {
-            raised_at: datetime!(2026-12-01 00:00 UTC),
+        RetentionBasis::LawfulAccess {
+            recorded_at: datetime!(2026-12-01 00:00 UTC),
         },
         Duration::days(365),
     )
     .unwrap();
 
     let schedule: RetentionSchedule = vec![billing, dispute].into_iter().collect();
-    assert!(schedule.is_held());
+    assert!(!schedule.is_held());
     assert_eq!(schedule.governing_policy(), Some(dispute));
 
     // The billing period lapsing does not make the record deletable.
@@ -460,7 +462,7 @@ proptest! {
 }
 
 /// The gate that stops a provider concluding from thin data has to measure the
-/// data, not the configuration. `ObservationWindow::new` already refuses
+/// data, not the configuration. `ObservationWindow::months` already refuses
 /// anything shorter than four months, so filling `observed_days` from the
 /// window's length made `window_sufficient` a restatement of the caller's own
 /// setting — always true, and blocking nothing.
@@ -471,7 +473,7 @@ fn the_sufficiency_gate_measures_the_evidence_not_the_configuration() {
 
     // Three weeks of registration data inside a four-month window.
     let mut presence = Vec::new();
-    let mut day = window.start(ending);
+    let mut day = window.start(ending).unwrap();
     for _ in 0..21 {
         presence.push(PresenceDay::new(day, Region::Eea));
         day += Duration::days(1);
@@ -505,8 +507,8 @@ fn presence_counts_days_not_entries() {
     let ending = date!(2026 - 07 - 28);
 
     let mut presence = Vec::new();
-    let mut day = window.start(ending);
-    for index in 0..window.days() {
+    let mut day = window.start(ending).unwrap();
+    for index in 0..window_days(window, ending) {
         // Every day abroad, but the first thirty are reported three times over.
         let region = if index < 30 {
             Region::Eea
@@ -523,9 +525,12 @@ fn presence_counts_days_not_entries() {
 
     let assessment = fairuse::assess(&[], &presence, home(), window, ending, &regions());
 
-    assert_eq!(assessment.observed_days(), window.days());
+    assert_eq!(assessment.observed_days(), window_days(window, ending));
     assert_eq!(assessment.roaming_presence_days(), 30);
-    assert_eq!(assessment.domestic_presence_days(), window.days() - 30);
+    assert_eq!(
+        assessment.domestic_presence_days(),
+        window_days(window, ending) - 30
+    );
     assert!(assessment.prevailing_domestic_presence());
 }
 

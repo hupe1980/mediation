@@ -24,6 +24,16 @@
 //! hours is a delivery expectation, not an expiry, so an extract that arrives
 //! in five hours is late and still worth processing.
 //!
+//! # Lateness is not a period close
+//!
+//! Lateness measures **elapsed time** between the event and `as_of`. It does not
+//! know whether the month the event belongs to has already been invoiced — a
+//! call from 31 July that arrives on 2 August is on time by any sensible
+//! policy and still belongs to a closed billing period. That is not a
+//! disposition question: the call is billable. Release it in the batch it
+//! arrived in, and book it against the closed period as a
+//! [`Restatement`](crate::Restatement) in the period it was discovered.
+//!
 //! # A future event is not an on-time event
 //!
 //! [`Lateness::Future`] exists because the alternative is silence. A record
@@ -156,11 +166,12 @@ impl LatenessPolicy {
 
     /// A policy whose only bound is a hard deadline.
     ///
-    /// `None` for a non-positive duration: a deadline of zero would reject
-    /// every record, including the ones arriving in real time.
+    /// `None` for a non-positive duration — a deadline of zero would reject
+    /// every record, including the ones arriving in real time — and for one
+    /// that is not whole seconds (finding R9).
     #[must_use]
     pub const fn deadline(after: Duration) -> Option<Self> {
-        if after.is_positive() {
+        if is_whole_positive(after) {
             Some(Self {
                 late_after: after,
                 deadline: Some(after),
@@ -172,10 +183,11 @@ impl LatenessPolicy {
 
     /// A policy that flags lateness without ever making a record unbillable.
     ///
-    /// `None` for a non-positive duration.
+    /// `None` for a non-positive duration and for one that is not whole
+    /// seconds (finding R9).
     #[must_use]
     pub const fn advisory(late_after: Duration) -> Option<Self> {
-        if late_after.is_positive() {
+        if is_whole_positive(late_after) {
             Some(Self {
                 late_after,
                 deadline: None,
@@ -187,14 +199,15 @@ impl LatenessPolicy {
 
     /// A policy with distinct lateness and deadline bounds.
     ///
-    /// `None` unless both are positive and the deadline is at least the
-    /// lateness threshold — a deadline that precedes the threshold would make
-    /// [`Lateness::Late`] unreachable, so the caller has said something they
-    /// did not mean.
+    /// `None` unless both are positive whole seconds and the deadline is at
+    /// least the lateness threshold — a deadline that precedes the threshold
+    /// would make [`Lateness::Late`] unreachable, so the caller has said
+    /// something they did not mean. The comparison is on the full durations
+    /// (finding R9).
     #[must_use]
     pub const fn new(late_after: Duration, deadline: Duration) -> Option<Self> {
-        if late_after.is_positive()
-            && deadline.is_positive()
+        if is_whole_positive(late_after)
+            && is_whole_positive(deadline)
             && deadline.whole_seconds() >= late_after.whole_seconds()
         {
             Some(Self {
@@ -219,15 +232,23 @@ impl LatenessPolicy {
     }
 
     /// The instant `event` becomes late.
+    ///
+    /// `None` when that instant lies beyond the calendar `time` supports.
+    /// Checked, so no policy — including one read from serde — panics here
+    /// (finding R8).
     #[must_use]
-    pub fn late_at(self, event: OffsetDateTime) -> OffsetDateTime {
-        event + self.late_after
+    pub fn late_at(self, event: OffsetDateTime) -> Option<OffsetDateTime> {
+        event.checked_add(self.late_after)
     }
 
-    /// The instant `event` stops being billable, when there is one.
+    /// The instant `event` stops being billable.
+    ///
+    /// `None` when the policy has no deadline, and when the deadline lies
+    /// beyond the calendar `time` supports — in both cases no representable
+    /// instant ends billability (finding R8).
     #[must_use]
     pub fn deadline_at(self, event: OffsetDateTime) -> Option<OffsetDateTime> {
-        self.deadline.map(|d| event + d)
+        event.checked_add(self.deadline?)
     }
 
     /// Classify an event against an evaluation instant.
@@ -249,6 +270,12 @@ impl LatenessPolicy {
         }
         Lateness::OnTime
     }
+}
+
+/// Positive and a whole number of seconds, the only bounds the stored form
+/// carries.
+const fn is_whole_positive(duration: Duration) -> bool {
+    duration.is_positive() && duration.subsec_nanoseconds() == 0
 }
 
 // ── Serde ────────────────────────────────────────────────────────────────────
@@ -393,7 +420,10 @@ mod tests {
     fn deadline_and_lateness_instants_are_derivable() {
         let policy = LatenessPolicy::tap3();
         let event = datetime!(2026-07-01 00:00:00 UTC);
-        assert_eq!(policy.late_at(event), datetime!(2026-07-31 00:00:00 UTC));
+        assert_eq!(
+            policy.late_at(event),
+            Some(datetime!(2026-07-31 00:00:00 UTC))
+        );
         assert_eq!(
             policy.deadline_at(event),
             Some(datetime!(2026-07-31 00:00:00 UTC))
